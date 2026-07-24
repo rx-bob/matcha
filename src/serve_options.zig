@@ -9,6 +9,7 @@ pub const default_interval_seconds: u32 = 5;
 
 pub const ServeOptions = struct {
     directory: []const u8,
+    directory_set: bool = false,
     host: []const u8 = default_host,
     port: u16 = default_port,
     interval_seconds: u32 = default_interval_seconds,
@@ -120,17 +121,26 @@ pub fn parseServeOptions(
         return .{ .err = .{ .extra_arguments = arg } };
     }
 
-    if (!directory_set) {
-        return .{ .err = .{ .missing_value = "directory" } };
+    if (directory_set) {
+        const normalized = path.expandHomePath(allocator, directory) catch |err| switch (err) {
+            error.MissingHome => return .{ .err = .{ .missing_home = directory } },
+            else => return .{ .err = .{ .path_error = directory } },
+        };
+
+        return .{ .ok = .{
+            .directory = normalized,
+            .directory_set = true,
+            .host = host,
+            .port = port,
+            .interval_seconds = interval_seconds,
+        } };
     }
 
-    const normalized = path.expandHomePath(allocator, directory) catch |err| switch (err) {
-        error.MissingHome => return .{ .err = .{ .missing_home = directory } },
-        else => return .{ .err = .{ .path_error = directory } },
-    };
-
+    // No directory provided: return options without a resolved directory. The
+    // caller decides whether to prompt interactively or emit a usage error.
     return .{ .ok = .{
-        .directory = normalized,
+        .directory = "",
+        .directory_set = false,
         .host = host,
         .port = port,
         .interval_seconds = interval_seconds,
@@ -160,6 +170,7 @@ test "parseServeOptions accepts directory with defaults" {
     const home = path.expandHomePath(allocator, "~") catch unreachable;
     defer allocator.free(home);
     try std.testing.expectEqualStrings(home ++ "/matcha", options.directory);
+    try std.testing.expect(options.directory_set);
     try std.testing.expectEqualStrings(default_host, options.host);
     try std.testing.expectEqual(default_port, options.port);
     try std.testing.expectEqual(default_interval_seconds, options.interval_seconds);
@@ -173,6 +184,7 @@ test "parseServeOptions accepts explicit directory without home marker" {
         .err => unreachable,
     };
     try std.testing.expectEqualStrings("/tmp/matcha", options.directory);
+    try std.testing.expect(options.directory_set);
 }
 
 test "parseServeOptions parses separated flag overrides" {
@@ -241,9 +253,18 @@ test "parseServeOptions rejects extra positional arguments" {
     );
 }
 
-test "parseServeOptions rejects missing directory" {
+test "parseServeOptions leaves directory unset when missing" {
     const allocator = std.testing.allocator;
-    try expectError(.missing_value, "directory", parseServeOptions(allocator, &.{}));
+    const result = parseServeOptions(allocator, &.{});
+    const options = switch (result) {
+        .ok => |options| options,
+        .err => unreachable,
+    };
+    try std.testing.expectEqualStrings("", options.directory);
+    try std.testing.expect(!options.directory_set);
+    try std.testing.expectEqualStrings(default_host, options.host);
+    try std.testing.expectEqual(default_port, options.port);
+    try std.testing.expectEqual(default_interval_seconds, options.interval_seconds);
 }
 
 test "parseServeOptions rejects invalid ports" {
