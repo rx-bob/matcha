@@ -7,6 +7,7 @@ const json_input = @import("json_input.zig");
 const render_html = @import("render_html.zig");
 const render_markdown = @import("render_markdown.zig");
 const plan_read = @import("plan_read.zig");
+const serve_options = @import("serve_options.zig");
 
 pub const version = "0.1.0";
 
@@ -78,6 +79,10 @@ pub fn runArgs(args: []const []const u8, io: std.Io, stdout: *std.Io.Writer, std
 
     if (std.mem.eql(u8, command, "map")) {
         return runRenderCommand(.map, io, args[1..], stdout, stderr);
+    }
+
+    if (std.mem.eql(u8, command, "serve")) {
+        return runServeCommand(io, args[1..], stdout, stderr);
     }
 
     try writeHelp(stdout);
@@ -207,6 +212,69 @@ fn runPlanReadCommand(
     return .ok;
 }
 
+fn runServeCommand(
+    io: std.Io,
+    args: []const []const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !ExitCode {
+    if (args.len > 0 and isHelpCommand(args[0])) {
+        try writeServeHelp(stdout);
+        return .ok;
+    }
+
+    var options: serve_options.ServeOptions = switch (serve_options.parseServeOptions(std.heap.page_allocator, args)) {
+        .ok => |parsed| parsed,
+        .err => |cli_error| {
+            try writeCliError(stderr, cli_error);
+            try writeServeUsage(stderr);
+            return .usage;
+        },
+    };
+    _ = &options;
+
+    if (!serve_options.validateDirectory(io, options.directory)) {
+        try writeCliError(stderr, .{ .not_a_directory = options.directory });
+        return .usage;
+    }
+
+    try stderr.print(
+        "matcha serve: directory validation succeeded for {s} (listener not yet implemented)\n",
+        .{options.directory},
+    );
+    return .ok;
+}
+
+fn writeServeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeAll("Usage: matcha serve <directory> [--host <host>] [--port <port>] [--interval <seconds>]\n");
+}
+
+pub fn writeServeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeAll(
+        \\matcha serve
+        \\
+        \\Usage:
+        \\  matcha serve <directory> [options]
+        \\
+        \\Serve generated Matcha HTML plans and maps from <directory> on the local
+        \\network. The directory is scanned recursively and refreshed on the
+        \\configured interval. The server binds to all interfaces by default so
+        \\other machines on the LAN can browse the catalog.
+        \\
+        \\Arguments:
+        \\  <directory>          Root directory to scan for Matcha artifacts
+        \\
+        \\Options:
+        \\  --host <host>        Bind address (default: 0.0.0.0)
+        \\  --port <port>        Bind port (default: 27004)
+        \\  --interval <seconds> Catalog refresh interval (default: 5)
+        \\
+        \\The --host, --port, and --interval options accept either a space-separated
+        \\value (--port 27004) or an equals-style value (--port=27004).
+        \\
+    );
+}
+
 fn normalizeRenderPaths(allocator: std.mem.Allocator, options: *RenderOptions) RenderOptionsResult {
     options.input = path.expandHomePath(allocator, options.input) catch |err| {
         switch (err) {
@@ -299,6 +367,7 @@ pub fn writeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  version          Show the CLI version
         \\  plan             Render a plan based on the given input
         \\  map              Render a map based on the given input
+        \\  serve            Serve generated Matcha HTML artifacts on the local network
         \\
         \\Plan commands:
         \\  matcha plan --help              Show detailed help for plan rendering
@@ -306,6 +375,9 @@ pub fn writeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\Map commands:
         \\  matcha map --help               Show detailed help for map rendering
+        \\
+        \\Serve commands:
+        \\  matcha serve --help             Show detailed help for serve mode
         \\
         \\Options:
         \\  -i, --input <path>    JSON file to render
@@ -991,6 +1063,206 @@ test "runArgs explicit input/output paths for plan and map write expected HTML m
     try std.testing.expect(std.mem.indexOf(u8, map_html, "id=\"map-root\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, map_html, "window.MAP_DATA") != null);
     try std.testing.expect(std.mem.indexOf(u8, map_html, "matcha-map-theme") != null);
+}
+
+test "serve --help prints subcommand help" {
+    var stdout_buffer: [8192]u8 = undefined;
+    var stderr_buffer: [128]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", "--help" }, std.testing.io, &stdout, &stderr);
+    const output = stdout_buffer[0..stdout.end];
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(std.mem.indexOf(u8, output, "matcha serve") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Usage:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "--host") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "--port") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "--interval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "27004") != null);
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "serve -h alias prints subcommand help" {
+    var stdout_buffer: [8192]u8 = undefined;
+    var stderr_buffer: [128]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", "-h" }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], "matcha serve") != null);
+}
+
+test "serve accepts a real directory and reports validation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", tmp.dir.path.? }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "directory validation succeeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], tmp.dir.path.?) != null);
+    try std.testing.expectEqual(@as(usize, 0), stdout.end);
+}
+
+test "serve rejects a missing directory with usage" {
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{"serve"}, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Missing value for directory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Usage: matcha serve") != null);
+    try std.testing.expectEqual(@as(usize, 0), stdout.end);
+}
+
+test "serve rejects an invalid directory with not a directory error" {
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", "/tmp/matcha-nonexistent-xyz-12345" }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Not a directory:") != null);
+    try std.testing.expectEqual(@as(usize, 0), stdout.end);
+}
+
+test "serve rejects extra positional arguments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", tmp.dir.path.?, "/extra" }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Unexpected argument:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Usage: matcha serve") != null);
+}
+
+test "serve rejects invalid port" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", "--port", "abc", tmp.dir.path.? }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Invalid port:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Usage: matcha serve") != null);
+}
+
+test "serve rejects invalid interval" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", "--interval", "0", tmp.dir.path.? }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Invalid interval:") != null);
+}
+
+test "serve rejects unknown flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", "--theme", "dracula", tmp.dir.path.? }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Unknown option:") != null);
+}
+
+test "serve rejects a file path as directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/not-a-dir.txt", .{tmp.dir.path.?});
+    defer std.testing.allocator.free(file_path);
+    try tmp.dir.writeFile("not-a-dir.txt", "data");
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{ "serve", file_path }, std.testing.io, &stdout, &stderr);
+    try std.testing.expectEqual(ExitCode.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Not a directory:") != null);
+}
+
+test "root help mentions serve command" {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stderr_buffer: [128]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+
+    const code = try runArgs(&.{"help"}, std.testing.io, &stdout, &stderr);
+    const output = stdout_buffer[0..stdout.end];
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(std.mem.indexOf(u8, output, "serve            Serve generated Matcha HTML artifacts on the local network") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "matcha serve --help") != null);
+}
+
+test "existing plan and map behavior unchanged by serve addition" {
+    {
+        var stdout_buffer: [64]u8 = undefined;
+        var stderr_buffer: [128]u8 = undefined;
+        var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+        var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+        const code = try runArgs(&.{"version"}, std.testing.io, &stdout, &stderr);
+        try std.testing.expectEqual(ExitCode.ok, code);
+        try std.testing.expectEqualStrings("matcha 0.1.0\n", stdout_buffer[0..stdout.end]);
+    }
+
+    {
+        var stdout_buffer: [4096]u8 = undefined;
+        var stderr_buffer: [128]u8 = undefined;
+        var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+        var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+        const code = try runArgs(&.{ "plan", "--wat" }, std.testing.io, &stdout, &stderr);
+        try std.testing.expectEqual(ExitCode.usage, code);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Unknown option: --wat") != null);
+    }
+
+    {
+        var stdout_buffer: [4096]u8 = undefined;
+        var stderr_buffer: [128]u8 = undefined;
+        var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+        var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+        const code = try runArgs(&.{ "map", "--wat" }, std.testing.io, &stdout, &stderr);
+        try std.testing.expectEqual(ExitCode.usage, code);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Unknown option: --wat") != null);
+    }
+
+    {
+        var stdout_buffer: [4096]u8 = undefined;
+        var stderr_buffer: [128]u8 = undefined;
+        var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+        var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+        const code = try runArgs(&.{"nope"}, std.testing.io, &stdout, &stderr);
+        try std.testing.expectEqual(ExitCode.usage, code);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Unknown command: nope") != null);
+    }
 }
 
 fn expectRenderOptions(result: RenderOptionsResult) RenderOptions {

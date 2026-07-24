@@ -5,6 +5,7 @@ pub const path = @import("path.zig");
 pub const json_input = @import("json_input.zig");
 pub const render_html = @import("render_html.zig");
 pub const render_markdown = @import("render_markdown.zig");
+pub const serve_options = @import("serve_options.zig");
 
 pub const version = cli.version;
 
@@ -21,4 +22,5 @@ test "root imports CLI modules without dependency cycles" {
     try std.testing.expect(path.hasParentDirectory("dist/map.html"));
     try std.testing.expectEqualStrings("sample_map.json", render_html.defaultInput(.map));
     try std.testing.expectEqualStrings("# ", render_markdown.headingPrefix(.plan));
+    try std.testing.expectEqual(@as(u16, 27004), serve_options.default_port);
 }
