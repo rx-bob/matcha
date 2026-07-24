@@ -7,6 +7,12 @@ pub const default_host: []const u8 = "0.0.0.0";
 pub const default_port: u16 = 27004;
 pub const default_interval_seconds: u32 = 5;
 
+pub const ExitCode = enum(u8) {
+    ok = 0,
+    usage = 1,
+    failure = 2,
+};
+
 pub const ServeOptions = struct {
     directory: []const u8,
     directory_set: bool = false,

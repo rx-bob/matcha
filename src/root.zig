@@ -6,6 +6,7 @@ pub const json_input = @import("json_input.zig");
 pub const render_html = @import("render_html.zig");
 pub const render_markdown = @import("render_markdown.zig");
 pub const serve_options = @import("serve_options.zig");
+pub const serve = @import("serve.zig");
 
 pub const version = cli.version;
 

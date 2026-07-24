@@ -8,14 +8,11 @@ const render_html = @import("render_html.zig");
 const render_markdown = @import("render_markdown.zig");
 const plan_read = @import("plan_read.zig");
 const serve_options = @import("serve_options.zig");
+const serve = @import("serve.zig");
 
 pub const version = "0.1.0";
 
-pub const ExitCode = enum(u8) {
-    ok = 0,
-    usage = 1,
-    failure = 2,
-};
+pub const ExitCode = serve_options.ExitCode;
 
 pub const RenderOptions = struct {
     target: render_html.RenderTarget,
@@ -224,8 +221,47 @@ fn runServeCommand(
     }
 
     var stdin_acquirer = stdinDirectoryAcquirer(io);
-    return runServeCommandAcquired(io, args, stdout, stderr, stdin_acquirer.acquirer());
+    return runServeCommandAcquired(io, args, stdout, stderr, stdin_acquirer.acquirer(), realServerRunner());
 }
+
+/// Injectable server runner so command dispatch can be exercised without
+/// starting a real blocking listener.
+pub const ServerRunner = struct {
+    context: *anyopaque,
+    runFn: *const fn (context: *anyopaque, io: std.Io, options: serve_options.ServeOptions, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!ExitCode,
+
+    pub fn run(
+        self: ServerRunner,
+        io: std.Io,
+        options: serve_options.ServeOptions,
+        stdout: *std.Io.Writer,
+        stderr: *std.Io.Writer,
+    ) anyerror!ExitCode {
+        return self.runFn(self.context, io, options, stdout, stderr);
+    }
+};
+
+var real_runner_storage: RealServerRunner = .{};
+
+fn realServerRunner() ServerRunner {
+    return .{
+        .context = @ptrCast(&real_runner_storage),
+        .runFn = RealServerRunner.run,
+    };
+}
+
+const RealServerRunner = struct {
+    fn run(
+        context: *anyopaque,
+        io: std.Io,
+        options: serve_options.ServeOptions,
+        stdout: *std.Io.Writer,
+        stderr: *std.Io.Writer,
+    ) anyerror!ExitCode {
+        _ = context;
+        return serve.run(io, options, stdout, stderr);
+    }
+};
 
 fn runServeCommandAcquired(
     io: std.Io,
@@ -233,6 +269,7 @@ fn runServeCommandAcquired(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     acquirer: DirectoryAcquirer,
+    runner: ServerRunner,
 ) !ExitCode {
     if (args.len > 0 and isHelpCommand(args[0])) {
         try writeServeHelp(stdout);
@@ -265,11 +302,7 @@ fn runServeCommandAcquired(
         return .usage;
     }
 
-    try stderr.print(
-        "matcha serve: directory validation succeeded for {s} (listener not yet implemented)\n",
-        .{options.directory},
-    );
-    return .ok;
+    return runner.run(io, options, stdout, stderr);
 }
 
 /// Outcome of acquiring a serve directory interactively or from arguments.
@@ -1223,11 +1256,19 @@ test "serve accepts a real directory and reports validation" {
     var stdout: std.Io.Writer = .fixed(&stdout_buffer);
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
 
-    const code = try runArgs(&.{ "serve", tmp.dir.path.? }, std.testing.io, &stdout, &stderr);
+    var runner = FakeServerRunner{};
+    const code = try runServeCommandAcquired(
+        std.testing.io,
+        &.{tmp.dir.path.?},
+        &stdout,
+        &stderr,
+        nonInteractiveAcquirer().acquirer(),
+        runner.runner(),
+    );
     try std.testing.expectEqual(ExitCode.ok, code);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "directory validation succeeded") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], tmp.dir.path.?) != null);
-    try std.testing.expectEqual(@as(usize, 0), stdout.end);
+    try std.testing.expect(runner.last_options != null);
+    try std.testing.expect(runner.last_options.?.directory_set);
+    try std.testing.expectEqualStrings(tmp.dir.path.?, runner.last_options.?.directory);
 }
 
 test "serve rejects a missing directory with usage in non-interactive mode" {
@@ -1237,18 +1278,21 @@ test "serve rejects a missing directory with usage in non-interactive mode" {
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
 
     var harness = nonInteractiveAcquirer();
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.usage, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Missing value for directory") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Usage: matcha serve") != null);
     try std.testing.expectEqual(@as(usize, 0), stdout.end);
     try std.testing.expect(!harness.readLineCalled());
+    try std.testing.expect(runner.last_options == null);
 }
 
 test "serve non-interactive missing directory returns usage without reading input" {
@@ -1259,12 +1303,14 @@ test "serve non-interactive missing directory returns usage without reading inpu
 
     var harness = nonInteractiveAcquirer();
     harness.line = "should-not-be-read";
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.usage, code);
     try std.testing.expect(!harness.readLineCalled());
@@ -1284,17 +1330,20 @@ test "serve prompts interactively and accepts a valid entered directory" {
     harness.line = try std.testing.allocator.dupe(u8, tmp.dir.path.?);
     defer std.testing.allocator.free(harness.line.?);
 
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.ok, code);
     try std.testing.expect(harness.readLineCalled());
     try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], "Directory to serve:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "directory validation succeeded") != null);
+    try std.testing.expect(runner.last_options != null);
+    try std.testing.expectEqualStrings(tmp.dir.path.?, runner.last_options.?.directory);
 }
 
 test "serve prompted path supports home expansion" {
@@ -1329,15 +1378,18 @@ test "serve prompted path supports home expansion" {
     harness.line = try allocator.dupe(u8, prompted_path);
     defer allocator.free(harness.line.?);
 
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.ok, code);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "directory validation succeeded") != null);
+    try std.testing.expect(runner.last_options != null);
+    try std.testing.expectEqualStrings(home_target, runner.last_options.?.directory);
 }
 
 test "serve interactive empty response fails without re-prompting" {
@@ -1351,12 +1403,14 @@ test "serve interactive empty response fails without re-prompting" {
     harness.line = try std.testing.allocator.dupe(u8, "");
     defer std.testing.allocator.free(harness.line.?);
 
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.usage, code);
     try std.testing.expect(harness.readLineCalled());
@@ -1374,12 +1428,14 @@ test "serve interactive end-of-file fails without re-prompting" {
     defer harness.deinit(std.testing.allocator);
     harness.end_of_file = true;
 
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.usage, code);
     try std.testing.expect(harness.readLineCalled());
@@ -1397,12 +1453,14 @@ test "serve interactive invalid entered directory fails with not a directory" {
     harness.line = try std.testing.allocator.dupe(u8, "/tmp/matcha-interactive-nonexistent-xyz");
     defer std.testing.allocator.free(harness.line.?);
 
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.usage, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Not a directory:") != null);
@@ -1419,17 +1477,20 @@ test "serve explicit directory never triggers a prompt" {
 
     var harness = nonInteractiveAcquirer();
     harness.line = "should-not-be-read";
+    var runner = FakeServerRunner{};
     const code = try runServeCommandAcquired(
         std.testing.io,
         &.{tmp.dir.path.?},
         &stdout,
         &stderr,
         harness.acquirer(),
+        runner.runner(),
     );
     try std.testing.expectEqual(ExitCode.ok, code);
     try std.testing.expect(!harness.readLineCalled());
     try std.testing.expectEqual(@as(usize, 0), stdout.end);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "directory validation succeeded") != null);
+    try std.testing.expect(runner.last_options != null);
+    try std.testing.expectEqualStrings(tmp.dir.path.?, runner.last_options.?.directory);
 }
 
 const FakeDirectoryAcquirer = struct {
@@ -1475,6 +1536,35 @@ fn nonInteractiveAcquirer() FakeDirectoryAcquirer {
 fn interactiveAcquirer(_: std.mem.Allocator) FakeDirectoryAcquirer {
     return .{ .interactive = true };
 }
+
+const FakeServerRunner = struct {
+    last_options: ?serve_options.ServeOptions = null,
+    last_stdout: ?*std.Io.Writer = null,
+    last_stderr: ?*std.Io.Writer = null,
+    exit_code: ExitCode = .ok,
+
+    fn run(
+        context: *anyopaque,
+        io: std.Io,
+        options: serve_options.ServeOptions,
+        stdout: *std.Io.Writer,
+        stderr: *std.Io.Writer,
+    ) anyerror!ExitCode {
+        _ = io;
+        const self: *FakeServerRunner = @ptrCast(@alignCast(context));
+        self.last_options = options;
+        self.last_stdout = stdout;
+        self.last_stderr = stderr;
+        return self.exit_code;
+    }
+
+    fn runner(self: *FakeServerRunner) ServerRunner {
+        return .{
+            .context = @ptrCast(self),
+            .runFn = FakeServerRunner.run,
+        };
+    }
+};
 
 test "serve rejects an invalid directory with not a directory error" {
     var stdout_buffer: [1024]u8 = undefined;
