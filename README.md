@@ -1,10 +1,7 @@
 # Matcha 🍵
 
-Matcha is is a finely ground powder of green tea specially processed from shade-grown tea leaves but its also a CLI.
-The Matcha CLI lets your agent output static artifacts like a plan or a map, without having to worry about semi-functional / semi-broken vibe coded UIs.
-Furthermore matcha lets you escape the markdown flavoured hellscape that interacting with a clanker has become.
-
-tl;dr: Matcha turns agentic output into human friendly plans & maps.
+Matcha is a CLI that lets you escape the modern markdown hell when working with an agent. You tell it to create a plan or a map with matcha & sit back and relax. No need to worry about semi-functional / semi-broken UIs.
+Matcha gives the best of both worlds, structured easily readable output for the human and noise-free markdown for the clanker.
 
 ## Install
 
