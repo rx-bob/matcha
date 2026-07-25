@@ -1,61 +1,178 @@
 <script lang="ts">
-  import { onMount } from "svelte"
+  import { onMount, onDestroy } from "svelte"
   import {
+    catalogsEqual,
+    filterProjects,
     isEmptyCatalog,
+    normalizeSearch,
     parseCatalog,
     toProjectDisplays,
     totalArtifactCount,
+    type Catalog,
     type ProjectDisplay,
+    type TypeFilter,
   } from "./lib/catalog.ts"
   import ProjectSection from "./components/serve/ProjectSection.svelte"
   import EmptyState from "./components/serve/EmptyState.svelte"
 
   export let catalogUrl: string
+  export let pollIntervalMs: number = 5000
 
   type LoadState = "loading" | "loaded" | "error"
   let state: LoadState = "loading"
   let errorMessage = ""
   let projects: ProjectDisplay[] = []
   let warningCount = 0
+  let lastRefreshed: Date | null = null
+  let refreshError = false
+
+  // Search + filter state, preserved across refreshes.
+  let searchInput = ""
+  let typeFilter: TypeFilter = "all"
+
+  // Polling control.
+  let pollTimer: ReturnType<typeof setTimeout> | null = null
+  let inFlight = false
+  let destroyed = false
+
+  function clearPollTimer(): void {
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer)
+      pollTimer = null
+    }
+  }
+
+  function scheduleNextPoll(): void {
+    clearPollTimer()
+    if (destroyed) return
+    if (typeof document !== "undefined" && document.hidden) return
+    pollTimer = setTimeout(() => {
+      void refreshCatalog()
+    }, pollIntervalMs)
+  }
 
   async function refreshCatalog(): Promise<void> {
+    if (inFlight) return
+    inFlight = true
     try {
       const response = await fetch(catalogUrl, {
         headers: { Accept: "application/json" },
       })
       if (!response.ok) {
-        state = "error"
-        errorMessage = `Server returned ${response.status} ${response.statusText}`.trim()
+        if (state === "loading") {
+          state = "error"
+          errorMessage = `Server returned ${response.status} ${response.statusText}`.trim()
+        } else {
+          // Recoverable: keep previous catalog, surface restrained error.
+          refreshError = true
+        }
         return
       }
       const json: unknown = await response.json()
-      const catalog = parseCatalog(json)
-      projects = toProjectDisplays(catalog)
-      warningCount = catalog.warnings.length
+      const newCatalog = parseCatalog(json)
+      // Replace the displayed model only after a successful response, and
+      // avoid rerender churn when the payload is unchanged.
+      if (lastCatalog === null || !catalogsEqual(lastCatalog, newCatalog)) {
+        projects = toProjectDisplays(newCatalog)
+        warningCount = newCatalog.warnings.length
+        lastCatalog = newCatalog
+      }
+      refreshError = false
       state = "loaded"
+      lastRefreshed = new Date()
     } catch (err) {
-      state = "error"
-      errorMessage = err instanceof Error ? err.message : "Catalog request failed"
+      if (state === "loading") {
+        state = "error"
+        errorMessage = err instanceof Error ? err.message : "Catalog request failed"
+      } else {
+        refreshError = true
+      }
+    } finally {
+      inFlight = false
+      scheduleNextPoll()
+    }
+  }
+
+  let lastCatalog: Catalog | null = null
+
+  function handleVisibilityChange(): void {
+    if (document.hidden) {
+      clearPollTimer()
+    } else {
+      // Refresh immediately on returning to the tab, then resume polling.
+      void refreshCatalog()
     }
   }
 
   onMount(() => {
     void refreshCatalog()
+    document.addEventListener("visibilitychange", handleVisibilityChange)
   })
 
+  onDestroy(() => {
+    destroyed = true
+    clearPollTimer()
+    document.removeEventListener("visibilitychange", handleVisibilityChange)
+  })
+
+  $: normalizedQuery = normalizeSearch(searchInput)
   $: totalArtifacts =
     state === "loaded" ? projects.reduce((sum, p) => sum + p.artifacts.length, 0) : 0
   $: showEmpty = state === "loaded" && totalArtifacts === 0
+  $: visibleProjects = filterProjects(projects, normalizedQuery, typeFilter)
+  $: noMatches = state === "loaded" && totalArtifacts > 0 && visibleProjects.length === 0
+  $: lastRefreshedLabel = lastRefreshed
+    ? lastRefreshed.toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    : ""
 </script>
 
 <main class="matcha-serve">
   <header class="serve-header">
     <h1>matcha serve</h1>
     {#if state === "loaded" && totalArtifacts > 0}
+      <div class="serve-controls">
+        <input
+          class="serve-search"
+          type="search"
+          placeholder="Search project, title, or path"
+          aria-label="Search catalog"
+          bind:value={searchInput}
+        />
+        <div class="serve-filter" role="group" aria-label="Filter by type">
+          <button
+            class="serve-filter-btn"
+            class:active={typeFilter === "all"}
+            aria-pressed={typeFilter === "all"}
+            on:click={() => (typeFilter = "all")}
+          >All</button>
+          <button
+            class="serve-filter-btn"
+            class:active={typeFilter === "plan"}
+            aria-pressed={typeFilter === "plan"}
+            on:click={() => (typeFilter = "plan")}
+          >Plans</button>
+          <button
+            class="serve-filter-btn"
+            class:active={typeFilter === "map"}
+            aria-pressed={typeFilter === "map"}
+            on:click={() => (typeFilter = "map")}
+          >Maps</button>
+        </div>
+      </div>
       <p class="serve-summary">
         {totalArtifacts} artifact{totalArtifacts === 1 ? "" : "s"}
         {#if warningCount > 0}
           <span class="serve-warnings">({warningCount} warning{warningCount === 1 ? "" : "s"})</span>
+        {/if}
+        {#if lastRefreshedLabel}
+          <span class="serve-refreshed">last refreshed {lastRefreshedLabel}</span>
+        {/if}
+        {#if refreshError}
+          <span class="serve-refresh-error" role="alert">refresh failed; showing previous catalog</span>
         {/if}
       </p>
     {/if}
@@ -70,11 +187,11 @@
       Could not load the catalog: {errorMessage}
     </p>
     <button class="serve-retry" on:click={refreshCatalog}>Retry</button>
+  {:else if noMatches}
+    <p class="serve-no-matches">No artifacts match the current search or filter.</p>
   {:else}
-    {#each projects as project (project.name)}
-      {#if project.artifacts.length > 0}
-        <ProjectSection {project} />
-      {/if}
+    {#each visibleProjects as project (project.name)}
+      <ProjectSection {project} />
     {/each}
   {/if}
 </main>
@@ -92,26 +209,86 @@
     margin-bottom: 1.5rem;
   }
   .serve-header h1 {
-    margin: 0 0 0.25rem;
+    margin: 0 0 0.75rem;
     font-size: 1.75rem;
     font-weight: 600;
+  }
+  .serve-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+  .serve-search {
+    flex: 1 1 220px;
+    min-width: 0;
+    padding: 0.4rem 0.6rem;
+    font: inherit;
+    font-size: 0.9rem;
+    border: 1px solid #ccc;
+    border-radius: 0.3rem;
+    background: #fff;
+    color: inherit;
+  }
+  .serve-search:focus-visible {
+    outline: 2px solid #1e66f5;
+    outline-offset: 1px;
+  }
+  .serve-filter {
+    display: flex;
+    gap: 0.25rem;
+  }
+  .serve-filter-btn {
+    padding: 0.35rem 0.7rem;
+    font: inherit;
+    font-size: 0.8rem;
+    border: 1px solid #ccc;
+    border-radius: 0.3rem;
+    background: #f8f8f8;
+    cursor: pointer;
+    color: inherit;
+  }
+  .serve-filter-btn:hover {
+    background: #eee;
+  }
+  .serve-filter-btn.active {
+    background: #1e66f5;
+    color: #fff;
+    border-color: #1e66f5;
+  }
+  .serve-filter-btn:focus-visible {
+    outline: 2px solid #1e66f5;
+    outline-offset: 1px;
   }
   .serve-summary {
     margin: 0;
     color: #666;
-    font-size: 0.875rem;
+    font-size: 0.8rem;
   }
   .serve-warnings {
     margin-left: 0.5rem;
     color: #b8860b;
   }
+  .serve-refreshed {
+    margin-left: 0.5rem;
+    color: #888;
+  }
+  .serve-refresh-error {
+    margin-left: 0.5rem;
+    color: #b22222;
+  }
   .serve-loading,
-  .serve-error {
+  .serve-error,
+  .serve-no-matches {
     padding: 1rem 0;
     font-size: 0.95rem;
   }
   .serve-error {
     color: #b22222;
+  }
+  .serve-no-matches {
+    color: #666;
   }
   .serve-retry {
     margin-top: 0.5rem;
@@ -232,6 +409,13 @@
   @media (max-width: 600px) {
     .matcha-serve {
       padding: 1rem;
+    }
+    .serve-controls {
+      flex-direction: column;
+      align-items: stretch;
+    }
+    .serve-filter {
+      justify-content: space-between;
     }
     :global(.project-cards) {
       grid-template-columns: 1fr;

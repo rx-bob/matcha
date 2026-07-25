@@ -229,5 +229,173 @@ export function isCatalog(value: unknown): value is Catalog {
   return isObject(value) && Array.isArray(value.projects) && Array.isArray(value.warnings)
 }
 
+/// Type filter selection for the catalog UI. "all" shows every artifact;
+/// "plan" and "map" restrict to that kind.
+export type TypeFilter = "all" | "plan" | "map"
+
+/// Normalize a search query for case-insensitive, whitespace-tolerant
+/// matching. Returns a lowercased string with runs of whitespace collapsed
+/// to single spaces and trimmed. Empty or whitespace-only queries return an
+/// empty string, which means "match everything".
+export function normalizeSearch(query: string): string {
+  if (!query) return ""
+  return query.trim().toLowerCase().replace(/\s+/g, " ")
+}
+
+/// True when a normalized search query matches an artifact. The query is
+/// tested against the project name, artifact title, and relative path. An
+/// empty query matches every artifact so callers can combine search with a
+/// type filter without short-circuiting.
+export function artifactMatchesSearch(
+  artifact: ArtifactDisplay,
+  projectName: string,
+  normalizedQuery: string,
+): boolean {
+  if (normalizedQuery.length === 0) return true
+  if (projectName.toLowerCase().includes(normalizedQuery)) return true
+  if (artifact.title.toLowerCase().includes(normalizedQuery)) return true
+  if (artifact.relPath.toLowerCase().includes(normalizedQuery)) return true
+  return false
+}
+
+/// True when an artifact passes the type filter. "all" passes every kind.
+export function artifactMatchesFilter(artifact: ArtifactDisplay, filter: TypeFilter): boolean {
+  if (filter === "all") return true
+  return artifact.kind === filter
+}
+
+/// Filter a list of project display models by a combined search query and
+/// type filter. Projects whose artifacts all fail the filters are dropped so
+/// the UI never renders empty project sections. Project ordering and the
+/// artifact ordering within each surviving project are preserved (server
+/// determinism). The caller is expected to pass an already-normalized
+/// search query via `normalizeSearch`.
+export function filterProjects(
+  projects: ProjectDisplay[],
+  normalizedQuery: string,
+  filter: TypeFilter,
+): ProjectDisplay[] {
+  if (normalizedQuery.length === 0 && filter === "all") {
+    return projects.filter((p) => p.artifacts.length > 0)
+  }
+  const result: ProjectDisplay[] = []
+  for (const project of projects) {
+    const matching = project.artifacts.filter(
+      (artifact) =>
+        artifactMatchesFilter(artifact, filter) &&
+        artifactMatchesSearch(artifact, project.name, normalizedQuery),
+    )
+    if (matching.length > 0) {
+      result.push({ name: project.name, artifacts: matching })
+    }
+  }
+  return result
+}
+
+/// Compare two catalog payloads for value equality. Used by the polling loop
+/// to decide whether the displayed model needs to change after a successful
+/// fetch. Compares the project names, artifact counts, and the per-artifact
+/// relPath/url/kind/mtime/size tuple so unchanged rescans do not cause
+/// rerender churn while genuine changes still refresh the view. Optional
+/// metadata fields (title, status, generatedAt, diagramKind) are compared
+/// too so edits that only change those fields still refresh.
+export function catalogsEqual(a: Catalog, b: Catalog): boolean {
+  if (a === b) return true
+  if (a.projects.length !== b.projects.length) return false
+  if (a.warnings.length !== b.warnings.length) return false
+  for (let i = 0; i < a.projects.length; i++) {
+    const ap = a.projects[i]
+    const bp = b.projects[i]
+    if (ap.name !== bp.name) return false
+    if (ap.artifacts.length !== bp.artifacts.length) return false
+    for (let j = 0; j < ap.artifacts.length; j++) {
+      if (!artifactsEqual(ap.artifacts[j], bp.artifacts[j])) return false
+    }
+  }
+  for (let i = 0; i < a.warnings.length; i++) {
+    if (a.warnings[i].relPath !== b.warnings[i].relPath) return false
+    if (a.warnings[i].reason !== b.warnings[i].reason) return false
+  }
+  return true
+}
+
+function artifactsEqual(a: CatalogArtifact, b: CatalogArtifact): boolean {
+  return (
+    a.relPath === b.relPath &&
+    a.url === b.url &&
+    a.kind === b.kind &&
+    a.group === b.group &&
+    a.size === b.size &&
+    a.mtime === b.mtime &&
+    a.title === b.title &&
+    a.project === b.project &&
+    a.status === b.status &&
+    a.generatedAt === b.generatedAt &&
+    a.diagramKind === b.diagramKind
+  )
+}
+
+/// State machine for the catalog polling loop. The loop drives transitions
+/// between fetch attempts so behavior is deterministic and unit-testable
+/// without a real timer. The machine is pure: callers feed it events and
+/// read the next state, then apply side effects (network, timers, DOM).
+export type PollState =
+  | { phase: "idle" }
+  | { phase: "fetching" }
+  | { phase: "paused" }
+
+export type PollEvent =
+  | { type: "start" }
+  | { type: "stop" }
+  | { type: "fetch-succeeded"; catalog: Catalog; unchanged: boolean }
+  | { type: "fetch-failed" }
+  | { type: "visibility"; hidden: boolean }
+  | { type: "interval-elapsed" }
+
+/// Advance the polling state machine by one event. Returns the next state
+/// and the side effect the caller should perform.
+export type PollEffect =
+  | { kind: "none" }
+  | { kind: "fetch" }
+  | { kind: "schedule-next" }
+  | { kind: "pause" }
+  | { kind: "resume" }
+
+export function reducePoll(
+  state: PollState,
+  event: PollEvent,
+): { state: PollState; effect: PollEffect } {
+  switch (event.type) {
+    case "start":
+      return { state: { phase: "fetching" }, effect: { kind: "fetch" } }
+    case "stop":
+      return { state: { phase: "idle" }, effect: { kind: "none" } }
+    case "fetch-succeeded":
+      if (state.phase === "idle") return { state, effect: { kind: "none" } }
+      return { state: { phase: "fetching" }, effect: { kind: "schedule-next" } }
+    case "fetch-failed":
+      if (state.phase === "idle") return { state, effect: { kind: "none" } }
+      return { state: { phase: "fetching" }, effect: { kind: "schedule-next" } }
+    case "visibility":
+      if (event.hidden) {
+        if (state.phase === "fetching") {
+          return { state: { phase: "paused" }, effect: { kind: "pause" } }
+        }
+        // Already paused or idle: nothing to do.
+        return { state, effect: { kind: "none" } }
+      }
+      // became visible
+      if (state.phase === "paused") {
+        return { state: { phase: "fetching" }, effect: { kind: "resume" } }
+      }
+      return { state, effect: { kind: "none" } }
+    case "interval-elapsed":
+      if (state.phase === "fetching") {
+        return { state: { phase: "fetching" }, effect: { kind: "fetch" } }
+      }
+      return { state, effect: { kind: "none" } }
+  }
+}
+
 /// Re-export JsonValue for callers that build catalog fixtures.
 export type { JsonValue }
