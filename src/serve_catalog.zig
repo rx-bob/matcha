@@ -921,7 +921,7 @@ pub const Scanner = struct {
 
     /// Spawn the background worker. Must be called after `initialScan`.
     pub fn start(self: *Scanner) !void {
-        self.thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{self});
+        self.thread = try std.Thread.spawn(.{}, worker, .{self});
     }
 
     /// Signal shutdown, wake the worker, and join it. Releases the current
