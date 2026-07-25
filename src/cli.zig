@@ -45,7 +45,7 @@ pub fn run(init: std.process.Init) !void {
     try stderr.flush();
 
     if (exit_code != .ok) {
-        std.process.exit(@intFromEnum(exit_code));
+        std.process.exit(@backingInt(exit_code));
     }
 }
 

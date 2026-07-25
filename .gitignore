@@ -15,6 +15,7 @@ client/dist/
 
 # Build output
 dist/
+.task/
 
 # Logs
 *.log

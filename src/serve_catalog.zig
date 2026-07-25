@@ -680,7 +680,7 @@ fn entryLessThan(_: void, a: CatalogEntry, b: CatalogEntry) bool {
         .gt => return false,
         .eq => {},
     }
-    if (a.kind != b.kind) return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+    if (a.kind != b.kind) return @backingInt(a.kind) < @backingInt(b.kind);
     return std.mem.lessThan(u8, a.rel_path, b.rel_path);
 }
 

@@ -51,11 +51,27 @@ tasks:
   build-client:
     desc: Build the self-contained plan, map, and serve client bundles
     dir: client
+    sources:
+      - package.json
+      - package-lock.json
+      - tsconfig.json
+      - vite.config.ts
+      - src/**/*
+    generates:
+      - ../plan.js
+      - ../plan-components.css
+      - ../map.js
+      - ../map.css
+      - ../serve.js
+      - ../serve.css
     cmds:
+      - npm ci
       - npm run build
 
   build:
     desc: Compile the CLI executable into dist (including embedded serve assets)
+    deps:
+      - build-client
     cmds:
       - mkdir -p dist
       - zig build release

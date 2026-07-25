@@ -37,7 +37,7 @@ fn resetListenFd() void {
 fn installShutdownHandler() void {
     const handler: std.posix.Sigaction = .{
         .handler = .{ .handler = signalHandler },
-        .mask = 0,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.INT, &handler, null);

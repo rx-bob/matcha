@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const exe = b.addExecutable(.{
@@ -27,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("root.zig"),
         .target = target,
         .optimize = .ReleaseSafe,
+        .link_libc = true,
     });
 
     const release_exe = b.addExecutable(.{
