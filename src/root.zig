@@ -9,6 +9,7 @@ pub const serve_options = @import("serve_options.zig");
 pub const serve_catalog = @import("serve_catalog.zig");
 pub const serve_routes = @import("serve_routes.zig");
 pub const serve = @import("serve.zig");
+pub const serve_test = @import("serve_test.zig");
 
 pub const version = cli.version;
 
