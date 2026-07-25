@@ -7,6 +7,7 @@ pub const render_html = @import("render_html.zig");
 pub const render_markdown = @import("render_markdown.zig");
 pub const serve_options = @import("serve_options.zig");
 pub const serve_catalog = @import("serve_catalog.zig");
+pub const serve_routes = @import("serve_routes.zig");
 pub const serve = @import("serve.zig");
 
 pub const version = cli.version;

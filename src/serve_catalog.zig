@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const serve_routes = @import("serve_routes.zig");
+
 /// Maximum number of bytes read from an artifact while classifying it. The
 /// plan/map markers emitted by the renderers appear near the top of the file,
 /// so a bounded prefix is enough and avoids loading whole files into memory.
@@ -612,6 +614,8 @@ pub fn writeCatalogJson(
             const entry = catalog.entries[i];
             try writer.writeAll("{\"relPath\":");
             try appendJsonStringJson(writer, entry.rel_path);
+            try writer.writeAll(",\"url\":");
+            try serve_routes.writeArtifactUrl(writer, entry.rel_path);
             try writer.writeAll(",\"kind\":");
             try appendJsonStringJson(writer, switch (entry.kind) {
                 .plan => "plan",
@@ -1684,6 +1688,9 @@ test "writeCatalogJson produces sorted JSON with no absolute paths" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"diagramKind\":\"class\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"generatedAt\":\"2026-07-24T00:00:00Z\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"warnings\":[]") != null);
+    // Stable catalog-safe URL is emitted for each artifact.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/artifacts/proj/plan.html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/artifacts/proj/map.html\"") != null);
 }
 
 test "writeCatalogJson emits a valid empty projects shape" {
