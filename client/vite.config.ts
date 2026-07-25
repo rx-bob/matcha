@@ -3,6 +3,7 @@ import { defineConfig } from "vite"
 
 export default defineConfig(({ mode }) => {
   const isMap = mode === "map"
+  const isServe = mode === "serve"
 
   return {
     plugins: [svelte()],
@@ -10,11 +11,11 @@ export default defineConfig(({ mode }) => {
       outDir: "dist",
       emptyOutDir: false,
       lib: {
-        entry: isMap ? "src/map.ts" : "src/main.ts",
-        name: isMap ? "BobMapClient" : "BobPlanClient",
+        entry: isMap ? "src/map.ts" : isServe ? "src/serve.ts" : "src/main.ts",
+        name: isMap ? "BobMapClient" : isServe ? "BobServeClient" : "BobPlanClient",
         formats: ["iife"],
-        fileName: () => isMap ? "map.js" : "plan.js",
-        cssFileName: isMap ? "map" : "plan",
+        fileName: () => isMap ? "map.js" : isServe ? "serve.js" : "plan.js",
+        cssFileName: isMap ? "map" : isServe ? "serve" : "plan",
       },
       rollupOptions: {
         output: {

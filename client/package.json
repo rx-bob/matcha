@@ -3,9 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm run build:plan && npm run build:map",
+    "build": "npm run build:plan && npm run build:map && npm run build:serve",
     "build:plan": "vite build --mode plan && cp dist/plan.js ../plan.js && cp dist/plan.css ../plan-components.css",
-    "build:map": "vite build --mode map && cp dist/map.js ../map.js && cp dist/map.css ../map.css"
+    "build:map": "vite build --mode map && cp dist/map.js ../map.js && cp dist/map.css ../map.css",
+    "build:serve": "vite build --mode serve && cp dist/serve.js ../serve.js && cp dist/serve.css ../serve.css"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^6.2.1",

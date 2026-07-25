@@ -36,6 +36,16 @@ pub const map_css: TextAsset = .{
     .contents = @embedFile("../map.css"),
 };
 
+pub const serve_js: TextAsset = .{
+    .name = "serve.js",
+    .contents = @embedFile("../serve.js"),
+};
+
+pub const serve_css: TextAsset = .{
+    .name = "serve.css",
+    .contents = @embedFile("../serve.css"),
+};
+
 pub const llm_output_format: TextAsset = .{
     .name = "llm_output_format.txt",
     .contents = @embedFile("../llm_output_format.txt"),
@@ -52,6 +62,8 @@ pub const required_assets = [_]TextAsset{
     plan_components_css,
     map_js,
     map_css,
+    serve_js,
+    serve_css,
     llm_output_format,
     llm_uml_output_format,
 };
@@ -111,6 +123,22 @@ pub fn optionalMapJs() ?*const TextAsset {
     }
 
     return &map_js;
+}
+
+pub fn optionalServeJs() ?*const TextAsset {
+    if (serve_js.contents.len == 0) {
+        return null;
+    }
+
+    return &serve_js;
+}
+
+pub fn optionalServeCss() ?*const TextAsset {
+    if (serve_css.contents.len == 0) {
+        return null;
+    }
+
+    return &serve_css;
 }
 
 pub fn writeThemeCss(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -177,6 +205,21 @@ test "theme assets are non-empty and in CLI order" {
 test "format documents are available without file IO" {
     try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "Plan input format") != null);
     try std.testing.expect(std.mem.indexOf(u8, llm_uml_output_format.contents, "Map input format") != null);
+}
+
+test "embedded serve assets are non-empty and lookup-able" {
+    try std.testing.expect(serve_js.contents.len > 0);
+    try std.testing.expect(serve_css.contents.len > 0);
+    try std.testing.expectEqualStrings("serve.js", serve_js.name);
+    try std.testing.expectEqualStrings("serve.css", serve_css.name);
+
+    const looked_up_js = assetByName("serve.js").?;
+    try std.testing.expectEqualStrings(serve_js.contents, looked_up_js.contents);
+    const looked_up_css = assetByName("serve.css").?;
+    try std.testing.expectEqualStrings(serve_css.contents, looked_up_css.contents);
+
+    try std.testing.expect(optionalServeJs() != null);
+    try std.testing.expect(optionalServeCss() != null);
 }
 
 test "theme css can be streamed in manifest order" {

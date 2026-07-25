@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const assets = @import("assets.zig");
 const serve_options = @import("serve_options.zig");
 const serve_catalog = @import("serve_catalog.zig");
 const serve_routes = @import("serve_routes.zig");
@@ -189,8 +190,7 @@ fn handleConnection(io: std.Io, stream: net.Stream, scanner: *serve_catalog.Scan
         return;
     }
 
-    const body = indexBody(scanner);
-    try writeStatus(writer, .ok, "text/html; charset=utf-8", body);
+    try writeIndexResponse(writer);
     try writer.flush();
 }
 
@@ -394,13 +394,57 @@ fn writeStatus(
     try writer.writeAll(body);
 }
 
-fn indexBody(scanner: *serve_catalog.Scanner) []const u8 {
-    _ = scanner;
-    return "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">" ++
-        "<title>matcha serve</title></head><body>" ++
-        "<h1>matcha serve</h1>" ++
-        "<p>Catalog is not yet available.</p>" ++
-        "</body></html>";
+/// Compose and stream the self-contained serve index HTML response. The
+/// shell inlines the embedded serve JavaScript and CSS so the catalog UI is
+/// reachable without external files, CDNs, or the source checkout. The body
+/// references `/api/catalog` for live data and provides a `#serve-root`
+/// mount point consumed by the embedded Svelte client.
+///
+/// The content length is computed up front from the embedded asset lengths so
+/// the response carries an exact `Content-Length` header without buffering
+/// the whole body into a single allocation.
+fn writeIndexResponse(writer: *std.Io.Writer) !void {
+    const js = assets.optionalServeJs() orelse {
+        try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "serve assets unavailable");
+        return;
+    };
+    const css = assets.optionalServeCss() orelse {
+        try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "serve assets unavailable");
+        return;
+    };
+
+    const head =
+        "<!DOCTYPE html>\n" ++
+        "<html lang=\"en\">\n" ++
+        "<head>\n" ++
+        "<meta charset=\"UTF-8\">\n" ++
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" ++
+        "<title>matcha serve</title>\n" ++
+        "<style>\n";
+    const css_close = "</style>\n";
+    const script_open = "<script>\n";
+    const script_close = "</script>\n";
+    const tail =
+        "</head>\n" ++
+        "<body>\n" ++
+        "<div id=\"serve-root\"></div>\n" ++
+        "</body>\n" ++
+        "</html>\n";
+
+    const total = head.len + css.contents.len + css_close.len +
+        script_open.len + js.contents.len + script_close.len + tail.len;
+
+    try writer.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{total},
+    );
+    try writer.writeAll(head);
+    try writer.writeAll(css.contents);
+    try writer.writeAll(css_close);
+    try writer.writeAll(script_open);
+    try writer.writeAll(js.contents);
+    try writer.writeAll(script_close);
+    try writer.writeAll(tail);
 }
 
 /// Test helper that owns a temp directory and a scanner backed by it. Used so
@@ -449,12 +493,47 @@ test "resolveAddress parses explicit ipv4 host" {
     try std.testing.expectEqual(@as(u16, 8123), addr.ip4.port);
 }
 
-test "indexBody is deterministic HTML" {
-    var scanner_ctx = try testScanner();
-    defer scanner_ctx.deinit();
-    const body = indexBody(&scanner_ctx.scanner);
-    try std.testing.expect(std.mem.startsWith(u8, body, "<!DOCTYPE html>"));
-    try std.testing.expect(std.mem.indexOf(u8, body, "matcha serve") != null);
+test "writeIndexResponse emits a self-contained HTML shell with embedded assets" {
+    var buffer: [65536]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeIndexResponse(&writer);
+    const output = buffer[0..writer.end];
+
+    try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "Content-Type: text/html; charset=utf-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<!DOCTYPE html>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<title>matcha serve</title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<div id=\"serve-root\"></div>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<style>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<script>") != null);
+
+    const js_asset = assets.serve_js;
+    const css_asset = assets.serve_css;
+    try std.testing.expect(js_asset.contents.len > 0);
+    try std.testing.expect(css_asset.contents.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, output, js_asset.contents) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, css_asset.contents) != null);
+
+    const content_length_header = "Content-Length: ";
+    const cl_pos = std.mem.indexOf(u8, output, content_length_header).?;
+    const cl_start = cl_pos + content_length_header.len;
+    const cl_end = std.mem.indexOfScalarPos(u8, output, cl_start, '\r').?;
+    const cl_str = output[cl_start..cl_end];
+    const expected_len = std.fmt.parseInt(usize, cl_str, 10) catch unreachable;
+    const header_end = std.mem.indexOf(u8, output, "\r\n\r\n").? + 4;
+    try std.testing.expectEqual(expected_len, output.len - header_end);
+}
+
+test "writeIndexResponse makes no external network requests" {
+    var buffer: [65536]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeIndexResponse(&writer);
+    const output = buffer[0..writer.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "http://") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "https://") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "src=\"http") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "href=\"http") == null);
 }
 
 test "writeStatus emits a complete HTTP response" {
@@ -467,7 +546,7 @@ test "writeStatus emits a complete HTTP response" {
     try std.testing.expect(std.mem.endsWith(u8, output, "hello"));
 }
 
-test "run serves minimal index at slash on loopback ephemeral port" {
+test "run serves embedded index at slash on loopback ephemeral port" {
     const io = std.testing.io;
     var scanner_ctx = try testScanner();
     defer scanner_ctx.deinit();
