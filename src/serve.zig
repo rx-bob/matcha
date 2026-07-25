@@ -67,7 +67,9 @@ pub fn run(
 
     // Build the catalog scanner and run the initial scan synchronously so the
     // catalog is available before the server reports readiness. The worker
-    // thread refreshes the snapshot on the configured interval.
+    // thread refreshes the snapshot on the configured interval. Diagnostics
+    // are wired to stderr so scan warnings, failure, and recovery reach the
+    // operator without flooding output.
     var scanner = serve_catalog.Scanner.init(
         io,
         std.heap.page_allocator,
@@ -75,6 +77,7 @@ pub fn run(
         options.interval_seconds,
         serve_catalog.scan,
     );
+    scanner.enableDiagnostics(stderr);
     scanner.initialScan();
     defer scanner.stop();
 
@@ -84,7 +87,7 @@ pub fn run(
     installShutdownHandler();
 
     const bound_port = server.socket.address.getPort();
-    try writeStartupReport(stdout, options, bound_port);
+    try writeStartupReport(stdout, options, bound_port, &scanner);
 
     while (true) {
         const stream = server.accept(io) catch |err| switch (err) {
@@ -114,10 +117,40 @@ fn writeStartupReport(
     stdout: *std.Io.Writer,
     options: serve_options.ServeOptions,
     bound_port: u16,
+    scanner: *serve_catalog.Scanner,
 ) !void {
+    // Count artifacts in the current snapshot (zero when the initial scan
+    // failed). The snapshot is immutable for the duration of the guard.
+    var artifact_count: usize = 0;
+    {
+        var guard = scanner.snapshotLock();
+        defer guard.release();
+        if (guard.get()) |catalog| {
+            artifact_count = catalog.entries.len;
+        }
+    }
+
+    // The "open" URL uses a usable loopback host when the bind address is
+    // all-interfaces, so an operator on the host can click through. The
+    // configured bind address is reported separately so LAN exposure is clear.
+    const open_host: []const u8 = if (std.mem.eql(u8, options.host, "0.0.0.0"))
+        "127.0.0.1"
+    else
+        options.host;
+
+    const plural: []const u8 = if (artifact_count == 1) "artifact" else "artifacts";
+
     try stdout.print(
-        "matcha serve: root {s}\nmatcha serve: listening on {s}:{d} (scan interval {d}s)\n",
-        .{ options.directory, options.host, bound_port, options.interval_seconds },
+        "matcha serve: root {s}\n",
+        .{options.directory},
+    );
+    try stdout.print(
+        "matcha serve: serving {d} {s} at http://{s}:{d}/\n",
+        .{ artifact_count, plural, open_host, bound_port },
+    );
+    try stdout.print(
+        "matcha serve: listening on {s}:{d} (refresh every {d}s)\n",
+        .{ options.host, bound_port, options.interval_seconds },
     );
 }
 
@@ -797,6 +830,81 @@ test "run reports bind failure and exits non-zero" {
     const code = try run(io, options, @constCast(&stdout), &stderr);
     try std.testing.expectEqual(serve_options.ExitCode.failure, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "cannot bind") != null);
+}
+
+test "writeStartupReport prints root, artifact count, open url, bind, and interval" {
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+
+    const options: serve_options.ServeOptions = .{
+        .directory = "/tmp/example",
+        .host = "0.0.0.0",
+        .port = 27004,
+        .interval_seconds = 5,
+    };
+
+    try writeStartupReport(&stdout, options, 27004, &scanner_ctx.scanner);
+    const out = stdout_buffer[0..stdout.end];
+
+    // Root is reported.
+    try std.testing.expect(std.mem.indexOf(u8, out, "matcha serve: root /tmp/example") != null);
+    // Artifact count is reported (testScanner creates an empty directory).
+    try std.testing.expect(std.mem.indexOf(u8, out, "serving 0 artifacts") != null);
+    // Open URL uses loopback when bound to all interfaces.
+    try std.testing.expect(std.mem.indexOf(u8, out, "http://127.0.0.1:27004/") != null);
+    // Configured bind address is reported separately.
+    try std.testing.expect(std.mem.indexOf(u8, out, "listening on 0.0.0.0:27004") != null);
+    // Refresh interval is reported.
+    try std.testing.expect(std.mem.indexOf(u8, out, "refresh every 5s") != null);
+}
+
+test "writeStartupReport uses singular 'artifact' for one entry" {
+    // Build a scanner with one fake artifact by writing a plan fixture.
+    var scanner_ctx = try testScannerWithOneArtifact();
+    defer scanner_ctx.deinit();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+
+    const options: serve_options.ServeOptions = .{
+        .directory = scanner_ctx.scanner.root,
+        .host = "127.0.0.1",
+        .port = 27004,
+        .interval_seconds = 5,
+    };
+
+    try writeStartupReport(&stdout, options, 27004, &scanner_ctx.scanner);
+    const out = stdout_buffer[0..stdout.end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "serving 1 artifact at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "http://127.0.0.1:27004/") != null);
+}
+
+/// Test helper that creates a temp directory containing one plan HTML fixture
+/// so the scanner has a non-empty catalog for startup-report assertions.
+fn testScannerWithOneArtifact() !TestScanner {
+    const io = std.testing.io;
+    const tmp = std.testing.tmpDir(.{});
+    const root = try std.heap.page_allocator.dupe(u8, tmp.dir.path.?);
+    errdefer std.heap.page_allocator.free(root);
+    try tmp.dir.writeFile("plan.html", minimalPlanHtml());
+    var scanner = serve_catalog.Scanner.init(
+        io,
+        std.heap.page_allocator,
+        root,
+        5,
+        serve_catalog.scan,
+    );
+    scanner.initialScan();
+    return .{ .tmp = tmp, .scanner = scanner };
+}
+
+fn minimalPlanHtml() []const u8 {
+    return "<!DOCTYPE html><html><head></head><body>" ++
+        "<script type=\"application/json\" id=\"plan-data\">{\"title\":\"x\"}</script>" ++
+        "</body></html>";
 }
 
 /// Test harness that captures the full response (status line + headers + body)

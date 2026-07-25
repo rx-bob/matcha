@@ -752,6 +752,23 @@ pub const Scanner = struct {
     last_scan_failed: bool = false,
     thread: ?std.Thread = null,
 
+    /// Optional operator diagnostic sink. When set, scan warnings and scan
+    /// failure/recovery transitions are reported here with relative paths and
+    /// concise reasons. Null keeps the scanner silent (preserving the
+    /// behavior of unit tests that do not assert on diagnostics).
+    stderr: ?*std.Io.Writer = null,
+    /// Warnings emitted by the previous successful scan, owned by the
+    /// scanner and used to deduplicate unchanged warnings across scans so a
+    /// persistent malformed file does not flood output every interval. Freed
+    /// and replaced after each successful scan; reset to empty on scan
+    /// failure so a warning that disappeared and later reappears is reported
+    /// again.
+    prev_warnings: []ScanWarning = &.{},
+    /// Previous scan-failure state, used to report only the
+    /// success-to-failure and failure-to-success transitions instead of
+    /// repeating the same diagnostic every interval.
+    prev_scan_failed: bool = false,
+
     /// Initialize a scanner. The caller must call `start` to spawn the worker
     /// and `stop` to join it and release the current snapshot.
     pub fn init(
@@ -770,6 +787,13 @@ pub const Scanner = struct {
         };
     }
 
+    /// Enable operator diagnostics on the given writer. Scan warnings and
+    /// failure/recovery transitions are written here. Must be called before
+    /// `initialScan` to capture the initial scan's diagnostics.
+    pub fn enableDiagnostics(self: *Scanner, stderr: *std.Io.Writer) void {
+        self.stderr = stderr;
+    }
+
     /// Perform the initial scan synchronously so the catalog is available
     /// before the server reports readiness. On scan failure the server still
     /// starts with an empty catalog; the worker will retry on the interval.
@@ -783,7 +807,8 @@ pub const Scanner = struct {
     }
 
     /// Signal shutdown, wake the worker, and join it. Releases the current
-    /// snapshot. Safe to call once; idempotent on the thread handle.
+    /// snapshot and any dedup state. Safe to call once; idempotent on the
+    /// thread handle.
     pub fn stop(self: *Scanner) void {
         self.shutdown.store(true, .release);
         self.cond.broadcast(self.io);
@@ -795,22 +820,37 @@ pub const Scanner = struct {
             catalog.deinit(self.allocator);
             self.current = null;
         }
+        self.freePrevWarnings();
+    }
+
+    fn freePrevWarnings(self: *Scanner) void {
+        for (self.prev_warnings) |w| {
+            self.allocator.free(w.rel_path);
+            self.allocator.free(w.reason);
+        }
+        if (self.prev_warnings.len > 0) self.allocator.free(self.prev_warnings);
+        self.prev_warnings = &.{};
     }
 
     /// Run a single scan, build a snapshot, and swap it in under the mutex. The
     /// previous snapshot is freed after the swap. Scan failures leave the prior
-    /// catalog available and record `last_scan_failed`.
+    /// catalog available and record `last_scan_failed`. When diagnostics are
+    /// enabled, scan warnings, failure, and recovery are reported to the
+    /// operator with relative paths and concise reasons; unchanged warnings
+    /// are deduplicated against the previous scan so output does not flood.
     pub fn runScan(self: *Scanner) void {
-        const result = self.scan_fn(self.io, self.allocator, self.root) catch {
+        const result = self.scan_fn(self.io, self.allocator, self.root) catch |err| {
             self.mutex.lockUncancelable(self.io);
             self.last_scan_failed = true;
             self.mutex.unlock(self.io);
+            self.reportScanFailure(err);
             return;
         };
-        const new_catalog = buildCatalog(self.allocator, result) catch {
+        const new_catalog = buildCatalog(self.allocator, result) catch |err| {
             self.mutex.lockUncancelable(self.io);
             self.last_scan_failed = true;
             self.mutex.unlock(self.io);
+            self.reportScanFailure(err);
             return;
         };
 
@@ -821,6 +861,65 @@ pub const Scanner = struct {
         self.mutex.unlock(self.io);
 
         if (old) |c| c.deinit(self.allocator);
+
+        self.reportScanSuccess(new_catalog);
+    }
+
+    /// Report a scan failure transition to the operator. Only the first
+    /// failure in a run of failures is reported; subsequent failures stay
+    /// silent until the scanner recovers. Dedup state is reset so warnings
+    /// that reappear after recovery are reported fresh.
+    fn reportScanFailure(self: *Scanner, err: anyerror) void {
+        if (self.prev_scan_failed) return;
+        self.prev_scan_failed = true;
+        self.freePrevWarnings();
+        if (self.stderr) |w| {
+            w.print("matcha serve: scan failed: {s}\n", .{@errorName(err)}) catch {};
+        }
+    }
+
+    /// Report scan recovery and any new or changed warnings to the operator.
+    /// Warnings unchanged from the previous successful scan are suppressed.
+    /// Disappeared warnings are simply no longer reported (no "resolved" line)
+    /// to keep output concise; the dedup state is updated so a warning that
+    /// disappears and later reappears is reported again.
+    fn reportScanSuccess(self: *Scanner, catalog: *const Catalog) void {
+        if (self.prev_scan_failed) {
+            if (self.stderr) |w| {
+                w.writeAll("matcha serve: scan recovered\n") catch {};
+            }
+        }
+        self.prev_scan_failed = false;
+
+        if (self.stderr) |w| {
+            for (catalog.warnings) |warning| {
+                if (!warningPresent(self.prev_warnings, warning)) {
+                    w.print("matcha serve: warning: {s}: {s}\n", .{ warning.rel_path, warning.reason }) catch {};
+                }
+            }
+        }
+
+        // Update dedup state with the current warnings.
+        self.freePrevWarnings();
+        if (catalog.warnings.len == 0) {
+            self.prev_warnings = &.{};
+            return;
+        }
+        const owned = self.allocator.alloc(ScanWarning, catalog.warnings.len) catch {
+            self.prev_warnings = &.{};
+            return;
+        };
+        var count: usize = 0;
+        for (catalog.warnings) |warning| {
+            const rel = self.allocator.dupe(u8, warning.rel_path) catch continue;
+            const reason = self.allocator.dupe(u8, warning.reason) catch {
+                self.allocator.free(rel);
+                continue;
+            };
+            owned[count] = .{ .rel_path = rel, .reason = reason };
+            count += 1;
+        }
+        self.prev_warnings = owned[0..count];
     }
 
     /// Acquire the current snapshot for reading. The caller MUST hold the
@@ -848,6 +947,20 @@ pub const Scanner = struct {
         }
     }
 };
+
+/// True when `warning` (rel_path + reason) is present in `prev`. Both slices
+/// are sorted by (rel_path, reason) so a linear scan is sufficient for the
+/// small warning counts produced by a single scan.
+fn warningPresent(prev: []const ScanWarning, warning: ScanWarning) bool {
+    for (prev) |p| {
+        if (std.mem.eql(u8, p.rel_path, warning.rel_path) and
+            std.mem.eql(u8, p.reason, warning.reason))
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 /// RAII guard for reading the current scanner snapshot. The mutex is held
 /// while the guard is live; call `release` (or let `deinit` run) to unlock.
@@ -1647,6 +1760,33 @@ fn freeCannedResult(allocator: std.mem.Allocator, result: ScanResult) void {
     freeScanResult(allocator, result);
 }
 
+/// Build a canned `ScanResult` with the given entries and warnings. Both
+/// entries and warnings are duplicated into owned allocations.
+fn cannedResultWithWarnings(
+    allocator: std.mem.Allocator,
+    entries: []const CatalogEntry,
+    warnings: []const ScanWarning,
+) !ScanResult {
+    var result = try cannedResult(allocator, entries);
+    var owned: std.ArrayList(ScanWarning) = .empty;
+    errdefer {
+        for (owned.items) |w| {
+            allocator.free(w.rel_path);
+            allocator.free(w.reason);
+        }
+        owned.deinit(allocator);
+    }
+    for (warnings) |w| {
+        const rel = try allocator.dupe(u8, w.rel_path);
+        errdefer allocator.free(rel);
+        const reason = try allocator.dupe(u8, w.reason);
+        errdefer allocator.free(reason);
+        try owned.append(allocator, .{ .rel_path = rel, .reason = reason });
+    }
+    result.warnings = try owned.toOwnedSlice(allocator);
+    return result;
+}
+
 test "buildCatalog sorts entries by group, kind, then rel_path" {
     const allocator = std.testing.allocator;
     // Deliberately unsorted input.
@@ -1933,4 +2073,280 @@ test "scanner stop joins the worker and releases the snapshot" {
     // After stop, current is null and the thread handle is cleared.
     try std.testing.expect(scanner.current == null);
     try std.testing.expect(scanner.thread == null);
+}
+
+// ---------------------------------------------------------------------------
+// E5.S1: scanner diagnostics — warning dedup, failure, and recovery.
+// ---------------------------------------------------------------------------
+
+/// Test harness capturing scanner diagnostics into a fixed buffer so tests
+/// can assert on the exact stderr output without touching real streams.
+const DiagCapture = struct {
+    buffer: [4096]u8 = undefined,
+    writer: std.Io.Writer = .{ .context = undefined },
+
+    fn init() DiagCapture {
+        var cap: DiagCapture = .{};
+        cap.writer = .fixed(&cap.buffer);
+        return cap;
+    }
+
+    fn written(self: *const DiagCapture) []const u8 {
+        return self.buffer[0..self.writer.end];
+    }
+};
+
+test "scanner reports new warnings on first successful scan" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    const r0 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "malformed json metadata" },
+    });
+    try source.results.append(allocator, r0);
+
+    var cap = DiagCapture.init();
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.enableDiagnostics(&cap.writer);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    const out = cap.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "matcha serve: warning: bad.html: malformed json metadata") != null);
+}
+
+test "scanner deduplicates unchanged warnings across scans" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    // First scan: one warning.
+    const r0 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "malformed json metadata" },
+    });
+    try source.results.append(allocator, r0);
+    // Second scan: same warning (unchanged).
+    const r1 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "malformed json metadata" },
+    });
+    try source.results.append(allocator, r1);
+
+    var cap = DiagCapture.init();
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.enableDiagnostics(&cap.writer);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    const after_first = cap.writer.end;
+    scanner.runScan();
+    const after_second = cap.writer.end;
+
+    // The second scan must not re-emit the same warning.
+    const second_output = cap.buffer[after_first..after_second];
+    try std.testing.expectEqual(@as(usize, 0), second_output.len);
+}
+
+test "scanner reports a warning that changes reason" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    const r0 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "malformed json metadata" },
+    });
+    try source.results.append(allocator, r0);
+    const r1 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "missing closing script tag" },
+    });
+    try source.results.append(allocator, r1);
+
+    var cap = DiagCapture.init();
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.enableDiagnostics(&cap.writer);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    const after_first = cap.writer.end;
+    scanner.runScan();
+    const second_output = cap.buffer[after_first..cap.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, second_output, "missing closing script tag") != null);
+}
+
+test "scanner reports a warning that reappears after disappearing" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    // Scan 0: warning present.
+    const r0 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "malformed json metadata" },
+    });
+    try source.results.append(allocator, r0);
+    // Scan 1: warning gone.
+    const r1 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{});
+    try source.results.append(allocator, r1);
+    // Scan 2: warning reappears.
+    const r2 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "malformed json metadata" },
+    });
+    try source.results.append(allocator, r2);
+
+    var cap = DiagCapture.init();
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.enableDiagnostics(&cap.writer);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    const after_first = cap.writer.end;
+    scanner.runScan(); // warning disappears
+    const after_second = cap.writer.end;
+    scanner.runScan(); // warning reappears
+    const after_third = cap.writer.end;
+
+    // The disappearing scan emits nothing; the reappearing scan re-emits.
+    try std.testing.expectEqual(@as(usize, 0), cap.buffer[after_first..after_second].len);
+    const third = cap.buffer[after_second..after_third];
+    try std.testing.expect(std.mem.indexOf(u8, third, "warning: bad.html: malformed json metadata") != null);
+}
+
+test "scanner reports scan failure once and recovery once" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    // Scan 0: success.
+    const r0 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    try source.results.append(allocator, r0);
+    // Scans 1 and 2: failure (run past canned list returns error.Unexpected).
+    // Scan 3: success (we add one more canned result).
+    const r3 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 2, .mtime = .zero },
+    });
+    try source.results.append(allocator, r3);
+
+    var cap = DiagCapture.init();
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.enableDiagnostics(&cap.writer);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    const after_initial = cap.writer.end;
+    scanner.runScan(); // first failure
+    const after_first_failure = cap.writer.end;
+    scanner.runScan(); // second failure (no new output)
+    const after_second_failure = cap.writer.end;
+    scanner.runScan(); // recovery
+    const after_recovery = cap.writer.end;
+
+    // First failure is reported.
+    const failure_out = cap.buffer[after_initial..after_first_failure];
+    try std.testing.expect(std.mem.indexOf(u8, failure_out, "matcha serve: scan failed") != null);
+    // Second failure is silent (dedup).
+    try std.testing.expectEqual(@as(usize, 0), cap.buffer[after_first_failure..after_second_failure].len);
+    // Recovery is reported.
+    const recovery_out = cap.buffer[after_second_failure..after_recovery];
+    try std.testing.expect(std.mem.indexOf(u8, recovery_out, "matcha serve: scan recovered") != null);
+}
+
+test "scanner keeps prior catalog on scan failure and recovers automatically" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    const r0 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    try source.results.append(allocator, r0);
+    // Recovery scan with a new size.
+    const r1 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 42, .mtime = .zero },
+    });
+    try source.results.append(allocator, r1);
+
+    var cap = DiagCapture.init();
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.enableDiagnostics(&cap.writer);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    // Force a failing scan by running past the canned list.
+    scanner.runScan();
+    try std.testing.expect(scanner.last_scan_failed);
+
+    // Prior catalog still available.
+    {
+        var guard = scanner.snapshotLock();
+        defer guard.release();
+        const catalog = guard.get().?;
+        try std.testing.expectEqual(@as(usize, 1), catalog.entries.len);
+    }
+
+    // Recovery scan replaces the catalog.
+    scanner.runScan();
+    try std.testing.expect(!scanner.last_scan_failed);
+    {
+        var guard = scanner.snapshotLock();
+        defer guard.release();
+        const catalog = guard.get().?;
+        try std.testing.expectEqual(@as(u64, 42), catalog.entries[0].size);
+    }
+}
+
+test "scanner diagnostics never print embedded document contents" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    // Warning reason is a short diagnostic string, never the file contents.
+    const r0 = try cannedResultWithWarnings(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    }, &.{
+        .{ .rel_path = "bad.html", .reason = "malformed json metadata" },
+    });
+    try source.results.append(allocator, r0);
+
+    var cap = DiagCapture.init();
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.enableDiagnostics(&cap.writer);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    const out = cap.written();
+    // Diagnostic must not contain the absolute root.
+    try std.testing.expect(std.mem.indexOf(u8, out, "/tmp/test") == null);
+    // Diagnostic must not contain a JSON object body from an embedded doc.
+    try std.testing.expect(std.mem.indexOf(u8, out, "{\"title\"") == null);
 }
