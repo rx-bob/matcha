@@ -3,9 +3,9 @@ const std = @import("std");
 const serve_routes = @import("serve_routes.zig");
 
 /// Maximum number of bytes read from an artifact while classifying it. The
-/// plan/map markers emitted by the renderers appear near the top of the file,
-/// so a bounded prefix is enough and avoids loading whole files into memory.
-pub const classify_prefix_bytes: usize = 4096;
+/// markers are often located well into historical artifacts, so this window is
+/// intentionally large enough to avoid false negatives while staying bounded.
+pub const classify_prefix_bytes: usize = 64 * 1024;
 
 /// Maximum number of bytes of the embedded JSON metadata block that the
 /// scanner will decode. A single oversized or malformed HTML file cannot
@@ -13,10 +13,9 @@ pub const classify_prefix_bytes: usize = 4096;
 /// warning and the rest of the scan continues.
 pub const metadata_max_bytes: usize = 1024 * 1024;
 
-/// The embedded-data script markers emitted by the Matcha HTML renderers.
-/// The renderers emit `<script type="application/json" id="plan-data">` (and
-/// the matching `map-data` form), so matching the attribute pair avoids false
-/// positives from marker-like text outside the embedded-data script element.
+/// Legacy exact marker strings emitted by current renderers for plan/map artifacts.
+/// Matching now uses tolerant script-tag parsing, but these constants remain for
+/// compatibility with callers that import them directly.
 pub const plan_marker: []const u8 = "type=\"application/json\" id=\"plan-data\"";
 pub const map_marker: []const u8 = "type=\"application/json\" id=\"map-data\"";
 
@@ -242,11 +241,6 @@ fn extractMetadata(
     warnings: *std.ArrayList(ScanWarning),
     rel_path: []const u8,
 ) !void {
-    const marker = switch (kind) {
-        .plan => plan_marker,
-        .map => map_marker,
-    };
-
     // Read the whole file into a bounded buffer so we can locate the closing
     // </script> tag. The metadata block itself is bounded by
     // `metadata_max_bytes` during decoding; files larger than the read limit
@@ -260,17 +254,14 @@ fn extractMetadata(
     };
     defer allocator.free(file_bytes);
 
-    // Locate the marker within the file bytes.
-    const marker_index = std.mem.indexOf(u8, file_bytes, marker) orelse {
+    // Locate the matching embedded data script within the file bytes.
+    const script_tag = findArtifactScriptTag(file_bytes, kind) orelse {
         try appendWarning(allocator, warnings, rel_path, "embedded marker not found");
         return;
     };
 
     // The JSON body starts after the opening <script ...> tag.
-    const tag_close = std.mem.indexOfScalarPos(u8, file_bytes, marker_index, '>') orelse {
-        try appendWarning(allocator, warnings, rel_path, "malformed script tag");
-        return;
-    };
+    const tag_close = script_tag.tag_close;
     const json_start = tag_close + 1;
 
     // The JSON body ends at the closing </script> tag.
@@ -470,12 +461,137 @@ fn handleMetadataKey(
 /// Classify an HTML prefix by its embedded plan/map data marker. Returns null
 /// for unrelated HTML, non-HTML, or false marker-like text that is not inside
 /// the expected embedded-data script element.
+const ScriptTag = struct {
+    kind: ArtifactKind,
+    tag_close: usize,
+};
+
+fn isNameChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == ':' or ch == '.';
+}
+
+fn skipWhitespace(input: []const u8, i: *usize) void {
+    while (i.* < input.len and std.ascii.isWhitespace(input[i.*])) i.* += 1;
+}
+
+fn parseScriptTag(input: []const u8, script_start: usize) ?ScriptTag {
+    if (script_start + 7 > input.len) return null;
+    if (!std.ascii.eqlIgnoreCase(input[script_start .. script_start + 7], "<script")) return null;
+
+    if (script_start + 7 < input.len and
+        !std.ascii.isWhitespace(input[script_start + 7]) and
+        input[script_start + 7] != '>' and
+        input[script_start + 7] != '/')
+    {
+        return null;
+    }
+
+    var tag_end = script_start + 7;
+    var in_single = false;
+    var in_double = false;
+    while (tag_end < input.len) : (tag_end += 1) {
+        const ch = input[tag_end];
+        if (in_single) {
+            if (ch == '\'') in_single = false;
+            continue;
+        }
+        if (in_double) {
+            if (ch == '"') in_double = false;
+            continue;
+        }
+        if (ch == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_double = true;
+            continue;
+        }
+        if (ch == '>') break;
+    }
+    if (tag_end >= input.len) return null;
+
+    var i = script_start + 7;
+    var id_kind: ?ArtifactKind = null;
+    var type_seen = false;
+    var type_is_json = false;
+
+    while (i < tag_end) {
+        skipWhitespace(input, &i);
+        if (i >= tag_end or input[i] == '/' or input[i] == '>') break;
+
+        const name_start = i;
+        while (i < tag_end and isNameChar(input[i])) i += 1;
+        const name = input[name_start..i];
+        if (name.len == 0) {
+            i += 1;
+            continue;
+        }
+
+        skipWhitespace(input, &i);
+        var value: ?[]const u8 = null;
+        if (i < tag_end and input[i] == '=') {
+            i += 1;
+            skipWhitespace(input, &i);
+            if (i >= tag_end) break;
+
+            if (input[i] == '\'' or input[i] == '"') {
+                const quote = input[i];
+                i += 1;
+                const value_start = i;
+                while (i < tag_end and input[i] != quote) i += 1;
+                value = input[value_start..i];
+                if (i < tag_end) i += 1;
+            } else {
+                const value_start = i;
+                while (i < tag_end and !std.ascii.isWhitespace(input[i])) i += 1;
+                value = input[value_start..i];
+            }
+        }
+
+        if (std.ascii.eqlIgnoreCase(name, "id")) {
+            if (value) |id_value| {
+                if (std.ascii.eqlIgnoreCase(id_value, "plan-data")) id_kind = .plan;
+                if (std.ascii.eqlIgnoreCase(id_value, "map-data")) id_kind = .map;
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "type")) {
+            type_seen = true;
+            if (value) |type_value| {
+                type_is_json = std.ascii.eqlIgnoreCase(type_value, "application/json");
+            }
+        }
+    }
+
+    if (id_kind == null) return null;
+    if (type_seen and !type_is_json) return null;
+    var content_start = tag_end + 1;
+    while (content_start < input.len and std.ascii.isWhitespace(input[content_start])) content_start += 1;
+    if (content_start >= input.len) return null;
+    if (input[content_start] != '{' and input[content_start] != '[') return null;
+
+    return ScriptTag{ .kind = id_kind.?, .tag_close = tag_end };
+}
+
+fn findArtifactScriptTag(input: []const u8, target_kind: ?ArtifactKind) ?ScriptTag {
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        const rel = std.mem.indexOf(u8, input[cursor..], "<") orelse return null;
+        const script_start = cursor + rel;
+        const tag = parseScriptTag(input, script_start) orelse {
+            cursor = script_start + 1;
+            continue;
+        };
+        if (target_kind == null or tag.kind == target_kind.?) return tag;
+        cursor = tag.tag_close + 1;
+    }
+    return null;
+}
+
+/// Classify an HTML prefix by its embedded plan/map data marker. Returns null
+/// for unrelated HTML, non-HTML, or false marker-like text that is not inside
+/// the expected embedded-data script element.
 pub fn classify(prefix: []const u8) ?ArtifactKind {
-    const plan_index = std.mem.indexOf(u8, prefix, plan_marker) orelse std.math.maxInt(usize);
-    const map_index = std.mem.indexOf(u8, prefix, map_marker) orelse std.math.maxInt(usize);
-    if (plan_index == std.math.maxInt(usize) and map_index == std.math.maxInt(usize)) return null;
-    if (plan_index <= map_index) return .plan;
-    return .map;
+    return (findArtifactScriptTag(prefix, null) orelse return null).kind;
 }
 
 fn isHidden(name: []const u8) bool {
@@ -514,7 +630,7 @@ fn freeEntryMetadata(allocator: std.mem.Allocator, entry: CatalogEntry) void {
 }
 
 // ---------------------------------------------------------------------------
-// E2.S3: immutable catalog snapshots, deterministic JSON, and a background
+// Catalog lifecycle: immutable snapshots, deterministic JSON, and a background
 // scanner that refreshes the catalog on a configured interval.
 // ---------------------------------------------------------------------------
 
@@ -631,7 +747,9 @@ pub fn writeCatalogJson(
             try writer.writeAll("{\"relPath\":");
             try appendJsonStringJson(writer, entry.rel_path);
             try writer.writeAll(",\"url\":");
+            try writer.writeByte('"');
             try serve_routes.writeArtifactUrl(writer, entry.rel_path);
+            try writer.writeByte('"');
             try writer.writeAll(",\"kind\":");
             try appendJsonStringJson(writer, switch (entry.kind) {
                 .plan => "plan",
@@ -991,6 +1109,24 @@ test "classify detects map marker" {
     ).?);
 }
 
+test "classify detects plan marker when id attribute comes first" {
+    try std.testing.expectEqual(ArtifactKind.plan, classify(
+        \\<html><script id="plan-data" type='application/json'>{"title":"x"}</script></html>
+    ).?);
+}
+
+test "classify detects map marker in single-quoted script attributes" {
+    try std.testing.expectEqual(ArtifactKind.map, classify(
+        \\<html><script id='map-data' type='application/json'>{"title":"x"}</script></html>
+    ).?);
+}
+
+test "classify accepts legacy id-only marker" {
+    try std.testing.expectEqual(ArtifactKind.plan, classify(
+        \\<html><script id="plan-data">{"title":"x"}</script></html>
+    ).?);
+}
+
 test "classify prefers the first marker when both appear" {
     const html =
         \\<html><script type="application/json" id="plan-data"></script><script type="application/json" id="map-data"></script></html>
@@ -1219,7 +1355,7 @@ test "scan does not retain artifact bodies in the catalog" {
 }
 
 // ---------------------------------------------------------------------------
-// E2.S2: bounded index metadata extraction and project determination.
+// Metadata pipeline: bounded index extraction and project determination.
 // ---------------------------------------------------------------------------
 
 /// Helper that writes a plan HTML fixture with the given embedded JSON payload
@@ -1611,7 +1747,7 @@ test "decodeScriptSafeJson passes through non-escaped content" {
 }
 
 // ---------------------------------------------------------------------------
-// E2.S3: snapshot refresh, catalog JSON, and scanner lifecycle tests.
+// Lifecycle tests: snapshot refresh, catalog JSON, and scanner behavior.
 // ---------------------------------------------------------------------------
 
 /// Test scan hook that returns canned `ScanResult`s so scanner behavior can be
@@ -2076,7 +2212,7 @@ test "scanner stop joins the worker and releases the snapshot" {
 }
 
 // ---------------------------------------------------------------------------
-// E5.S1: scanner diagnostics — warning dedup, failure, and recovery.
+// Diagnostics: warning dedup, failure, and recovery.
 // ---------------------------------------------------------------------------
 
 /// Test harness capturing scanner diagnostics into a fixed buffer so tests

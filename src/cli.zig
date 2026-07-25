@@ -409,21 +409,41 @@ pub fn writeServeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\Usage:
         \\  matcha serve <directory> [options]
         \\
-        \\Serve generated Matcha HTML plans and maps from <directory> on the local
-        \\network. The directory is scanned recursively and refreshed on the
-        \\configured interval. The server binds to all interfaces by default so
-        \\other machines on the LAN can browse the catalog.
+        \\Serve generated Matcha HTML plans and maps from <directory> as a
+        \\read-only catalog and artifact browser.
         \\
         \\Arguments:
         \\  <directory>          Root directory to scan for Matcha artifacts
         \\
+        \\Behavior:
+        \\  - Only regular .html files are considered.
+        \\  - Markers determine artifact type:
+        \\      plan:  <script id="plan-data" ...>
+        \\      map:   <script id="map-data" ...>
+        \\    Non-marked HTML is ignored.
+        \\  - Scanning is recursive and groups entries by:
+        \\      embedded project metadata, then first path segment, then Ungrouped.
+        \\  - Artifact routes are read-only:
+        \\      /artifacts/<url-encoded-relative-path>
+        \\  - Directory is scanned at startup and every 5 seconds by default.
         \\Options:
         \\  --host <host>        Bind address (default: 0.0.0.0)
         \\  --port <port>        Bind port (default: 27004)
-        \\  --interval <seconds> Catalog refresh interval (default: 5)
+        \\  --interval <seconds> Catalog refresh interval in seconds (default: 5)
         \\
         \\The --host, --port, and --interval options accept either a space-separated
         \\value (--port 27004) or an equals-style value (--port=27004).
+        \\
+        \\By default, --host 0.0.0.0 binds every interface, so peers on your local
+        \\network can browse artifacts. Use --host 127.0.0.1 for loopback-only access.
+        \\
+        \\If no <directory> is provided and this is an interactive terminal, the
+        \\command prompts for one path. In non-interactive mode it exits immediately
+        \\with usage.
+        \\
+        \\Examples:
+        \\  matcha serve ./artifacts
+        \\  matcha serve ~/artifacts --host 127.0.0.1 --port 8080 --interval 10
         \\
     );
 }
@@ -1233,6 +1253,13 @@ test "serve --help prints subcommand help" {
     try std.testing.expect(std.mem.indexOf(u8, output, "--port") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--interval") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "27004") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "default: 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "plan-data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "map-data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "0.0.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "127.0.0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "read-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ungrouped") != null);
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
 }
 

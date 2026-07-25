@@ -4,14 +4,14 @@ import { mount } from "svelte"
 const target = document.getElementById("serve-root")
 
 if (!target) {
-  throw new Error("Serve content target was not found")
+  console.warn("Serve content target was not found: #serve-root")
+} else {
+  target.textContent = ""
+
+  mount(ServeApp, {
+    target,
+    props: {
+      catalogUrl: "/api/catalog",
+    },
+  })
 }
-
-target.textContent = ""
-
-mount(ServeApp, {
-  target,
-  props: {
-    catalogUrl: "/api/catalog",
-  },
-})

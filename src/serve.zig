@@ -10,15 +10,26 @@ const net = std.Io.net;
 /// Listen socket file descriptor shared with the signal handler so SIGINT and
 /// SIGTERM can close the listener and unblock the accept loop. Set once after
 /// binding and cleared on shutdown.
-var listen_fd: std.posix.fd_t = -1;
+var listen_fd: std.atomic.Value(std.posix.fd_t) = .init(-1);
 
 extern "c" fn close(fd: std.posix.fd_t) c_int;
 
 fn signalHandler(sig: std.posix.SIG) callconv(.c) void {
     _ = sig;
-    const fd = listen_fd;
+    const fd = listen_fd.load(.acquire);
     if (fd != -1) {
-        listen_fd = -1;
+        _ = close(fd);
+        listen_fd.store(-1, .release);
+    }
+}
+
+fn setListenFd(fd: std.posix.fd_t) void {
+    listen_fd.store(fd, .release);
+}
+
+fn resetListenFd() void {
+    const fd = listen_fd.swap(-1, .acq_rel);
+    if (fd != -1) {
         _ = close(fd);
     }
 }
@@ -83,20 +94,24 @@ pub fn run(
 
     try scanner.start();
 
-    listen_fd = server.socket.handle;
+    setListenFd(server.socket.handle);
     installShutdownHandler();
 
     const bound_port = server.socket.address.getPort();
     try writeStartupReport(stdout, options, bound_port, &scanner);
+    try stdout.flush();
 
     while (true) {
         const stream = server.accept(io) catch |err| switch (err) {
             error.SocketNotListening => {
-                listen_fd = -1;
+                resetListenFd();
                 return .ok;
             },
             error.ConnectionAborted => continue,
-            else => return err,
+            else => {
+                if (listen_fd.load(.acquire) == -1) return .ok;
+                return err;
+            },
         };
         handleConnection(io, stream, &scanner) catch {};
         stream.close(io);
@@ -207,6 +222,12 @@ fn handleConnection(io: std.Io, stream: net.Stream, scanner: *serve_catalog.Scan
 
     if (std.mem.eql(u8, path, "/api/catalog")) {
         try writeCatalogResponse(writer, scanner);
+        try writer.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, path, "/favicon.ico")) {
+        try writeStatus(writer, .ok, "image/x-icon", "");
         try writer.flush();
         return;
     }
@@ -385,8 +406,9 @@ fn writeArtifactResponse(
     // memory. The reader's seek position advances on each read so concurrent
     // requests on the same fd would interfere; instead each request opens its
     // own file descriptor above.
+    var file_read_buffer: [artifact_stream_buffer_len]u8 = undefined;
+    var file_reader = file.readerStreaming(io, &file_read_buffer);
     var read_buffer: [artifact_stream_buffer_len]u8 = undefined;
-    var file_reader = file.readerStreaming(io, &read_buffer);
     const reader: *std.Io.Reader = &file_reader.interface;
 
     while (true) {
@@ -455,20 +477,15 @@ fn writeIndexResponse(writer: *std.Io.Writer) !void {
         "<title>matcha serve</title>\n" ++
         "<style>\n";
     const css_close = "</style>\n";
-    const script_open = "<script>\n";
-    const script_close = "</script>\n";
-    const tail =
-        "</head>\n" ++
-        "<body>\n" ++
-        "<div id=\"serve-root\"></div>\n" ++
-        "</body>\n" ++
-        "</html>\n";
+    const script_open = "</head>\n<body>\n<div id=\"serve-root\"></div>\n<script>\n";
+    const script_close = "</script>\n</body>\n</html>\n";
+    const tail = "";
 
     const total = head.len + css.contents.len + css_close.len +
         script_open.len + js.contents.len + script_close.len + tail.len;
 
     try writer.print(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n",
         .{total},
     );
     try writer.writeAll(head);

@@ -1027,7 +1027,7 @@ test "renders epics and stories with core fields" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const parsed = try parseJsonValue(arena.allocator(), "{\"schemaVersion\":1,\"id\":\"epics\",\"title\":\"Epic Story Plan\",\"epics\":[{\"id\":\"E1\",\"title\":\"Epic One\",\"summary\":\"Epic summary.\",\"status\":\"in-progress\",\"tags\":[\"cli\"],\"testFocus\":\"Argument parsing\",\"dependencies\":[\"E2\"],\"stories\":[{\"id\":\"E1.S1\",\"title\":\"Story One\",\"status\":\"planned\",\"priority\":1,\"risk\":\"low\",\"owner\":\"agent\",\"estimate\":\"2h\",\"tags\":[\"parser\"],\"dependencies\":[\"E1.S2\"],\"details\":[\"Detail one.\"],\"acceptanceCriteria\":[\"Criterion one.\"],\"unitTests\":[\"Test one.\"],\"filesLikelyTouched\":[\"src/mod.ts\"],\"commandsToRun\":[\"task test\"],\"artifacts\":[\"dist/matcha\"],\"notes\":[\"Note one.\"]}]}] }");
+    const parsed = try parseJsonValue(arena.allocator(), "{\"schemaVersion\":1,\"id\":\"epics\",\"title\":\"Delivery Plan\",\"epics\":[{\"id\":\"area-1\",\"title\":\"Core Area\",\"summary\":\"Core area summary.\",\"status\":\"in-progress\",\"tags\":[\"cli\"],\"testFocus\":\"Argument parsing\",\"dependencies\":[\"prereq-area\"],\"stories\":[{\"id\":\"item-1\",\"title\":\"Task One\",\"status\":\"planned\",\"priority\":1,\"risk\":\"low\",\"owner\":\"agent\",\"estimate\":\"2h\",\"tags\":[\"parser\"],\"dependencies\":[\"item-2\"],\"details\":[\"Detail one.\"],\"acceptanceCriteria\":[\"Criterion one.\"],\"unitTests\":[\"Test one.\"],\"filesLikelyTouched\":[\"src/mod.ts\"],\"commandsToRun\":[\"task test\"],\"artifacts\":[\"dist/matcha\"],\"notes\":[\"Note one.\"]}]}] }");
     defer parsed.deinit();
 
     const markdown = try renderPlanMarkdown(allocator, parsed.value);
@@ -1035,21 +1035,21 @@ test "renders epics and stories with core fields" {
 
     for ([_][]const u8{
         "## Epics",
-        "### E1: Epic One",
+        "### area-1: Core Area",
         "Epic summary.",
         "- **Status:** in-progress",
         "- **Tags:** cli",
         "- **Test Focus:** Argument parsing",
-        "- **Dependencies:** E2",
+        "- **Dependencies:** prereq-area",
         "#### Stories",
-        "##### E1.S1: Story One",
+        "##### item-1: Task One",
         "- **Status:** planned",
         "- **Priority:** 1",
         "- **Risk:** low",
         "- **Owner:** agent",
         "- **Estimate:** 2h",
         "- **Tags:** parser",
-        "- **Dependencies:** E1.S2",
+        "- **Dependencies:** item-2",
         "**Details:**",
         "- Detail one.",
         "**Acceptance Criteria:**",
@@ -1099,7 +1099,7 @@ test "renders sections and section tables" {
 
     const parsed = try parseJsonValue(
         arena.allocator(),
-        "{\"schemaVersion\":1,\"id\":\"sections\",\"title\":\"Section Plan\",\"sections\":[{\"id\":\"rules\",\"title\":\"Rules\",\"kind\":\"rules\",\"summary\":[\"Rule summary.\"],\"items\":[{\"title\":\"One\",\"text\":\"First rule.\",\"status\":\"draft\",\"priority\":1,\"tags\":[\"cli\"],\"ref\":\"E1.S1\"}]},{\"id\":\"arch\",\"title\":\"Architecture\",\"kind\":\"architecture\",\"columns\":[\"component\",\"responsibility\"],\"rows\":[{\"component\":\"Engine\",\"responsibility\":\"Logic\"},{\"component\":\"UI\",\"responsibility\":\"Display\"}]}] }",
+        "{\"schemaVersion\":1,\"id\":\"sections\",\"title\":\"Section Plan\",\"sections\":[{\"id\":\"rules\",\"title\":\"Rules\",\"kind\":\"rules\",\"summary\":[\"Rule summary.\"],\"items\":[{\"title\":\"One\",\"text\":\"First rule.\",\"status\":\"draft\",\"priority\":1,\"tags\":[\"cli\"],\"ref\":\"item-1\"}]},{\"id\":\"arch\",\"title\":\"Architecture\",\"kind\":\"architecture\",\"columns\":[\"component\",\"responsibility\"],\"rows\":[{\"component\":\"Engine\",\"responsibility\":\"Logic\"},{\"component\":\"UI\",\"responsibility\":\"Display\"}]}] }",
     );
     defer parsed.deinit();
 
@@ -1111,7 +1111,7 @@ test "renders sections and section tables" {
         "### rules: Rules",
         "- **Kind:** rules",
         "Rule summary.",
-        "- **One:** First rule. (draft) [priority 1] [cli] (ref: E1.S1)",
+        "- **One:** First rule. (draft) [priority 1] [cli] (ref: item-1)",
         "### arch: Architecture",
         "- **Kind:** architecture",
         "| component | responsibility |",
@@ -1148,7 +1148,7 @@ test "renders workflows commands blockers recommended order and exit criteria" {
 
     const parsed = try parseJsonValue(
         arena.allocator(),
-        "{\"schemaVersion\":1,\"id\":\"remainder\",\"title\":\"Remainder Plan\",\"workflows\":[{\"id\":\"flow\",\"title\":\"Flow\",\"kind\":\"ordered-steps\",\"steps\":[\"Simple step.\",{\"id\":\"step-2\",\"text\":\"Complex step.\",\"command\":\"task test\",\"expectedResults\":[\"Tests pass.\"],\"refs\":[\"E1.S1\"],\"status\":\"planned\"}]}],\"commands\":[{\"title\":\"Verify\",\"command\":\"task verify\",\"workingDirectory\":\"~/repos/matcha\",\"environment\":{\"HOME\":\"/tmp\"},\"expectedResults\":[\"Clean diff.\"],\"refs\":[\"E5.S4\"]}],\"blockers\":[{\"priority\":1,\"area\":\"Design\",\"requiredFix\":\"Decide CLI shape.\",\"status\":\"planned\",\"refs\":[\"E1.S2\"]}],\"recommendedOrder\":[{\"ref\":\"E1.S1\",\"reason\":\"Dispatch first.\"}],\"exitCriteria\":[\"All tests pass.\"]}",
+        "{\"schemaVersion\":1,\"id\":\"remainder\",\"title\":\"Remainder Plan\",\"workflows\":[{\"id\":\"flow\",\"title\":\"Flow\",\"kind\":\"ordered-steps\",\"steps\":[\"Simple step.\",{\"id\":\"step-2\",\"text\":\"Complex step.\",\"command\":\"task test\",\"expectedResults\":[\"Tests pass.\"],\"refs\":[\"item-1\"] ,\"status\":\"planned\"}]}],\"commands\":[{\"title\":\"Verify\",\"command\":\"task verify\",\"workingDirectory\":\"~/repos/matcha\",\"environment\":{\"HOME\":\"/tmp\"},\"expectedResults\":[\"Clean diff.\"],\"refs\":[\"item-4\"]}],\"blockers\":[{\"priority\":1,\"area\":\"Design\",\"requiredFix\":\"Decide CLI shape.\",\"status\":\"planned\",\"refs\":[\"item-2\"]}],\"recommendedOrder\":[{\"ref\":\"item-1\",\"reason\":\"Dispatch first.\"}],\"exitCriteria\":[\"All tests pass.\"]}",
     );
     defer parsed.deinit();
 
@@ -1166,7 +1166,7 @@ test "renders workflows commands blockers recommended order and exit criteria" {
         "   task test",
         "   ```",
         "   - Expected: Tests pass.",
-        "   - Refs: E1.S1",
+        "   - Refs: item-1",
         "## Commands",
         "### Verify",
         "- **Working Directory:** `~/repos/matcha`",
@@ -1177,15 +1177,15 @@ test "renders workflows commands blockers recommended order and exit criteria" {
         "```",
         "**Expected Results:**",
         "Clean diff.",
-        "**Refs:** E5.S4",
+        "**Refs:** item-4",
         "## Blockers",
         "### Blocker: Design",
         "- **Priority:** 1",
         "- **Required Fix:** Decide CLI shape.",
         "- **Status:** planned",
-        "- **Refs:** E1.S2",
+        "- **Refs:** item-2",
         "## Recommended Order",
-        "1. **E1.S1**: Dispatch first.",
+        "1. **item-1**: Dispatch first.",
         "## Exit Criteria",
         "- All tests pass.",
     }) |expected| {

@@ -15,19 +15,19 @@ test "serve integration workflow: catalog, artifacts, and refresh without fixed-
     defer tmp.cleanup();
 
     const plan_alpha =
-        \<!DOCTYPE html><html><head><title>Plan Alpha</title></head><body>
-        \<script type="application/json" id="plan-data">{"title":"Alpha", "project":"Project One", "status":"ready", "generatedAt":"2026-07-24T22:14:13Z"}</script>
-        \</body></html>
+        \\<!DOCTYPE html><html><head><title>Plan Alpha</title></head><body>
+        \\<script type="application/json" id="plan-data">{"title":"Alpha", "project":"Project One", "status":"ready", "generatedAt":"2026-07-24T22:14:13Z"}</script>
+        \\</body></html>
     ;
     const map_beta =
-        \<!DOCTYPE html><html><head><title>Nested Map</title></head><body>
-        \<script type="application/json" id="map-data">{"project":"", "diagramKind":"flow"}</script>
-        \</body></html>
+        \\<!DOCTYPE html><html><head><title>Nested Map</title></head><body>
+        \\<script type="application/json" id="map-data">{"project":"", "diagramKind":"flow"}</script>
+        \\</body></html>
     ;
     const plan_gamma =
-        \<!DOCTYPE html><html><head><title>Gamma</title></head><body>
-        \<script type="application/json" id="plan-data">{"project":""}</script>
-        \</body></html>
+        \\<!DOCTYPE html><html><head><title>Gamma</title></head><body>
+        \\<script type="application/json" id="plan-data">{"project":""}</script>
+        \\</body></html>
     ;
 
     // Initial artifacts: one explicit-project plan, one fallback-directory map,
@@ -90,9 +90,9 @@ test "serve integration workflow: catalog, artifacts, and refresh without fixed-
     // Add a new nested map artifact and refresh the live snapshot without waiting
     // for background intervals.
     const map_delta =
-        \<!DOCTYPE html><html><head><title>Added Map</title></head><body>
-        \<script type="application/json" id="map-data">{"title":"Delta","project":"Project One","diagramKind":"class"}</script>
-        \</body></html>
+        \\<!DOCTYPE html><html><head><title>Added Map</title></head><body>
+        \\<script type="application/json" id="map-data">{"title":"Delta","project":"Project One","diagramKind":"class"}</script>
+        \\</body></html>
     ;
     try tmp.dir.writeFile("nested/delta-map.html", map_delta);
     scanner.runScan();

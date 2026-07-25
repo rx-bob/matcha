@@ -43,15 +43,19 @@ tasks:
     desc: Run sample map
     cmds:
       - zig build run -- map
+  run-serve:
+    desc: Run serve on generated artifacts with the provided CLI arguments
+    cmds:
+      - zig build run -- serve {{.CLI_ARGS}}
 
   build-client:
-    desc: Build the self-contained Svelte client bundles
+    desc: Build the self-contained plan, map, and serve client bundles
     dir: client
     cmds:
       - npm run build
 
   build:
-    desc: Compile the CLI executable into dist
+    desc: Compile the CLI executable into dist (including embedded serve assets)
     cmds:
       - mkdir -p dist
       - zig build release
