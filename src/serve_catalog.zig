@@ -105,7 +105,7 @@ pub fn scan(
         .follow_symlinks = false,
     }) catch |err| switch (err) {
         error.AccessDenied => return error.AccessDenied,
-        error.SystemResources, error.OutOfMemory => return error.OutOfMemory,
+        error.SystemResources => return error.OutOfMemory,
         else => return error.Unexpected,
     };
     defer root_dir.close(io);
@@ -182,11 +182,6 @@ pub fn scan(
             error.OutOfMemory => {
                 allocator.free(rel_path);
                 return error.OutOfMemory;
-            },
-            else => {
-                // Record a concise warning for malformed artifacts and keep
-                // the entry without metadata so the rest of the scan proceeds.
-                appendWarning(allocator, &warnings, rel_path, "metadata extraction failed") catch {};
             },
         };
 
@@ -294,10 +289,6 @@ fn extractMetadata(
     // parsing. The decoded text is allocated and freed here.
     const json_decoded = decodeScriptSafeJson(allocator, json_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            try appendWarning(allocator, warnings, rel_path, "cannot decode script-safe json");
-            return;
-        },
     };
     defer allocator.free(json_decoded);
 
@@ -519,6 +510,341 @@ fn freeEntryMetadata(allocator: std.mem.Allocator, entry: CatalogEntry) void {
     if (entry.metadata.generated_at) |s| allocator.free(s);
     if (entry.metadata.diagram_kind) |s| allocator.free(s);
 }
+
+// ---------------------------------------------------------------------------
+// E2.S3: immutable catalog snapshots, deterministic JSON, and a background
+// scanner that refreshes the catalog on a configured interval.
+// ---------------------------------------------------------------------------
+
+/// An immutable, sorted catalog snapshot published by the scanner. Both
+/// `entries` and `warnings` are owned by the snapshot and released with
+/// `freeCatalog`. Entries are sorted by `(group, kind, rel_path)` and warnings
+/// by `(rel_path, reason)` so serialized output is stable and client rendering
+/// is inexpensive. Snapshots never retain artifact bodies or absolute paths.
+pub const Catalog = struct {
+    entries: []CatalogEntry,
+    warnings: []ScanWarning,
+
+    /// Free the snapshot and all owned strings within it.
+    pub fn deinit(self: *Catalog, allocator: std.mem.Allocator) void {
+        freeEntries(allocator, self.entries);
+        for (self.warnings) |warning| {
+            allocator.free(warning.rel_path);
+            allocator.free(warning.reason);
+        }
+        allocator.free(self.warnings);
+        allocator.destroy(self);
+    }
+};
+
+/// Ordering for entries: group, then kind (plan before map), then rel_path.
+fn entryLessThan(_: void, a: CatalogEntry, b: CatalogEntry) bool {
+    const ga = a.group();
+    const gb = b.group();
+    switch (std.mem.order(u8, ga, gb)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (a.kind != b.kind) return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+    return std.mem.lessThan(u8, a.rel_path, b.rel_path);
+}
+
+/// Ordering for warnings: rel_path, then reason.
+fn warningLessThan(_: void, a: ScanWarning, b: ScanWarning) bool {
+    switch (std.mem.order(u8, a.rel_path, b.rel_path)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    return std.mem.lessThan(u8, a.reason, b.reason);
+}
+
+/// Build an immutable sorted catalog snapshot from a `ScanResult`. The scan
+/// result's owned entries and warnings are moved into the snapshot; on error
+/// the scan result is still consumed via `freeScanResult`. The returned
+/// `*Catalog` is heap-allocated and must be released with `Catalog.deinit`.
+pub fn buildCatalog(
+    allocator: std.mem.Allocator,
+    result: ScanResult,
+) error{OutOfMemory}!*Catalog {
+    std.mem.sort(CatalogEntry, result.entries, {}, entryLessThan);
+    std.mem.sort(ScanWarning, result.warnings, {}, warningLessThan);
+
+    const catalog = allocator.create(Catalog) catch {
+        freeScanResult(allocator, result);
+        return error.OutOfMemory;
+    };
+    catalog.* = .{
+        .entries = result.entries,
+        .warnings = result.warnings,
+    };
+    return catalog;
+}
+
+/// Serialize a catalog snapshot as deterministic JSON to `writer`. The payload
+/// is grouped by project with sorted artifacts and sorted warnings, uses
+/// `application/json`-compatible syntax, and contains no absolute filesystem
+/// paths. Optional metadata fields are omitted when absent so clients can
+/// detect missing values without sentinel strings.
+pub fn writeCatalogJson(
+    writer: *std.Io.Writer,
+    catalog: *const Catalog,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("{\"projects\":[");
+
+    var first_project = true;
+    var i: usize = 0;
+    while (i < catalog.entries.len) {
+        const group_name = catalog.entries[i].group();
+        if (!first_project) try writer.writeAll(",");
+        first_project = false;
+        try writer.writeAll("{\"name\":");
+        try appendJsonStringJson(writer, group_name);
+        try writer.writeAll(",\"artifacts\":[");
+
+        var first_artifact = true;
+        while (i < catalog.entries.len and
+            std.mem.eql(u8, catalog.entries[i].group(), group_name))
+        {
+            if (!first_artifact) try writer.writeAll(",");
+            first_artifact = false;
+            const entry = catalog.entries[i];
+            try writer.writeAll("{\"relPath\":");
+            try appendJsonStringJson(writer, entry.rel_path);
+            try writer.writeAll(",\"kind\":");
+            try appendJsonStringJson(writer, switch (entry.kind) {
+                .plan => "plan",
+                .map => "map",
+            });
+            try writer.writeAll(",\"group\":");
+            try appendJsonStringJson(writer, group_name);
+            try writer.writeAll(",\"size\":");
+            try writer.printInt(entry.size, 10, .lower, .{});
+            try writer.writeAll(",\"mtime\":");
+            try writer.printInt(entry.mtime.nanoseconds, 10, .lower, .{});
+            if (entry.metadata.title) |s| {
+                try writer.writeAll(",\"title\":");
+                try appendJsonStringJson(writer, s);
+            }
+            if (entry.metadata.project) |s| {
+                try writer.writeAll(",\"project\":");
+                try appendJsonStringJson(writer, s);
+            }
+            if (entry.metadata.status) |s| {
+                try writer.writeAll(",\"status\":");
+                try appendJsonStringJson(writer, s);
+            }
+            if (entry.metadata.generated_at) |s| {
+                try writer.writeAll(",\"generatedAt\":");
+                try appendJsonStringJson(writer, s);
+            }
+            if (entry.metadata.diagram_kind) |s| {
+                try writer.writeAll(",\"diagramKind\":");
+                try appendJsonStringJson(writer, s);
+            }
+            try writer.writeAll("}");
+            i += 1;
+        }
+        try writer.writeAll("]}");
+    }
+    if (first_project) {
+        // Empty catalog: emit a single Ungrouped project with no artifacts so
+        // clients always receive a valid projects array shape.
+        try writer.writeAll("{\"name\":\"Ungrouped\",\"artifacts\":[]}");
+    }
+
+    try writer.writeAll("],\"warnings\":[");
+    for (catalog.warnings, 0..) |warning, w| {
+        if (w > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"relPath\":");
+        try appendJsonStringJson(writer, warning.rel_path);
+        try writer.writeAll(",\"reason\":");
+        try appendJsonStringJson(writer, warning.reason);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+}
+
+/// Write a JSON-escaped string directly to a writer. Used by `writeCatalogJson`
+/// to avoid intermediate allocation when serializing to the response stream.
+fn appendJsonStringJson(writer: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    try writer.writeByte('"');
+    for (s) |byte| switch (byte) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0x08 => try writer.writeAll("\\b"),
+        0x0c => try writer.writeAll("\\f"),
+        0x00...0x07, 0x0b, 0x0e...0x1f => {
+            var buf: [6]u8 = undefined;
+            const hex = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{byte}) catch unreachable;
+            try writer.writeAll(hex);
+        },
+        else => try writer.writeByte(byte),
+    };
+    try writer.writeByte('"');
+}
+
+/// Allocate a JSON document for `catalog` using `allocator`. The caller owns
+/// the returned slice. Useful for tests and for buffering a response before
+/// writing it to the network.
+pub fn catalogJsonAlloc(
+    allocator: std.mem.Allocator,
+    catalog: *const Catalog,
+) error{OutOfMemory}![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
+    errdefer allocating.deinit();
+    writeCatalogJson(&allocating.writer, catalog) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    allocating.writer.flush() catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    var out = allocating.toArrayList();
+    return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+/// Injectable scan function signature. Defaults to `scan` so production uses
+/// the real filesystem walker while tests can substitute a controlled hook.
+pub const ScanFn = *const fn (io: std.Io, allocator: std.mem.Allocator, root: []const u8) ScanError!ScanResult;
+
+/// Background scanner that refreshes an immutable catalog snapshot on a
+/// configured interval, independently of incoming HTTP requests. The scanner
+/// runs a single worker so scans never overlap or accumulate queued jobs. The
+/// current snapshot is published atomically under a mutex; requests always
+/// observe a complete prior or complete new snapshot. Shutdown joins the
+/// worker safely.
+pub const Scanner = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    interval_seconds: u32,
+    scan_fn: ScanFn,
+
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    current: ?*Catalog = null,
+    last_scan_failed: bool = false,
+    thread: ?std.Thread = null,
+
+    /// Initialize a scanner. The caller must call `start` to spawn the worker
+    /// and `stop` to join it and release the current snapshot.
+    pub fn init(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        root: []const u8,
+        interval_seconds: u32,
+        scan_fn: ScanFn,
+    ) Scanner {
+        return .{
+            .io = io,
+            .allocator = allocator,
+            .root = root,
+            .interval_seconds = interval_seconds,
+            .scan_fn = scan_fn,
+        };
+    }
+
+    /// Perform the initial scan synchronously so the catalog is available
+    /// before the server reports readiness. On scan failure the server still
+    /// starts with an empty catalog; the worker will retry on the interval.
+    pub fn initialScan(self: *Scanner) void {
+        self.runScan();
+    }
+
+    /// Spawn the background worker. Must be called after `initialScan`.
+    pub fn start(self: *Scanner) !void {
+        self.thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{self});
+    }
+
+    /// Signal shutdown, wake the worker, and join it. Releases the current
+    /// snapshot. Safe to call once; idempotent on the thread handle.
+    pub fn stop(self: *Scanner) void {
+        self.shutdown.store(true, .release);
+        self.cond.broadcast(self.io);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        if (self.current) |catalog| {
+            catalog.deinit(self.allocator);
+            self.current = null;
+        }
+    }
+
+    /// Run a single scan, build a snapshot, and swap it in under the mutex. The
+    /// previous snapshot is freed after the swap. Scan failures leave the prior
+    /// catalog available and record `last_scan_failed`.
+    pub fn runScan(self: *Scanner) void {
+        const result = self.scan_fn(self.io, self.allocator, self.root) catch {
+            self.mutex.lockUncancelable(self.io);
+            self.last_scan_failed = true;
+            self.mutex.unlock(self.io);
+            return;
+        };
+        const new_catalog = buildCatalog(self.allocator, result) catch {
+            self.mutex.lockUncancelable(self.io);
+            self.last_scan_failed = true;
+            self.mutex.unlock(self.io);
+            return;
+        };
+
+        self.mutex.lockUncancelable(self.io);
+        const old = self.current;
+        self.current = new_catalog;
+        self.last_scan_failed = false;
+        self.mutex.unlock(self.io);
+
+        if (old) |c| c.deinit(self.allocator);
+    }
+
+    /// Acquire the current snapshot for reading. The caller MUST hold the
+    /// returned guard for the entire duration of reading the catalog; the
+    /// scanner cannot swap or free the snapshot while the guard is held.
+    pub fn snapshotLock(self: *Scanner) SnapshotGuard {
+        self.mutex.lockUncancelable(self.io);
+        return .{ .scanner = self, .catalog = self.current };
+    }
+
+    fn worker(self: *Scanner) void {
+        while (true) {
+            if (self.shutdown.load(.acquire)) return;
+            const duration = std.Io.Clock.Duration{
+                .raw = std.Io.Duration.fromSeconds(@intCast(self.interval_seconds)),
+                .clock = .awake,
+            };
+            self.mutex.lockUncancelable(self.io);
+            if (!self.shutdown.load(.acquire)) {
+                self.cond.waitTimeout(self.io, &self.mutex, .{ .duration = duration }) catch {};
+            }
+            self.mutex.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return;
+            self.runScan();
+        }
+    }
+};
+
+/// RAII guard for reading the current scanner snapshot. The mutex is held
+/// while the guard is live; call `release` (or let `deinit` run) to unlock.
+pub const SnapshotGuard = struct {
+    scanner: *Scanner,
+    catalog: ?*Catalog,
+
+    /// The current snapshot, or null if no successful scan has completed yet.
+    pub fn get(self: SnapshotGuard) ?*Catalog {
+        return self.catalog;
+    }
+
+    /// Release the mutex. Must be called exactly once when reading is done.
+    pub fn release(self: *SnapshotGuard) void {
+        self.scanner.mutex.unlock(self.scanner.io);
+    }
+};
 
 test "classify detects plan marker" {
     try std.testing.expectEqual(ArtifactKind.plan, classify(
@@ -1149,4 +1475,419 @@ test "decodeScriptSafeJson passes through non-escaped content" {
     const decoded = try decodeScriptSafeJson(allocator, input);
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings(input, decoded);
+}
+
+// ---------------------------------------------------------------------------
+// E2.S3: snapshot refresh, catalog JSON, and scanner lifecycle tests.
+// ---------------------------------------------------------------------------
+
+/// Test scan hook that returns canned `ScanResult`s so scanner behavior can be
+/// exercised without touching the filesystem or waiting on real intervals.
+const FakeScanSource = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    /// Index of the next canned result to return.
+    next: usize = 0,
+    /// Owned canned results, returned in order. Each result's entries/warnings
+    /// are owned by the result and freed via `freeScanResult` after the scanner
+    /// consumes them into a catalog.
+    results: std.ArrayList(ScanResult) = .empty,
+    /// Set when a scan is running so tests can assert non-overlap.
+    in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Count of scans executed.
+    scan_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Set true to make the next scan block until `release` is called.
+    block_until_release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    released: std.Io.Condition = .init,
+
+    fn deinit(self: *FakeScanSource) void {
+        for (self.results.items) |r| freeScanResult(self.allocator, r);
+        self.results.deinit(self.allocator);
+    }
+
+    fn scanFn(io: std.Io, allocator: std.mem.Allocator, root: []const u8) ScanError!ScanResult {
+        _ = root;
+        // The context is recovered via a module-level pointer since the scan
+        // function signature does not carry user data.
+        const self = fake_scan_state orelse return error.Unexpected;
+        _ = io;
+        _ = allocator;
+
+        // Detect overlapping scans: in_progress must be false when we start.
+        const prev = self.in_progress.swap(true, .acq_rel);
+        if (prev) {
+            // Overlap detected; this is a test failure condition.
+            std.debug.panic("overlapping scan detected", .{});
+        }
+        _ = self.scan_count.fetchAdd(1, .monotonic);
+
+        if (self.block_until_release.load(.acquire)) {
+            // Wait until the test releases us; this simulates a slow scan.
+            self.released.waitUncancelable(self.io, &overlap_mutex);
+        }
+
+        self.in_progress.store(false, .release);
+
+        const idx = self.next;
+        self.next += 1;
+        if (idx >= self.results.items.len) return error.Unexpected;
+        const canned = self.results.items[idx];
+        // Hand back a duplicate-owned copy so the scanner can consume/free it.
+        return dupeScanResult(self.allocator, canned) catch return error.OutOfMemory;
+    }
+};
+
+/// Module-level pointer used by `FakeScanSource.scanFn` to recover the test
+/// context, since the `ScanFn` signature carries no user data.
+var fake_scan_state: ?*FakeScanSource = null;
+var overlap_mutex: std.Io.Mutex = .init;
+
+/// Duplicate a `ScanResult` into independently-owned entries and warnings so
+/// each scan returns fresh allocations the scanner can free.
+fn dupeScanResult(allocator: std.mem.Allocator, result: ScanResult) !ScanResult {
+    var entries: std.ArrayList(CatalogEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            freeEntryMetadata(allocator, e);
+            allocator.free(e.rel_path);
+        }
+        entries.deinit(allocator);
+    }
+    for (result.entries) |entry| {
+        const rel = try allocator.dupe(u8, entry.rel_path);
+        errdefer allocator.free(rel);
+        var md: ArtifactMetadata = .{};
+        if (entry.metadata.title) |s| md.title = try allocator.dupe(u8, s);
+        if (entry.metadata.project) |s| md.project = try allocator.dupe(u8, s);
+        if (entry.metadata.status) |s| md.status = try allocator.dupe(u8, s);
+        if (entry.metadata.generated_at) |s| md.generated_at = try allocator.dupe(u8, s);
+        if (entry.metadata.diagram_kind) |s| md.diagram_kind = try allocator.dupe(u8, s);
+        try entries.append(allocator, .{
+            .rel_path = rel,
+            .kind = entry.kind,
+            .size = entry.size,
+            .mtime = entry.mtime,
+            .metadata = md,
+        });
+    }
+
+    var warnings: std.ArrayList(ScanWarning) = .empty;
+    errdefer {
+        for (warnings.items) |w| {
+            allocator.free(w.rel_path);
+            allocator.free(w.reason);
+        }
+        warnings.deinit(allocator);
+    }
+    for (result.warnings) |w| {
+        const rel = try allocator.dupe(u8, w.rel_path);
+        errdefer allocator.free(rel);
+        const reason = try allocator.dupe(u8, w.reason);
+        errdefer allocator.free(reason);
+        try warnings.append(allocator, .{ .rel_path = rel, .reason = reason });
+    }
+
+    return .{
+        .entries = try entries.toOwnedSlice(allocator),
+        .warnings = try warnings.toOwnedSlice(allocator),
+    };
+}
+
+/// Build a canned `ScanResult` with the given entries (no warnings).
+fn cannedResult(allocator: std.mem.Allocator, entries: []const CatalogEntry) !ScanResult {
+    var owned: std.ArrayList(CatalogEntry) = .empty;
+    errdefer {
+        for (owned.items) |e| {
+            freeEntryMetadata(allocator, e);
+            allocator.free(e.rel_path);
+        }
+        owned.deinit(allocator);
+    }
+    for (entries) |entry| {
+        const rel = try allocator.dupe(u8, entry.rel_path);
+        errdefer allocator.free(rel);
+        var md: ArtifactMetadata = .{};
+        if (entry.metadata.title) |s| md.title = try allocator.dupe(u8, s);
+        if (entry.metadata.project) |s| md.project = try allocator.dupe(u8, s);
+        if (entry.metadata.status) |s| md.status = try allocator.dupe(u8, s);
+        if (entry.metadata.generated_at) |s| md.generated_at = try allocator.dupe(u8, s);
+        if (entry.metadata.diagram_kind) |s| md.diagram_kind = try allocator.dupe(u8, s);
+        try owned.append(allocator, .{
+            .rel_path = rel,
+            .kind = entry.kind,
+            .size = entry.size,
+            .mtime = entry.mtime,
+            .metadata = md,
+        });
+    }
+    return .{ .entries = try owned.toOwnedSlice(allocator), .warnings = &.{} };
+}
+
+fn freeCannedResult(allocator: std.mem.Allocator, result: ScanResult) void {
+    freeScanResult(allocator, result);
+}
+
+test "buildCatalog sorts entries by group, kind, then rel_path" {
+    const allocator = std.testing.allocator;
+    // Deliberately unsorted input.
+    const result = try cannedResult(allocator, &.{
+        .{ .rel_path = "z/top.html", .kind = .plan, .size = 1, .mtime = .zero },
+        .{ .rel_path = "a/sub/plan.html", .kind = .plan, .size = 1, .mtime = .zero, .metadata = .{ .project = "alpha" } },
+        .{ .rel_path = "a/sub/map.html", .kind = .map, .size = 1, .mtime = .zero, .metadata = .{ .project = "alpha" } },
+        .{ .rel_path = "a/plan.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    const catalog = try buildCatalog(allocator, result);
+    defer catalog.deinit(allocator);
+
+    // Expected: alpha/plan, alpha/map, a/plan, Ungrouped/z.
+    try std.testing.expectEqualStrings("alpha", catalog.entries[0].group());
+    try std.testing.expectEqual(ArtifactKind.plan, catalog.entries[0].kind);
+    try std.testing.expectEqualStrings("a/sub/plan.html", catalog.entries[0].rel_path);
+
+    try std.testing.expectEqualStrings("alpha", catalog.entries[1].group());
+    try std.testing.expectEqual(ArtifactKind.map, catalog.entries[1].kind);
+    try std.testing.expectEqualStrings("a/sub/map.html", catalog.entries[1].rel_path);
+
+    try std.testing.expectEqualStrings("a", catalog.entries[2].group());
+    try std.testing.expectEqualStrings("a/plan.html", catalog.entries[2].rel_path);
+
+    try std.testing.expectEqualStrings("Ungrouped", catalog.entries[3].group());
+    try std.testing.expectEqualStrings("z/top.html", catalog.entries[3].rel_path);
+}
+
+test "writeCatalogJson produces sorted JSON with no absolute paths" {
+    const allocator = std.testing.allocator;
+    const result = try cannedResult(allocator, &.{
+        .{ .rel_path = "proj/plan.html", .kind = .plan, .size = 4096, .mtime = .{ .nanoseconds = 1753000000000000000 }, .metadata = .{ .title = "Plan One", .project = "proj", .status = "planned", .generated_at = "2026-07-24T00:00:00Z" } },
+        .{ .rel_path = "proj/map.html", .kind = .map, .size = 8192, .mtime = .{ .nanoseconds = 1753000000000000001 }, .metadata = .{ .title = "Map One", .project = "proj", .diagram_kind = "class" } },
+    });
+    const catalog = try buildCatalog(allocator, result);
+    defer catalog.deinit(allocator);
+
+    const json = try catalogJsonAlloc(allocator, catalog);
+    defer allocator.free(json);
+
+    // No absolute filesystem paths appear (the temp root never leaks).
+    try std.testing.expect(std.mem.indexOf(u8, json, "/tmp/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "/Users/") == null);
+
+    // Deterministic ordering: plan before map within the project.
+    const plan_pos = std.mem.indexOf(u8, json, "plan.html").?;
+    const map_pos = std.mem.indexOf(u8, json, "map.html").?;
+    try std.testing.expect(plan_pos < map_pos);
+
+    // Required fields present.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"projects\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"proj\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"map\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"diagramKind\":\"class\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"generatedAt\":\"2026-07-24T00:00:00Z\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"warnings\":[]") != null);
+}
+
+test "writeCatalogJson emits a valid empty projects shape" {
+    const allocator = std.testing.allocator;
+    const result = try cannedResult(allocator, &.{});
+    const catalog = try buildCatalog(allocator, result);
+    defer catalog.deinit(allocator);
+
+    const json = try catalogJsonAlloc(allocator, catalog);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"Ungrouped\",\"artifacts\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"warnings\":[]") != null);
+}
+
+test "writeCatalogJson omits absent optional metadata" {
+    const allocator = std.testing.allocator;
+    const result = try cannedResult(allocator, &.{
+        .{ .rel_path = "x/plan.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    const catalog = try buildCatalog(allocator, result);
+    defer catalog.deinit(allocator);
+
+    const json = try catalogJsonAlloc(allocator, catalog);
+    defer allocator.free(json);
+    // title falls back to filename stem, but project/status/generatedAt/diagramKind absent.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"title\":\"plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"project\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"generatedAt\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"diagramKind\"") == null);
+}
+
+test "scanner publishes initial catalog before start" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    const r0 = try cannedResult(allocator, &.{
+        .{ .rel_path = "a/plan.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    try source.results.append(allocator, r0);
+
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    var guard = scanner.snapshotLock();
+    defer guard.release();
+    const catalog = guard.get() orelse return error.NoCatalog;
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries.len);
+    try std.testing.expectEqualStrings("a/plan.html", catalog.entries[0].rel_path);
+}
+
+test "scanner reflects added, changed, and deleted artifacts across scans" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    // Initial: one plan.
+    const r0 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 10, .mtime = .zero, .metadata = .{ .title = "A" } },
+    });
+    try source.results.append(allocator, r0);
+    // After first refresh: add a map, keep the plan (changed size).
+    const r1 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 99, .mtime = .zero, .metadata = .{ .title = "A" } },
+        .{ .rel_path = "p/b.html", .kind = .map, .size = 20, .mtime = .zero, .metadata = .{ .title = "B" } },
+    });
+    try source.results.append(allocator, r1);
+    // After second refresh: delete the plan, keep the map.
+    const r2 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/b.html", .kind = .map, .size = 20, .mtime = .zero, .metadata = .{ .title = "B" } },
+    });
+    try source.results.append(allocator, r2);
+
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    // Initial: one entry.
+    {
+        var guard = scanner.snapshotLock();
+        defer guard.release();
+        const catalog = guard.get().?;
+        try std.testing.expectEqual(@as(usize, 1), catalog.entries.len);
+        try std.testing.expectEqual(@as(u64, 10), catalog.entries[0].size);
+    }
+
+    // After first manual refresh: two entries, plan size updated, map added.
+    scanner.runScan();
+    {
+        var guard = scanner.snapshotLock();
+        defer guard.release();
+        const catalog = guard.get().?;
+        try std.testing.expectEqual(@as(usize, 2), catalog.entries.len);
+        // plan before map within same group.
+        try std.testing.expectEqual(ArtifactKind.plan, catalog.entries[0].kind);
+        try std.testing.expectEqual(@as(u64, 99), catalog.entries[0].size);
+        try std.testing.expectEqual(ArtifactKind.map, catalog.entries[1].kind);
+    }
+
+    // After second manual refresh: plan deleted, only map remains.
+    scanner.runScan();
+    {
+        var guard = scanner.snapshotLock();
+        defer guard.release();
+        const catalog = guard.get().?;
+        try std.testing.expectEqual(@as(usize, 1), catalog.entries.len);
+        try std.testing.expectEqual(ArtifactKind.map, catalog.entries[0].kind);
+    }
+}
+
+test "scanner keeps prior catalog when a scan fails" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    const r0 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    try source.results.append(allocator, r0);
+    // The next scan will run past the canned results and return error.Unexpected.
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    // Force a failing scan by running past the canned list.
+    scanner.runScan();
+    try std.testing.expect(scanner.last_scan_failed);
+
+    // Prior catalog still available.
+    var guard = scanner.snapshotLock();
+    defer guard.release();
+    const catalog = guard.get().?;
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries.len);
+}
+
+test "scanner does not overlap slow scans" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    const r0 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    try source.results.append(allocator, r0);
+    // Provide a second result for the worker to consume after release.
+    const r1 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 2, .mtime = .zero },
+    });
+    try source.results.append(allocator, r1);
+
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.initialScan();
+    defer scanner.stop();
+
+    // Block the next scan so it appears "slow" and in-progress.
+    source.block_until_release.store(true, .release);
+
+    // Start the worker. It will sleep a short interval then enter a blocked scan.
+    try scanner.start();
+
+    // Wait until the slow scan is in progress (scan_count >= 2 means worker ran).
+    // Use a bounded spin so the test does not hang forever.
+    var waited: usize = 0;
+    while (source.scan_count.load(.monotonic) < 2 and waited < 1000) : (waited += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(source.in_progress.load(.acquire));
+
+    // Releasing the blocked scan lets the worker finish without overlap.
+    source.released.broadcast(std.testing.io);
+    scanner.stop();
+
+    // If overlap had occurred, the scan hook would have panicked above.
+    try std.testing.expect(source.scan_count.load(.monotonic) >= 2);
+}
+
+test "scanner stop joins the worker and releases the snapshot" {
+    const allocator = std.testing.allocator;
+    var source: FakeScanSource = .{ .io = std.testing.io, .allocator = allocator };
+    defer source.deinit();
+    fake_scan_state = &source;
+    defer fake_scan_state = null;
+
+    const r0 = try cannedResult(allocator, &.{
+        .{ .rel_path = "p/a.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    try source.results.append(allocator, r0);
+
+    var scanner = Scanner.init(std.testing.io, allocator, "/tmp/test", 1, FakeScanSource.scanFn);
+    scanner.initialScan();
+    try scanner.start();
+    scanner.stop();
+
+    // After stop, current is null and the thread handle is cleared.
+    try std.testing.expect(scanner.current == null);
+    try std.testing.expect(scanner.thread == null);
 }

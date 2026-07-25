@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const serve_options = @import("serve_options.zig");
+const serve_catalog = @import("serve_catalog.zig");
 
 const net = std.Io.net;
 
@@ -62,6 +63,21 @@ pub fn run(
     };
     defer server.deinit(io);
 
+    // Build the catalog scanner and run the initial scan synchronously so the
+    // catalog is available before the server reports readiness. The worker
+    // thread refreshes the snapshot on the configured interval.
+    var scanner = serve_catalog.Scanner.init(
+        io,
+        std.heap.page_allocator,
+        options.directory,
+        options.interval_seconds,
+        serve_catalog.scan,
+    );
+    scanner.initialScan();
+    defer scanner.stop();
+
+    try scanner.start();
+
     listen_fd = server.socket.handle;
     installShutdownHandler();
 
@@ -77,7 +93,7 @@ pub fn run(
             error.ConnectionAborted => continue,
             else => return err,
         };
-        handleConnection(io, stream, options.directory) catch {};
+        handleConnection(io, stream, &scanner) catch {};
         stream.close(io);
     }
 }
@@ -103,7 +119,7 @@ fn writeStartupReport(
     );
 }
 
-fn handleConnection(io: std.Io, stream: net.Stream, directory: []const u8) !void {
+fn handleConnection(io: std.Io, stream: net.Stream, scanner: *serve_catalog.Scanner) !void {
     var read_buffer: [4096]u8 = undefined;
     var write_buffer: [8192]u8 = undefined;
     var stream_reader = stream.reader(io, &read_buffer);
@@ -154,15 +170,50 @@ fn handleConnection(io: std.Io, stream: net.Stream, directory: []const u8) !void
         return;
     }
 
+    if (std.mem.eql(u8, path, "/api/catalog")) {
+        try writeCatalogResponse(writer, scanner);
+        try writer.flush();
+        return;
+    }
+
     if (!std.mem.eql(u8, path, "/")) {
         try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
         try writer.flush();
         return;
     }
 
-    const body = indexBody(directory);
+    const body = indexBody(scanner);
     try writeStatus(writer, .ok, "text/html; charset=utf-8", body);
     try writer.flush();
+}
+
+/// Serialize the current catalog snapshot to a JSON buffer while holding the
+/// scanner mutex, then release the snapshot and write the response. The
+/// snapshot is immutable so concurrent requests always receive a complete
+/// prior or complete new catalog.
+fn writeCatalogResponse(
+    writer: *std.Io.Writer,
+    scanner: *serve_catalog.Scanner,
+) !void {
+    var guard = scanner.snapshotLock();
+    defer guard.release();
+
+    const catalog = guard.get() orelse {
+        try writeStatus(writer, .ok, "application/json; charset=utf-8", "{\"projects\":[],\"warnings\":[]}");
+        return;
+    };
+
+    const json = serve_catalog.catalogJsonAlloc(std.heap.page_allocator, catalog) catch {
+        try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "catalog unavailable");
+        return;
+    };
+    defer std.heap.page_allocator.free(json);
+
+    try writer.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{json.len},
+    );
+    try writer.writeAll(json);
 }
 
 const StatusCode = enum {
@@ -194,13 +245,42 @@ fn writeStatus(
     try writer.writeAll(body);
 }
 
-fn indexBody(directory: []const u8) []const u8 {
-    _ = directory;
+fn indexBody(scanner: *serve_catalog.Scanner) []const u8 {
+    _ = scanner;
     return "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">" ++
         "<title>matcha serve</title></head><body>" ++
         "<h1>matcha serve</h1>" ++
         "<p>Catalog is not yet available.</p>" ++
         "</body></html>";
+}
+
+/// Test helper that owns a temp directory and a scanner backed by it. Used so
+/// `handleConnection`-based tests can exercise routing with a real catalog
+/// snapshot without depending on the developer's filesystem.
+const TestScanner = struct {
+    tmp: std.testing.TmpDir,
+    scanner: serve_catalog.Scanner,
+
+    fn deinit(self: *TestScanner) void {
+        self.scanner.stop();
+        self.tmp.cleanup();
+    }
+};
+
+fn testScanner() !TestScanner {
+    const io = std.testing.io;
+    const tmp = std.testing.tmpDir(.{});
+    const root = try std.heap.page_allocator.dupe(u8, tmp.dir.path.?);
+    errdefer std.heap.page_allocator.free(root);
+    var scanner = serve_catalog.Scanner.init(
+        io,
+        std.heap.page_allocator,
+        root,
+        5,
+        serve_catalog.scan,
+    );
+    scanner.initialScan();
+    return .{ .tmp = tmp, .scanner = scanner };
 }
 
 test "resolveAddress maps 0.0.0.0 to unspecified" {
@@ -221,7 +301,9 @@ test "resolveAddress parses explicit ipv4 host" {
 }
 
 test "indexBody is deterministic HTML" {
-    const body = indexBody("/tmp");
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+    const body = indexBody(&scanner_ctx.scanner);
     try std.testing.expect(std.mem.startsWith(u8, body, "<!DOCTYPE html>"));
     try std.testing.expect(std.mem.indexOf(u8, body, "matcha serve") != null);
 }
@@ -238,6 +320,8 @@ test "writeStatus emits a complete HTTP response" {
 
 test "run serves minimal index at slash on loopback ephemeral port" {
     const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
 
     var server = try net.IpAddress.listen(
         &.{ .ip4 = net.Ip4Address.loopback(0) },
@@ -283,7 +367,7 @@ test "run serves minimal index at slash on loopback ephemeral port" {
     const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Harness.run, .{&harness});
 
     const stream = try server.accept(io);
-    try handleConnection(io, stream, "/tmp");
+    try handleConnection(io, stream, &scanner_ctx.scanner);
     stream.close(io);
 
     thread.join();
@@ -294,6 +378,8 @@ test "run serves minimal index at slash on loopback ephemeral port" {
 
 test "handleConnection returns 404 for unknown route" {
     const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
 
     var server = try net.IpAddress.listen(
         &.{ .ip4 = net.Ip4Address.loopback(0) },
@@ -338,7 +424,7 @@ test "handleConnection returns 404 for unknown route" {
     const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Harness.run, .{&harness});
 
     const stream = try server.accept(io);
-    try handleConnection(io, stream, "/tmp");
+    try handleConnection(io, stream, &scanner_ctx.scanner);
     stream.close(io);
 
     thread.join();
@@ -349,6 +435,8 @@ test "handleConnection returns 404 for unknown route" {
 
 test "handleConnection rejects unsupported methods" {
     const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
 
     var server = try net.IpAddress.listen(
         &.{ .ip4 = net.Ip4Address.loopback(0) },
@@ -393,7 +481,7 @@ test "handleConnection rejects unsupported methods" {
     const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Harness.run, .{&harness});
 
     const stream = try server.accept(io);
-    try handleConnection(io, stream, "/tmp");
+    try handleConnection(io, stream, &scanner_ctx.scanner);
     stream.close(io);
 
     thread.join();
@@ -404,6 +492,8 @@ test "handleConnection rejects unsupported methods" {
 
 test "handleConnection rejects oversized request lines" {
     const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
 
     var server = try net.IpAddress.listen(
         &.{ .ip4 = net.Ip4Address.loopback(0) },
@@ -451,7 +541,7 @@ test "handleConnection rejects oversized request lines" {
     const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Harness.run, .{&harness});
 
     const stream = try server.accept(io);
-    try handleConnection(io, stream, "/tmp");
+    try handleConnection(io, stream, &scanner_ctx.scanner);
     stream.close(io);
 
     thread.join();
