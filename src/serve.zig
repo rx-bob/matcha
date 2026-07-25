@@ -237,19 +237,33 @@ const artifact_extra_headers: []const u8 =
     "Cache-Control: no-cache, no-store, must-revalidate\r\n";
 
 /// Resolve and stream the original HTML artifact bytes for a request matching
-/// `/artifacts/<encoded-relative-path>`. The relative path is decoded and
-/// validated once via `serve_routes.parseArtifactRoute` so the request cannot
-/// address files outside the configured root. The file is opened relative to
-/// the scanner's root directory, sized via `stat`, and streamed through a
-/// bounded buffer so memory stays bounded regardless of artifact size. The
-/// body is delivered byte-for-byte without rewriting, header injection, or
-/// metadata insertion; Matcha outputs remain independently self-contained.
+/// `/artifacts/<encoded-relative-path>`. Containment is enforced at request
+/// time through three independent checks so the server cannot be used as a
+/// general-purpose file browser and cannot serve files outside the root:
 ///
-/// Files that disappeared or became unreadable between catalog lookup and open
-/// produce a normal 404 (or read-failure) response without affecting the
-/// server. Request-time validation failures (malformed encoding, traversal,
-/// absolute paths, platform separators) return 404 to avoid disclosing
-/// security-sensitive routing details.
+/// 1. The relative path is decoded and validated once via
+///    `serve_routes.parseArtifactRoute` (rejects malformed encoding, NUL
+///    bytes, absolute paths, `..` traversal, and backslash separators).
+/// 2. The current catalog snapshot is consulted and the request is rejected
+///    unless `rel_path` is a currently recognized catalog artifact. This
+///    re-checks stale catalog data at request time and prevents serving
+///    non-catalog HTML, non-HTML files, directories, device files, or special
+///    files even if they happen to live under the root.
+/// 3. The file is opened relative to the configured root with
+///    `follow_symlinks = false` and `allow_directory = false`, and its `stat`
+///    is checked to confirm `kind == .file`. This blocks time-of-check to
+///    time-of-use replacement with an outside-root symlink and any non-regular
+///    file that bypassed the catalog check.
+///
+/// All request-time validation failures return a generic 404 with a body of
+/// `not found` so absolute filesystem paths and routing internals are never
+/// disclosed to HTTP clients. Files that disappeared or became unreadable
+/// between catalog lookup and open produce a normal 404 response without
+/// affecting the server. The body is delivered byte-for-byte without
+/// rewriting, header injection, or metadata insertion; Matcha outputs remain
+/// independently self-contained. Ordinary regenerated files at the same safe
+/// relative location are served after the next catalog refresh without a
+/// server restart.
 fn writeArtifactResponse(
     io: std.Io,
     writer: *std.Io.Writer,
@@ -267,6 +281,26 @@ fn writeArtifactResponse(
     };
     defer allocator.free(rel_path);
 
+    // Re-check containment against the live catalog snapshot: only currently
+    // recognized Matcha artifacts may be served. This prevents the server
+    // from acting as a general-purpose file browser for non-catalog files
+    // and closes the stale-catalog gap (a deleted file may still appear in a
+    // stale snapshot; we re-verify by opening the file below).
+    {
+        var guard = scanner.snapshotLock();
+        defer guard.release();
+        if (guard.get()) |catalog| {
+            if (catalog.findEntry(rel_path) == null) {
+                try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
+                return;
+            }
+        } else {
+            // No snapshot yet: nothing can be a recognized artifact.
+            try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
+            return;
+        }
+    }
+
     // Open the artifact relative to the configured root. Opening via the
     // already-validated relative path under the root directory enforces
     // containment at request time independently of the catalog snapshot.
@@ -282,41 +316,37 @@ fn writeArtifactResponse(
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied, error.IsDir, error.SymLinkLoop => {
-            try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
-            return;
-        },
-        else => {
-            try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
-            return;
-        },
+    }) catch {
+        // FileNotFound, AccessDenied, IsDir, SymLinkLoop, or any other open
+        // failure: respond 404 without disclosing the reason or absolute path.
+        try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
+        return;
     };
     defer file.close(io);
 
-    // Stat to obtain an exact content length when known. If stat fails, fall
-    // back to a chunked-style stream without a Content-Length header.
-    const maybe_stat = file.stat(io) catch null;
-    const content_length_known = maybe_stat != null;
-    const content_length: u64 = if (maybe_stat) |s| s.size else 0;
+    // Stat to obtain an exact content length and, critically, to confirm the
+    // opened fd is a regular file. This closes the time-of-check to time-of-use
+    // gap: a file swapped for an outside-root symlink between catalog lookup
+    // and open is rejected here because `follow_symlinks = false` makes stat
+    // report `sym_link` rather than the symlink target's kind.
+    const stat = file.stat(io) catch {
+        try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
+        return;
+    };
+    if (stat.kind != .file) {
+        try writeStatus(writer, .not_found, "text/plain; charset=utf-8", "not found");
+        return;
+    }
+    const content_length: u64 = stat.size;
 
     // Headers identify HTML safely and avoid stale regenerated artifacts.
-    if (content_length_known) {
-        try writer.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "{s}" ++
-                "Connection: close\r\n\r\n",
-            .{ content_length, artifact_extra_headers },
-        );
-    } else {
-        try writer.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
-                "{s}" ++
-                "Connection: close\r\n\r\n",
-            .{artifact_extra_headers},
-        );
-    }
+    try writer.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "{s}" ++
+            "Connection: close\r\n\r\n",
+        .{ content_length, artifact_extra_headers },
+    );
 
     // Stream the body through a fixed buffer so the whole file is never held in
     // memory. The reader's seek position advances on each read so concurrent
@@ -963,4 +993,250 @@ test "handleConnection serves empty artifact file with zero content length" {
         "<script type=\"application/json\" id=\"plan-data\">{\"title\":\"x\"}</script>",
         body,
     );
+}
+
+test "handleConnection refuses non-catalog HTML under root" {
+    // A plain HTML file without the plan/map marker is not a catalog artifact
+    // and must not be served even though it lives under the root.
+    const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+
+    try scanner_ctx.tmp.dir.writeFile(
+        "plain.html",
+        "<html><body>not a matcha artifact</body></html>",
+    );
+    scanner_ctx.scanner.runScan();
+
+    var server = try net.IpAddress.listen(
+        &.{ .ip4 = net.Ip4Address.loopback(0) },
+        io,
+        .{ .reuse_address = true },
+    );
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var harness: FullResponseHarness = .{
+        .port = bound_port,
+        .io = io,
+        .request = "GET /artifacts/plain.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, FullResponseHarness.run, .{&harness});
+
+    const stream = try server.accept(io);
+    try handleConnection(io, stream, &scanner_ctx.scanner);
+    stream.close(io);
+    thread.join();
+
+    const response = harness.response[0..harness.response_len];
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 404 Not Found") != null);
+    // The plain HTML body must not leak through.
+    try std.testing.expect(std.mem.indexOf(u8, response, "not a matcha artifact") == null);
+}
+
+test "handleConnection refuses non-HTML file under root" {
+    const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+
+    try scanner_ctx.tmp.dir.writeFile("notes.txt", "secret notes");
+    scanner_ctx.scanner.runScan();
+
+    var server = try net.IpAddress.listen(
+        &.{ .ip4 = net.Ip4Address.loopback(0) },
+        io,
+        .{ .reuse_address = true },
+    );
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var harness: FullResponseHarness = .{
+        .port = bound_port,
+        .io = io,
+        .request = "GET /artifacts/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, FullResponseHarness.run, .{&harness});
+
+    const stream = try server.accept(io);
+    try handleConnection(io, stream, &scanner_ctx.scanner);
+    stream.close(io);
+    thread.join();
+
+    const response = harness.response[0..harness.response_len];
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 404 Not Found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "secret notes") == null);
+}
+
+test "handleConnection refuses request for a directory under root" {
+    const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+
+    // A directory is not a catalog artifact and must not be served.
+    _ = scanner_ctx.tmp.dir.makeOpenPath(io, "subdir", .{}) catch return error.MakePathFailed;
+    scanner_ctx.scanner.runScan();
+
+    var server = try net.IpAddress.listen(
+        &.{ .ip4 = net.Ip4Address.loopback(0) },
+        io,
+        .{ .reuse_address = true },
+    );
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var harness: FullResponseHarness = .{
+        .port = bound_port,
+        .io = io,
+        .request = "GET /artifacts/subdir HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, FullResponseHarness.run, .{&harness});
+
+    const stream = try server.accept(io);
+    try handleConnection(io, stream, &scanner_ctx.scanner);
+    stream.close(io);
+    thread.join();
+
+    const response = harness.response[0..harness.response_len];
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 404 Not Found") != null);
+}
+
+test "handleConnection refuses artifact replaced by outside-root symlink" {
+    // Time-of-check/time-of-use: the scanner cataloged a real plan.html, but
+    // before the request opens it the file is replaced with a symlink that
+    // points outside the root. The response must be 404, not the target's
+    // contents, because openFile uses follow_symlinks=false and stat reports
+    // sym_link (not file) so the kind check rejects it.
+    const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+
+    // Catalog the real plan artifact first.
+    try writePlanArtifactFixture(scanner_ctx.tmp.dir, "plan.html");
+    scanner_ctx.scanner.runScan();
+
+    // Replace the file with a symlink pointing outside the root. Use a
+    // second temp directory as the symlink target so the link definitely
+    // escapes the served root.
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    try outside.dir.writeFile("secret.txt", "outside-root secret");
+
+    // Remove the cataloged file then create a symlink at the same path.
+    scanner_ctx.tmp.dir.deleteFile(io, "plan.html") catch return error.DeleteFailed;
+    scanner_ctx.tmp.dir.symLink(
+        io,
+        // Absolute path to the outside-root target so the link escapes the root.
+        try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "{s}/secret.txt",
+            .{outside.dir.path.?},
+        ),
+        "plan.html",
+        .{},
+    ) catch return; // symlinks may be unavailable on some platforms; skip silently.
+
+    var server = try net.IpAddress.listen(
+        &.{ .ip4 = net.Ip4Address.loopback(0) },
+        io,
+        .{ .reuse_address = true },
+    );
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var harness: FullResponseHarness = .{
+        .port = bound_port,
+        .io = io,
+        .request = "GET /artifacts/plan.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, FullResponseHarness.run, .{&harness});
+
+    const stream = try server.accept(io);
+    try handleConnection(io, stream, &scanner_ctx.scanner);
+    stream.close(io);
+    thread.join();
+
+    const response = harness.response[0..harness.response_len];
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 404 Not Found") != null);
+    // The outside-root secret must never appear in the response.
+    try std.testing.expect(std.mem.indexOf(u8, response, "outside-root secret") == null);
+}
+
+test "handleConnection serves regenerated artifact at same relative path" {
+    // A valid artifact regenerated at the same safe relative path is served
+    // after the next catalog refresh, without a server restart.
+    const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+
+    try writePlanArtifactFixture(scanner_ctx.tmp.dir, "plan.html");
+    scanner_ctx.scanner.runScan();
+
+    // Regenerate the file at the same path with different content.
+    const regenerated =
+        \\<!DOCTYPE html><html><head><title>Regenerated</title></head><body>
+        \\<script type="application/json" id="plan-data">{"title":"New","project":"demo"}</script>
+        \\</body></html>
+    ;
+    try scanner_ctx.tmp.dir.writeFile("plan.html", regenerated);
+    scanner_ctx.scanner.runScan();
+
+    var server = try net.IpAddress.listen(
+        &.{ .ip4 = net.Ip4Address.loopback(0) },
+        io,
+        .{ .reuse_address = true },
+    );
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var harness: FullResponseHarness = .{
+        .port = bound_port,
+        .io = io,
+        .request = "GET /artifacts/plan.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, FullResponseHarness.run, .{&harness});
+
+    const stream = try server.accept(io);
+    try handleConnection(io, stream, &scanner_ctx.scanner);
+    stream.close(io);
+    thread.join();
+
+    const response = harness.response[0..harness.response_len];
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") != null);
+
+    const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.NoBodyDelimiter;
+    const body = response[body_start + 4 ..];
+    try std.testing.expectEqualStrings(regenerated, body);
+}
+
+test "handleConnection artifact errors omit the absolute root" {
+    // No client-facing error body may disclose the configured absolute root.
+    const io = std.testing.io;
+    var scanner_ctx = try testScanner();
+    defer scanner_ctx.deinit();
+
+    const root_abs = scanner_ctx.tmp.dir.path.?;
+
+    var server = try net.IpAddress.listen(
+        &.{ .ip4 = net.Ip4Address.loopback(0) },
+        io,
+        .{ .reuse_address = true },
+    );
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var harness: FullResponseHarness = .{
+        .port = bound_port,
+        .io = io,
+        .request = "GET /artifacts/missing.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, FullResponseHarness.run, .{&harness});
+
+    const stream = try server.accept(io);
+    try handleConnection(io, stream, &scanner_ctx.scanner);
+    stream.close(io);
+    thread.join();
+
+    const response = harness.response[0..harness.response_len];
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 404 Not Found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, root_abs) == null);
 }

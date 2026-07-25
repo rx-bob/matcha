@@ -537,6 +537,22 @@ pub const Catalog = struct {
         allocator.free(self.warnings);
         allocator.destroy(self);
     }
+
+    /// Look up the catalog entry whose normalized relative path equals
+    /// `rel_path`. Returns null when the path is not a currently recognized
+    /// catalog artifact. Used at request time to re-check that an artifact
+    /// request targets a live catalog entry rather than an arbitrary file
+    /// under the root, so the server cannot be used as a general-purpose
+    /// file browser.
+    pub fn findEntry(self: *const Catalog, rel_path: []const u8) ?CatalogEntry {
+        // Entries are sorted by (group, kind, rel_path); the rel_path is not
+        // the primary key, so a binary search would be unsound. Catalog size
+        // is small and the scan is bounded, so a linear scan is fine.
+        for (self.entries) |entry| {
+            if (std.mem.eql(u8, entry.rel_path, rel_path)) return entry;
+        }
+        return null;
+    }
 };
 
 /// Ordering for entries: group, then kind (plan before map), then rel_path.
@@ -1721,6 +1737,26 @@ test "writeCatalogJson omits absent optional metadata" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"generatedAt\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"diagramKind\"") == null);
+}
+
+test "Catalog.findEntry locates recognized artifacts and rejects others" {
+    const allocator = std.testing.allocator;
+    const result = try cannedResult(allocator, &.{
+        .{ .rel_path = "proj/plan.html", .kind = .plan, .size = 1, .mtime = .zero },
+        .{ .rel_path = "proj/map.html", .kind = .map, .size = 1, .mtime = .zero },
+        .{ .rel_path = "other/x.html", .kind = .plan, .size = 1, .mtime = .zero },
+    });
+    const catalog = try buildCatalog(allocator, result);
+    defer catalog.deinit(allocator);
+
+    try std.testing.expect(catalog.findEntry("proj/plan.html") != null);
+    try std.testing.expect(catalog.findEntry("proj/map.html") != null);
+    try std.testing.expect(catalog.findEntry("other/x.html") != null);
+    // Non-catalog paths return null even if they look plausible.
+    try std.testing.expect(catalog.findEntry("plain.html") == null);
+    try std.testing.expect(catalog.findEntry("proj/missing.html") == null);
+    try std.testing.expect(catalog.findEntry("") == null);
+    try std.testing.expect(catalog.findEntry("../escape.html") == null);
 }
 
 test "scanner publishes initial catalog before start" {
