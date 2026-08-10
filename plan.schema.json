@@ -80,6 +80,13 @@
       "items": {
         "$ref": "#/$defs/recommendedOrderItem"
       }
+    },
+    "changedFiles": {
+      "type": "array",
+      "description": "One or many filetrees describing the files changed once the plan is complete. Rendered in a Changed Files section after the abstract and before epics.",
+      "items": {
+        "$ref": "#/$defs/fileTree"
+      }
     }
   },
   "$defs": {
@@ -233,6 +240,11 @@
           "type": "string",
           "minLength": 1
         },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional Markdown narrative block rendered after the epic summary and before its stories."
+        },
         "tags": {
           "$ref": "#/$defs/stringList"
         },
@@ -266,6 +278,11 @@
         "title": {
           "type": "string",
           "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional Markdown narrative block rendered after the story title and before its Details section."
         },
         "details": {
           "$ref": "#/$defs/stringList"
@@ -442,6 +459,69 @@
           "minLength": 1
         }
       }
+    },
+    "fileTree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root"],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional heading for a single tree (e.g. 'Source', 'Tests')."
+        },
+        "root": {
+          "$ref": "#/$defs/fileTreeNode"
+        }
+      }
+    },
+    "fileTreeNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "enum": ["folder", "file"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["new", "modified"],
+          "description": "Only valid on file nodes. Folders derive change state from their descendants."
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fileTreeNode"
+          },
+          "description": "Required for folder nodes. Absent for file nodes."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "folder" }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["children"],
+            "properties": {
+              "status": { "type": "null", "description": "Folders must not carry a status." }
+            }
+          },
+          "else": {
+            "properties": {
+              "children": { "type": "null", "description": "Files must not have children." }
+            }
+          }
+        }
+      ]
     }
   }
 }
