@@ -264,6 +264,11 @@ fn renderEpic(out: *MarkdownWriter, epic: std.json.ObjectMap) !void {
         try out.writeLine(summary);
     }
 
+    if (getString(epic, "description")) |description| {
+        try out.writeLine("");
+        try out.writeLine(description);
+    }
+
     if (getString(epic, "status")) |status| {
         try out.writeLine("");
         try out.writeKVLine("- **Status:** {s}", status);
@@ -345,6 +350,11 @@ fn renderStory(out: *MarkdownWriter, story: std.json.ObjectMap) !void {
         const dependencies_text = try joinPrefixComma(out.allocator, "- **Dependencies:** ", dependencies);
         defer out.allocator.free(dependencies_text);
         try out.writeLine(dependencies_text);
+    }
+
+    if (getString(story, "description")) |description| {
+        try out.writeLine("");
+        try out.writeLine(description);
     }
 
     if (getStringList(story, "details", out.allocator)) |details| {
