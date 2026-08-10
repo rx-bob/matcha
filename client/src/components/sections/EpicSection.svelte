@@ -3,6 +3,7 @@
   import { epicDomId } from "../../lib/ids.ts"
   import Pill from "../ui/Pill.svelte"
   import PillRow from "../ui/PillRow.svelte"
+  import MarkdownText from "../ui/MarkdownText.svelte"
   import StoryCard from "../cards/StoryCard.svelte"
 
   export let epic: Epic
@@ -30,7 +31,19 @@
     </PillRow>
   {/if}
 
+  {#if epic.description}
+    <div class="epic-description">
+      <MarkdownText markdown={epic.description} />
+    </div>
+  {/if}
+
   {#each epic.stories as story}
     <StoryCard {story} />
   {/each}
 </section>
+
+<style>
+  .epic-description {
+    margin-bottom: 1.5rem;
+  }
+</style>
