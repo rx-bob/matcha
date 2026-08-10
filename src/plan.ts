@@ -56,6 +56,7 @@ export interface Plan {
   blockers?: Blocker[]
   exitCriteria?: NonEmptyString[]
   recommendedOrder?: RecommendedOrderItem[]
+  changedFiles?: FileTree[]
 }
 
 export interface PlanSection {
@@ -82,6 +83,7 @@ export interface Epic {
   title: NonEmptyString
   stories: Story[]
   summary?: NonEmptyString
+  description?: NonEmptyString
   tags?: NonEmptyString[]
   testFocus?: NonEmptyString
   status?: PlanStatus
@@ -91,6 +93,7 @@ export interface Epic {
 export interface Story {
   id: Slug
   title: NonEmptyString
+  description?: NonEmptyString
   details?: NonEmptyString[]
   acceptanceCriteria?: NonEmptyString[]
   unitTests?: NonEmptyString[]
@@ -143,4 +146,20 @@ export interface Blocker {
 export interface RecommendedOrderItem {
   ref: Slug
   reason?: NonEmptyString
+}
+
+export type FileTreeNodeType = "folder" | "file"
+
+export type FileNodeStatus = "new" | "modified"
+
+export interface FileTreeNode {
+  name: NonEmptyString
+  type: FileTreeNodeType
+  status?: FileNodeStatus
+  children?: FileTreeNode[]
+}
+
+export interface FileTree {
+  label?: NonEmptyString
+  root: FileTreeNode
 }
