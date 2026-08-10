@@ -69,13 +69,16 @@ Top-level optional fields:
 - "workflows": ordered validation, migration, smoke-test, or rollout steps.
 - "commands": commands to run.
 - "blockers": known blocking fixes.
+- "changedFiles": array of filetrees describing the files changed once the plan is complete. Rendered in a Changed Files section after the abstract and before epics. Each tree has an optional label and a root node. Nodes are either folders (with children) or files (with a status of "new" or "modified"). Folders must not carry a status; files must not have children.
 
 Epic optional fields:
+- "description": Markdown string. Longer narrative block rendered after the epic summary and before its stories. Use Markdown for headings, lists, code, and links. Does not replace "summary"; "summary" is the short pitch, "description" is the detailed narrative.
 - "tags": array of short strings.
 - "testFocus": short string.
 - "dependencies": array of referenced epic or story IDs.
 
 Story optional fields:
+- "description": Markdown string. Longer narrative block rendered after the story title and before its "details" section. Use Markdown for headings, lists, code, and links. Does not replace "details"; "details" is the concrete implementation bullet list, "description" is the broader narrative.
 - "tags": array of short strings.
 - "dependencies": array of referenced story IDs.
 - "priority": positive integer.
@@ -147,5 +150,66 @@ Use this shape for optional blockers:
   "area": "Compilation",
   "requiredFix": "Fix the compile error before running integration tests."
 }
+
+Use this shape for optional changedFiles:
+
+{
+  "changedFiles": [
+    {
+      "label": "Source",
+      "root": {
+        "name": "src",
+        "type": "folder",
+        "children": [
+          {
+            "name": "cli.zig",
+            "type": "file",
+            "status": "modified"
+          },
+          {
+            "name": "tree.zig",
+            "type": "file",
+            "status": "new"
+          },
+          {
+            "name": "handlers",
+            "type": "folder",
+            "children": [
+              {
+                "name": "route.zig",
+                "type": "file",
+                "status": "new"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "label": "Tests",
+      "root": {
+        "name": "test",
+        "type": "folder",
+        "children": [
+          {
+            "name": "tree_test.zig",
+            "type": "file",
+            "status": "new"
+          }
+        ]
+      }
+    }
+  ]
+}
+
+FileTree shape:
+- "label": optional string. Heading for a single tree (e.g. "Source", "Tests").
+- "root": required FileTreeNode.
+
+FileTreeNode shape:
+- "name": required string. Display name of the file or folder.
+- "type": required, one of "folder" or "file".
+- "status": optional, one of "new" or "modified". Only valid on file nodes. Folders derive change state from their descendants and must not carry a status.
+- "children": required for folder nodes, absent for file nodes. Array of FileTreeNode.
 
 Prefer concise, dense plans. Avoid filler. Do not invent exact file paths, commands, APIs, or dates unless they were provided or are obvious from context.
