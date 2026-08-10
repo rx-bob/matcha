@@ -39,6 +39,16 @@
     on:navigate={(event) => navigate(event.detail)}
   />
 
+  {#if plan.changedFiles && plan.changedFiles.length > 0}
+    <NavItem
+      targetId="changed-files"
+      label="Changed Files"
+      active={activeId === "changed-files"}
+      depth={0}
+      on:navigate={(event) => navigate(event.detail)}
+    />
+  {/if}
+
   <div bind:this={epicsGroup} class="nav-tree-group nav-depth-0 nav-tree-section">
     <div class="nav-tree-row">
       <button
