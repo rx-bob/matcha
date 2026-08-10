@@ -16,6 +16,52 @@
     "minimumTarget": "iOS 17",
     "architecture": "SwiftUI views backed by a tested calculator engine"
   },
+  "changedFiles": [
+    {
+      "label": "Source",
+      "root": {
+        "name": "Calculator",
+        "type": "folder",
+        "children": [
+          {
+            "name": "Engine",
+            "type": "folder",
+            "children": [
+              { "name": "CalculatorEngine.swift", "type": "file", "status": "new" },
+              { "name": "CalculatorError.swift", "type": "file", "status": "new" },
+              { "name": "InputEvent.swift", "type": "file", "status": "new" }
+            ]
+          },
+          {
+            "name": "ViewModel",
+            "type": "folder",
+            "children": [
+              { "name": "CalculatorViewModel.swift", "type": "file", "status": "new" }
+            ]
+          },
+          {
+            "name": "Views",
+            "type": "folder",
+            "children": [
+              { "name": "CalculatorView.swift", "type": "file", "status": "modified" },
+              { "name": "KeypadButton.swift", "type": "file", "status": "new" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "label": "Tests",
+      "root": {
+        "name": "CalculatorTests",
+        "type": "folder",
+        "children": [
+          { "name": "CalculatorEngineTests.swift", "type": "file", "status": "new" },
+          { "name": "CalculatorViewModelTests.swift", "type": "file", "status": "new" }
+        ]
+      }
+    }
+  ],
   "sections": [
     {
       "id": "design-rules",
@@ -106,11 +152,13 @@
       "id": "E2",
       "title": "Calculator Engine",
       "summary": "Implement the arithmetic state machine and the core behavior expected from a basic calculator.",
+      "description": "The engine is the **heart** of the calculator. It owns all numeric state, pending operations, and error handling.\n\nKey design principles:\n\n- **No SwiftUI imports** — the engine is a pure Swift module.\n- **Deterministic behavior** — the same input sequence always produces the same result.\n- **Typed errors** — divide-by-zero, overflow, and invalid state are explicit enum cases, not strings.",
       "tags": ["engine", "test-heavy"],
       "stories": [
         {
           "id": "E2.S1",
           "title": "Implement Digit and Decimal Input",
+          "description": "Digit and decimal input is the **foundation** of all calculator behavior. Every other operation depends on correct operand entry.\n\nEdge cases to handle:\n\n- Leading zeros collapse (`007` → `7`).\n- Only one decimal separator per operand.\n- New operand after an operator replaces the display.",
           "details": [
             "Support appending digits to the current operand.",
             "Support a single decimal separator per operand.",

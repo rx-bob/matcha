@@ -160,6 +160,12 @@ fn renderPlan(out: *MarkdownWriter, plan: std.json.ObjectMap) !void {
         }
     }
 
+    if (getArray(plan, "changedFiles")) |changed_files| {
+        if (changed_files.items.len > 0) {
+            try renderChangedFiles(out, changed_files);
+        }
+    }
+
     if (getArray(plan, "epics")) |epics| {
         if (epics.items.len > 0) {
             try out.writeLine("## Epics");
@@ -249,6 +255,63 @@ fn renderPlan(out: *MarkdownWriter, plan: std.json.ObjectMap) !void {
             }
 
             try out.writeLine("");
+        }
+    }
+}
+
+fn renderChangedFiles(out: *MarkdownWriter, changed_files: std.json.Array) !void {
+    try out.writeLine("## Changed Files");
+    try out.writeLine("");
+
+    for (changed_files.items) |tree| {
+        if (tree != .object) continue;
+        const tree_object = tree.object;
+
+        if (getString(tree_object, "label")) |label| {
+            try out.writeFormattedLine("### {s}", .{label});
+            try out.writeLine("");
+        }
+
+        if (getObject(tree_object, "root")) |root| {
+            try renderFileTreeNode(out, root, 0);
+        }
+
+        try out.writeLine("");
+    }
+}
+
+fn renderFileTreeNode(out: *MarkdownWriter, node: std.json.ObjectMap, depth: usize) !void {
+    const name = getString(node, "name") orelse "";
+    const node_type = getString(node, "type") orelse "";
+
+    var line = try std.ArrayList(u8).initCapacity(out.allocator, 0);
+    defer line.deinit(out.allocator);
+
+    var indent: usize = 0;
+    while (indent < depth) : (indent += 1) {
+        try line.appendSlice(out.allocator, "  ");
+    }
+    try line.appendSlice(out.allocator, name);
+
+    if (std.mem.eql(u8, node_type, "file")) {
+        if (getString(node, "status")) |status| {
+            if (std.mem.eql(u8, status, "new")) {
+                try line.appendSlice(out.allocator, " [new]");
+            } else if (std.mem.eql(u8, status, "modified")) {
+                try line.appendSlice(out.allocator, " [mod]");
+            }
+        }
+    }
+
+    const line_text = try line.toOwnedSlice(out.allocator);
+    defer out.allocator.free(line_text);
+    try out.writeLine(line_text);
+
+    if (getArray(node, "children")) |children| {
+        for (children.items) |child| {
+            if (child == .object) {
+                try renderFileTreeNode(out, child.object, depth + 1);
+            }
         }
     }
 }
@@ -1076,6 +1139,32 @@ test "renders epics and stories with core fields" {
         "- dist/matcha",
         "**Notes:**",
         "- Note one.",
+    }) |expected| {
+        try std.testing.expect(std.mem.indexOf(u8, markdown, expected) != null);
+    }
+}
+
+test "renders changed files tree with status markers and indentation" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = try parseJsonValue(arena.allocator(), "{\"schemaVersion\":1,\"id\":\"changed\",\"title\":\"Changed Plan\",\"changedFiles\":[{\"label\":\"Source\",\"root\":{\"name\":\"src\",\"type\":\"folder\",\"children\":[{\"name\":\"main.zig\",\"type\":\"file\",\"status\":\"new\"},{\"name\":\"cli.zig\",\"type\":\"file\",\"status\":\"modified\"},{\"name\":\"utils\",\"type\":\"folder\",\"children\":[{\"name\":\"helpers.zig\",\"type\":\"file\",\"status\":\"modified\"}]}]}},{\"root\":{\"name\":\"test\",\"type\":\"folder\",\"children\":[{\"name\":\"main.test.zig\",\"type\":\"file\",\"status\":\"new\"}]}}]}");
+    defer parsed.deinit();
+
+    const markdown = try renderPlanMarkdown(allocator, parsed.value);
+    defer allocator.free(markdown);
+
+    for ([_][]const u8{
+        "## Changed Files",
+        "### Source",
+        "src",
+        "  main.zig [new]",
+        "  cli.zig [mod]",
+        "  utils",
+        "    helpers.zig [mod]",
+        "test",
+        "  main.test.zig [new]",
     }) |expected| {
         try std.testing.expect(std.mem.indexOf(u8, markdown, expected) != null);
     }
