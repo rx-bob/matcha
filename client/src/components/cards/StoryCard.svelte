@@ -3,6 +3,7 @@
   import { storyDomId } from "../../lib/ids.ts"
   import Pill from "../ui/Pill.svelte"
   import PillRow from "../ui/PillRow.svelte"
+  import MarkdownText from "../ui/MarkdownText.svelte"
   import StoryListSection from "./StoryListSection.svelte"
 
   export let story: Story
@@ -27,6 +28,12 @@
     {/if}
   </div>
 
+  {#if story.description}
+    <div class="story-description">
+      <MarkdownText markdown={story.description} />
+    </div>
+  {/if}
+
   <StoryListSection title="Details" items={story.details} />
   <StoryListSection title="Acceptance Criteria" items={story.acceptanceCriteria} />
   <StoryListSection title="Tests" items={story.unitTests} />
@@ -36,3 +43,9 @@
   <StoryListSection title="Artifacts" items={story.artifacts} />
   <StoryListSection title="Notes" items={story.notes} />
 </article>
+
+<style>
+  .story-description {
+    margin-bottom: 1rem;
+  }
+</style>
