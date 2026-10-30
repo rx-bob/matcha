@@ -11,6 +11,10 @@ Continuation behavior:
 
 {{ budget_section }}
 
+{{ blocker_section }}
+
+{{ worker_completion_section }}
+
 Work from evidence:
 - Inspect the current worktree and external state before relying on previous turn summaries.
 - Improve, replace, or remove existing work as needed to satisfy the objective.
