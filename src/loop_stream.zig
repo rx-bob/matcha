@@ -1,5 +1,6 @@
 const std = @import("std");
 const options = @import("loop_options.zig");
+const store = @import("loop_store.zig");
 
 pub const BackendKind = options.BackendKind;
 
@@ -39,6 +40,223 @@ pub const TurnAccumulator = struct {
 pub const EventHandler = *const fn (?*anyopaque, NormalizedEvent) void;
 
 pub const StreamError = std.Io.Reader.StreamError || std.mem.Allocator.Error;
+
+pub const Presenter = struct {
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    mode: options.OutputMode,
+    loop_id: []const u8,
+    backend: BackendKind,
+    turn_number: u32 = 0,
+    role: store.TurnRole = .worker,
+    pending_error: ?anyerror = null,
+    last_error_message: ?[]const u8 = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        mode: options.OutputMode,
+        loop_id: []const u8,
+        backend: BackendKind,
+    ) Presenter {
+        return .{ .allocator = allocator, .writer = writer, .mode = mode, .loop_id = loop_id, .backend = backend };
+    }
+
+    pub fn deinit(self: *Presenter) void {
+        if (self.last_error_message) |message| self.allocator.free(message);
+        self.last_error_message = null;
+    }
+
+    pub fn loopStarted(self: *Presenter) !void {
+        switch (self.mode) {
+            .live => {
+                try self.writer.print("=== [loop {s} started | {s}] ===\n", .{ self.loop_id, @tagName(self.backend) });
+                try self.flush();
+            },
+            .quiet => {},
+            .json => try self.writeJson(.{ .type = "loop.started", .loop_id = self.loop_id, .backend = @tagName(self.backend) }),
+        }
+    }
+
+    pub fn turnStarted(self: *Presenter, turn_number: u32, role: store.TurnRole, tokens_used: u64) !void {
+        if (self.last_error_message) |message| self.allocator.free(message);
+        self.last_error_message = null;
+        self.turn_number = turn_number;
+        self.role = role;
+        switch (self.mode) {
+            .live => {
+                try self.writer.print("=== [loop {s} | turn {d} | {s}:{s} | {d} tok] ===\n", .{ self.loop_id, turn_number, @tagName(role), @tagName(self.backend), tokens_used });
+                try self.flush();
+            },
+            .quiet => {
+                try self.writer.print("[turn {d}]\n", .{turn_number});
+                try self.flush();
+            },
+            .json => try self.writeJson(.{
+                .type = "turn.started",
+                .loop_id = self.loop_id,
+                .turn = turn_number,
+                .role = @tagName(role),
+                .backend = @tagName(self.backend),
+                .tokens_used = tokens_used,
+            }),
+        }
+    }
+
+    pub fn handleEvent(self: *Presenter, event: NormalizedEvent) !void {
+        switch (event) {
+            .session_id => |session_id| switch (self.mode) {
+                .live => {
+                    try self.writer.print("  session: {s}\n", .{session_id});
+                    try self.flush();
+                },
+                .quiet => {},
+                .json => try self.writeJson(.{ .type = "turn.session", .loop_id = self.loop_id, .turn = self.turn_number, .session_id = session_id }),
+            },
+            .tool_call => |tool| switch (self.mode) {
+                .live => {
+                    try self.writer.writeAll("  -> ");
+                    try writeOneLine(self.writer, tool.name, 48);
+                    if (tool.detail.len > 0) {
+                        try self.writer.writeAll(": ");
+                        try writeOneLine(self.writer, tool.detail, 144);
+                    }
+                    try self.writer.writeByte('\n');
+                    try self.flush();
+                },
+                .quiet => {},
+                .json => try self.writeJson(.{ .type = "turn.tool", .loop_id = self.loop_id, .turn = self.turn_number, .tool = tool.name, .detail = tool.detail }),
+            },
+            .assistant_text => |text| switch (self.mode) {
+                .live => {
+                    try self.writer.writeAll("  assistant: ");
+                    try self.writer.writeAll(text);
+                    if (text.len == 0 or text[text.len - 1] != '\n') try self.writer.writeByte('\n');
+                    try self.flush();
+                },
+                .quiet => {},
+                .json => try self.writeJson(.{ .type = "turn.assistant", .loop_id = self.loop_id, .turn = self.turn_number, .text = text }),
+            },
+            .token_usage => {},
+            .error_message => |message| {
+                const copy = try self.allocator.dupe(u8, message);
+                if (self.last_error_message) |old| self.allocator.free(old);
+                self.last_error_message = copy;
+                switch (self.mode) {
+                    .live => {
+                        try self.writer.writeAll("  error: ");
+                        try writeOneLine(self.writer, message, 240);
+                        try self.writer.writeByte('\n');
+                        try self.flush();
+                    },
+                    .quiet, .json => {},
+                }
+            },
+            .ignored => {},
+        }
+    }
+
+    pub fn eventHandler(context: ?*anyopaque, event: NormalizedEvent) void {
+        const self: *Presenter = @ptrCast(@alignCast(context.?));
+        if (self.pending_error != null) return;
+        self.handleEvent(event) catch |err| {
+            self.pending_error = err;
+        };
+    }
+
+    pub fn checkError(self: *Presenter) anyerror!void {
+        if (self.pending_error) |err| {
+            self.pending_error = null;
+            return err;
+        }
+    }
+
+    pub fn turnCompleted(self: *Presenter, status: store.LoopStatus, tokens_used: u64, elapsed_ms: u64) !void {
+        switch (self.mode) {
+            .live => {
+                try self.writer.print("=== [turn {d} completed | {s} | {d} tok | {d} ms] ===\n", .{ self.turn_number, @tagName(status), tokens_used, elapsed_ms });
+                try self.flush();
+            },
+            .quiet => {
+                try self.writer.print("[turn {d}] status={s} tokens={d} elapsed={d}ms\n", .{ self.turn_number, @tagName(status), tokens_used, elapsed_ms });
+                try self.flush();
+            },
+            .json => try self.writeJson(.{
+                .type = "turn.completed",
+                .loop_id = self.loop_id,
+                .turn = self.turn_number,
+                .role = @tagName(self.role),
+                .backend = @tagName(self.backend),
+                .status = @tagName(status),
+                .tokens_used = tokens_used,
+                .elapsed_ms = elapsed_ms,
+                .error_message = self.last_error_message,
+            }),
+        }
+    }
+
+    pub fn statusChanged(self: *Presenter, previous: store.LoopStatus, next: store.LoopStatus) !void {
+        switch (self.mode) {
+            .live => {
+                try self.writer.print("  status: {s} -> {s}\n", .{ @tagName(previous), @tagName(next) });
+                try self.flush();
+            },
+            .quiet => {
+                try self.writer.print("[loop {s}] status: {s} -> {s}\n", .{ self.loop_id, @tagName(previous), @tagName(next) });
+                try self.flush();
+            },
+            .json => try self.writeJson(.{ .type = "loop.status_changed", .loop_id = self.loop_id, .from = @tagName(previous), .to = @tagName(next) }),
+        }
+    }
+
+    pub fn loopFinished(self: *Presenter, status: store.LoopStatus, turns_completed: u32, tokens_used: u64, outcome: []const u8) !void {
+        switch (self.mode) {
+            .live => {
+                try self.writer.print("=== [loop {s} finished | {s} | {d} turns | {d} tok] ===\n{s}\n", .{ self.loop_id, @tagName(status), turns_completed, tokens_used, outcome });
+                try self.flush();
+            },
+            .quiet => {
+                try self.writer.print("[loop {s}] finished status={s} turns={d} tokens={d}: {s}\n", .{ self.loop_id, @tagName(status), turns_completed, tokens_used, outcome });
+                try self.flush();
+            },
+            .json => try self.writeJson(.{
+                .type = "loop.finished",
+                .loop_id = self.loop_id,
+                .status = @tagName(status),
+                .turns_completed = turns_completed,
+                .tokens_used = tokens_used,
+                .outcome = outcome,
+            }),
+        }
+    }
+
+    fn writeJson(self: *Presenter, value: anytype) !void {
+        const encoded = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+        defer self.allocator.free(encoded);
+        try self.writer.writeAll(encoded);
+        try self.writer.writeByte('\n');
+        try self.flush();
+    }
+
+    fn flush(self: *Presenter) !void {
+        try self.writer.flush();
+    }
+};
+
+fn writeOneLine(writer: *std.Io.Writer, text: []const u8, limit: usize) !void {
+    const clipped = truncateUtf8(text, limit);
+    for (clipped) |byte| {
+        try writer.writeByte(if (byte == '\n' or byte == '\r' or byte == '\t') ' ' else byte);
+    }
+    if (clipped.len < text.len) try writer.writeAll("…");
+}
+
+fn truncateUtf8(text: []const u8, limit: usize) []const u8 {
+    if (text.len <= limit) return text;
+    var end = limit;
+    while (end > 0 and end < text.len and (text[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return text[0..end];
+}
 
 /// Consumes JSONL one line at a time. Callback string slices are valid only until
 /// the callback returns; copy them if they must outlive this event. Accumulator
@@ -456,6 +674,68 @@ test "streams oversized JSON lines through a small reader buffer" {
     try readStream(std.testing.allocator, &limited.interface, .droid, &accumulator, &capture, Capture.handle);
     try std.testing.expect(capture.count(.tool_call) == 1);
     try std.testing.expect(capture.count(.ignored) == 1);
+}
+
+test "live, quiet, and json presenters format same turn events" {
+    const allocator = std.testing.allocator;
+    const live = try renderPresenterForTest(.live);
+    defer allocator.free(live);
+    const quiet = try renderPresenterForTest(.quiet);
+    defer allocator.free(quiet);
+    const json = try renderPresenterForTest(.json);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, live, "=== [loop loop-test | turn 2 | worker:codex | 100 tok] ===") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "  -> Read: /repo/src/main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "  assistant: done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "| 112 tok | 35 ms]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "\n  -> Read: /repo/other") == null);
+
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "[turn 2]\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "status=verifying tokens=112 elapsed=35ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "status: active -> verifying") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "finished status=complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "-> Read") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "assistant:") == null);
+
+    const expected_types = [_][]const u8{
+        "loop.started",
+        "turn.started",
+        "turn.session",
+        "turn.tool",
+        "turn.assistant",
+        "turn.completed",
+        "loop.status_changed",
+        "loop.finished",
+    };
+    var lines = std.mem.tokenizeScalar(u8, json, '\n');
+    for (expected_types) |expected| {
+        const line = lines.next() orelse return error.MissingJsonEvent;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const actual = parsed.value.object.get("type").?.string;
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expect(lines.next() == null);
+}
+
+fn renderPresenterForTest(mode: options.OutputMode) ![]u8 {
+    const allocator = std.testing.allocator;
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var presenter = Presenter.init(allocator, &output.writer, mode, "loop-test", .codex);
+    defer presenter.deinit();
+    var long_detail: [4096]u8 = @splat('x');
+    try presenter.loopStarted();
+    try presenter.turnStarted(2, .worker, 100);
+    try presenter.handleEvent(.{ .session_id = "session-1" });
+    try presenter.handleEvent(.{ .tool_call = .{ .name = "Read", .detail = "/repo/src/main.zig\n" ++ &long_detail } });
+    try presenter.handleEvent(.{ .assistant_text = "done\n" });
+    try presenter.handleEvent(.{ .token_usage = .{ .input_tokens = 100, .output_tokens = 12, .total_tokens = 112 } });
+    try presenter.turnCompleted(.verifying, 112, 35);
+    try presenter.statusChanged(.active, .verifying);
+    try presenter.loopFinished(.complete, 2, 112, "verified");
+    return allocator.dupe(u8, output.written());
 }
 
 const Capture = struct {
