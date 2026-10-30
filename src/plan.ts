@@ -56,7 +56,7 @@ export interface Plan {
   blockers?: Blocker[]
   exitCriteria?: NonEmptyString[]
   recommendedOrder?: RecommendedOrderItem[]
-  changedFiles?: FileTree[]
+  changedFiles: FileTree[]
 }
 
 export interface PlanSection {
@@ -156,6 +156,7 @@ export interface FileTreeNode {
   name: NonEmptyString
   type: FileTreeNodeType
   status?: FileNodeStatus
+  stories?: Slug[]
   children?: FileTreeNode[]
 }
 

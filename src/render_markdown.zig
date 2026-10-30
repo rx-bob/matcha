@@ -301,6 +301,20 @@ fn renderFileTreeNode(out: *MarkdownWriter, node: std.json.ObjectMap, depth: usi
                 try line.appendSlice(out.allocator, " [mod]");
             }
         }
+
+        if (getStringList(node, "stories", out.allocator)) |stories| {
+            defer out.allocator.free(stories);
+            if (stories.len > 0) {
+                try line.appendSlice(out.allocator, " (Stories: ");
+                for (stories, 0..) |story, index| {
+                    if (index > 0) {
+                        try line.appendSlice(out.allocator, ", ");
+                    }
+                    try line.appendSlice(out.allocator, story);
+                }
+                try line.appendSlice(out.allocator, ")");
+            }
+        }
     }
 
     const line_text = try line.toOwnedSlice(out.allocator);
@@ -1144,12 +1158,12 @@ test "renders epics and stories with core fields" {
     }
 }
 
-test "renders changed files tree with status markers and indentation" {
+test "renders changed files tree with status markers, stories, and indentation" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const parsed = try parseJsonValue(arena.allocator(), "{\"schemaVersion\":1,\"id\":\"changed\",\"title\":\"Changed Plan\",\"changedFiles\":[{\"label\":\"Source\",\"root\":{\"name\":\"src\",\"type\":\"folder\",\"children\":[{\"name\":\"main.zig\",\"type\":\"file\",\"status\":\"new\"},{\"name\":\"cli.zig\",\"type\":\"file\",\"status\":\"modified\"},{\"name\":\"utils\",\"type\":\"folder\",\"children\":[{\"name\":\"helpers.zig\",\"type\":\"file\",\"status\":\"modified\"}]}]}},{\"root\":{\"name\":\"test\",\"type\":\"folder\",\"children\":[{\"name\":\"main.test.zig\",\"type\":\"file\",\"status\":\"new\"}]}}]}");
+    const parsed = try parseJsonValue(arena.allocator(), "{\"schemaVersion\":1,\"id\":\"changed\",\"title\":\"Changed Plan\",\"changedFiles\":[{\"label\":\"Source\",\"root\":{\"name\":\"src\",\"type\":\"folder\",\"children\":[{\"name\":\"main.zig\",\"type\":\"file\",\"status\":\"new\",\"stories\":[\"E1.S1\",\"E2.S1\"]},{\"name\":\"cli.zig\",\"type\":\"file\",\"status\":\"modified\",\"stories\":[\"E1.S2\"]},{\"name\":\"utils\",\"type\":\"folder\",\"children\":[{\"name\":\"helpers.zig\",\"type\":\"file\",\"status\":\"modified\",\"stories\":[\"E2.S3\"]}]}]}},{\"root\":{\"name\":\"test\",\"type\":\"folder\",\"children\":[{\"name\":\"main.test.zig\",\"type\":\"file\",\"status\":\"new\"}]}}]}");
     defer parsed.deinit();
 
     const markdown = try renderPlanMarkdown(allocator, parsed.value);
@@ -1159,10 +1173,10 @@ test "renders changed files tree with status markers and indentation" {
         "## Changed Files",
         "### Source",
         "src",
-        "  main.zig [new]",
-        "  cli.zig [mod]",
+        "  main.zig [new] (Stories: E1.S1, E2.S1)",
+        "  cli.zig [mod] (Stories: E1.S2)",
         "  utils",
-        "    helpers.zig [mod]",
+        "    helpers.zig [mod] (Stories: E2.S3)",
         "test",
         "  main.test.zig [new]",
     }) |expected| {

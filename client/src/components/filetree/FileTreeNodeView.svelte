@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { FileTreeNode, FileNodeStatus } from "../../../../src/plan.ts"
+  import { storyDomId } from "../../lib/ids.ts"
   import { Folder, FolderOpen, File, ChevronRight, ChevronDown } from "@lucide/svelte"
 
   export let node: FileTreeNode
@@ -26,8 +27,8 @@
   }
 
   function statusLabel(status: FileNodeStatus | undefined): string {
-    if (status === "new") return "A"
-    if (status === "modified") return "M"
+    if (status === "new") return "New"
+    if (status === "modified") return "Modified"
     return ""
   }
 
@@ -80,6 +81,9 @@
       <span class="ft-name">{node.name}</span>
       {#if node.status}
         <span class={statusBadgeClass(node.status)}>{statusLabel(node.status)}</span>
+      {/if}
+      {#if node.stories && node.stories.length > 0}
+        <span class="ft-stories">(Stories:{#each node.stories as storyId, i}&nbsp;<a class="ft-story-link" href={"#" + storyDomId(storyId)}>{storyId}</a>{#if i < node.stories.length - 1},{/if}{/each})</span>
       {/if}
     </div>
   {/if}
@@ -191,6 +195,22 @@
     background: color-mix(in srgb, var(--muted) 18%, transparent);
     color: var(--muted);
     border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent);
+  }
+
+  .ft-stories {
+    font-size: 0.6875rem;
+    color: var(--subtle);
+    margin-left: 0.25rem;
+    flex-shrink: 0;
+  }
+
+  .ft-story-link {
+    color: var(--primary);
+    text-decoration: none;
+  }
+
+  .ft-story-link:hover {
+    text-decoration: underline;
   }
 
   .ft-children {

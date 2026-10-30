@@ -27,24 +27,24 @@
             "name": "Engine",
             "type": "folder",
             "children": [
-              { "name": "CalculatorEngine.swift", "type": "file", "status": "new" },
-              { "name": "CalculatorError.swift", "type": "file", "status": "new" },
-              { "name": "InputEvent.swift", "type": "file", "status": "new" }
+              { "name": "CalculatorEngine.swift", "type": "file", "status": "new", "stories": ["E2.S1", "E2.S2", "E2.S4"] },
+              { "name": "CalculatorError.swift", "type": "file", "status": "new", "stories": ["E2.S5"] },
+              { "name": "InputEvent.swift", "type": "file", "status": "new", "stories": ["E1.S2"] }
             ]
           },
           {
             "name": "ViewModel",
             "type": "folder",
             "children": [
-              { "name": "CalculatorViewModel.swift", "type": "file", "status": "new" }
+              { "name": "CalculatorViewModel.swift", "type": "file", "status": "new", "stories": ["E5.S1", "E5.S2"] }
             ]
           },
           {
             "name": "Views",
             "type": "folder",
             "children": [
-              { "name": "CalculatorView.swift", "type": "file", "status": "modified" },
-              { "name": "KeypadButton.swift", "type": "file", "status": "new" }
+              { "name": "CalculatorView.swift", "type": "file", "status": "modified", "stories": ["E4.S1", "E4.S3"] },
+              { "name": "KeypadButton.swift", "type": "file", "status": "new", "stories": ["E4.S2"] }
             ]
           }
         ]
@@ -56,8 +56,8 @@
         "name": "CalculatorTests",
         "type": "folder",
         "children": [
-          { "name": "CalculatorEngineTests.swift", "type": "file", "status": "new" },
-          { "name": "CalculatorViewModelTests.swift", "type": "file", "status": "new" }
+          { "name": "CalculatorEngineTests.swift", "type": "file", "status": "new", "stories": ["E2.S1", "E2.S2"] },
+          { "name": "CalculatorViewModelTests.swift", "type": "file", "status": "new", "stories": ["E5.S1"] }
         ]
       }
     }

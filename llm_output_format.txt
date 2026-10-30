@@ -11,15 +11,40 @@ The JSON object must follow this compact plan format:
   "summary": [
     "One to three short paragraphs explaining the plan's objective, current context, and main approach."
   ],
+  "changedFiles": [
+    {
+      "label": "Source",
+      "root": {
+        "name": "src",
+        "type": "folder",
+        "children": [
+          {
+            "name": "main.zig",
+            "type": "file",
+            "status": "new",
+            "stories": ["E1.S1"]
+          },
+          {
+            "name": "cli.zig",
+            "type": "file",
+            "status": "modified",
+            "stories": ["E1.S2"]
+          }
+        ]
+      }
+    }
+  ],
   "epics": [
     {
       "id": "E1",
       "title": "Epic title",
       "summary": "What this epic delivers.",
+      "description": "Optional Markdown narrative block rendered after the epic summary and before its stories. Use Markdown for headings, lists, code, and links.",
       "stories": [
         {
           "id": "E1.S1",
           "title": "Story title",
+          "description": "Optional Markdown narrative block rendered after the story title and before the details section. Use Markdown for headings, lists, code, and links.",
           "details": [
             "Concrete implementation work to perform."
           ],
@@ -58,6 +83,7 @@ Rules:
 - Unit tests should name the behavior being tested. If testing is not applicable, include a manual or smoke test instead.
 - recommendedOrder should reference story IDs, not epic IDs, unless the plan truly only has epic-level sequencing.
 - exitCriteria should describe the final proof that the entire plan succeeded.
+- changedFiles is required. Every plan must list the files that will be changed, using the FileTree shape below.
 
 Optional fields may be included when useful:
 
@@ -69,7 +95,6 @@ Top-level optional fields:
 - "workflows": ordered validation, migration, smoke-test, or rollout steps.
 - "commands": commands to run.
 - "blockers": known blocking fixes.
-- "changedFiles": array of filetrees describing the files changed once the plan is complete. Rendered in a Changed Files section after the abstract and before epics. Each tree has an optional label and a root node. Nodes are either folders (with children) or files (with a status of "new" or "modified"). Folders must not carry a status; files must not have children.
 
 Epic optional fields:
 - "description": Markdown string. Longer narrative block rendered after the epic summary and before its stories. Use Markdown for headings, lists, code, and links. Does not replace "summary"; "summary" is the short pitch, "description" is the detailed narrative.
@@ -151,7 +176,7 @@ Use this shape for optional blockers:
   "requiredFix": "Fix the compile error before running integration tests."
 }
 
-Use this shape for optional changedFiles:
+Use this shape for required changedFiles:
 
 {
   "changedFiles": [
@@ -164,12 +189,14 @@ Use this shape for optional changedFiles:
           {
             "name": "cli.zig",
             "type": "file",
-            "status": "modified"
+            "status": "modified",
+            "stories": ["E1.S1"]
           },
           {
             "name": "tree.zig",
             "type": "file",
-            "status": "new"
+            "status": "new",
+            "stories": ["E1.S1", "E1.S2"]
           },
           {
             "name": "handlers",
@@ -178,7 +205,8 @@ Use this shape for optional changedFiles:
               {
                 "name": "route.zig",
                 "type": "file",
-                "status": "new"
+                "status": "new",
+                "stories": ["E1.S3"]
               }
             ]
           }
@@ -194,7 +222,8 @@ Use this shape for optional changedFiles:
           {
             "name": "tree_test.zig",
             "type": "file",
-            "status": "new"
+            "status": "new",
+            "stories": ["E1.S1"]
           }
         ]
       }
@@ -210,6 +239,7 @@ FileTreeNode shape:
 - "name": required string. Display name of the file or folder.
 - "type": required, one of "folder" or "file".
 - "status": optional, one of "new" or "modified". Only valid on file nodes. Folders derive change state from their descendants and must not carry a status.
+- "stories": optional array of story IDs (e.g. ["E1.S1", "E2.S3"]). Only valid on file nodes. Lists which stories touch this file.
 - "children": required for folder nodes, absent for file nodes. Array of FileTreeNode.
 
 Prefer concise, dense plans. Avoid filler. Do not invent exact file paths, commands, APIs, or dates unless they were provided or are obvious from context.

@@ -5,7 +5,7 @@
   "description": "Canonical structured plan format for epic/story implementation plans, operational plans, validation flows, and architecture breakdowns.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "id", "title"],
+  "required": ["schemaVersion", "id", "title", "changedFiles"],
   "properties": {
     "schemaVersion": {
       "type": "integer",
@@ -493,6 +493,10 @@
           "enum": ["new", "modified"],
           "description": "Only valid on file nodes. Folders derive change state from their descendants."
         },
+        "stories": {
+          "$ref": "#/$defs/refList",
+          "description": "Story IDs that touch this file. Only valid on file nodes."
+        },
         "children": {
           "type": "array",
           "items": {
@@ -512,7 +516,8 @@
           "then": {
             "required": ["children"],
             "properties": {
-              "status": { "type": "null", "description": "Folders must not carry a status." }
+              "status": { "type": "null", "description": "Folders must not carry a status." },
+              "stories": { "type": "null", "description": "Folders must not carry stories." }
             }
           },
           "else": {
