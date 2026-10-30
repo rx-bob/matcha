@@ -9,6 +9,8 @@ const render_markdown = @import("render_markdown.zig");
 const plan_read = @import("plan_read.zig");
 const serve_options = @import("serve_options.zig");
 const serve = @import("serve.zig");
+const loop_options = @import("loop_options.zig");
+const loop_store = @import("loop_store.zig");
 
 pub const version = "0.1.0";
 
@@ -50,6 +52,16 @@ pub fn run(init: std.process.Init) !void {
 }
 
 pub fn runArgs(args: []const []const u8, io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
+    return runArgsWithLoopStoreRoot(args, io, stdout, stderr, null);
+}
+
+fn runArgsWithLoopStoreRoot(
+    args: []const []const u8,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    store_root: ?[]const u8,
+) !ExitCode {
     const command = if (args.len > 0) args[0] else "";
 
     if (isHelpCommand(command)) {
@@ -82,10 +94,244 @@ pub fn runArgs(args: []const []const u8, io: std.Io, stdout: *std.Io.Writer, std
         return runServeCommand(io, args[1..], stdout, stderr);
     }
 
+    if (std.mem.eql(u8, command, "loop")) {
+        return runLoopCommand(io, args[1..], stdout, stderr, store_root);
+    }
+
     try writeHelp(stdout);
     try stdout.writeByte('\n');
     try stderr.print("Unknown command: {s}\n", .{command});
     return .usage;
+}
+
+fn runLoopCommand(
+    io: std.Io,
+    args: []const []const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    store_root: ?[]const u8,
+) !ExitCode {
+    const command = switch (loop_options.parseLoopCommand(std.heap.page_allocator, args, true, "")) {
+        .ok => |parsed| parsed,
+        .err => |cli_error| {
+            try writeCliError(stderr, cli_error);
+            try writeLoopUsage(stderr);
+            return .usage;
+        },
+    };
+    switch (command) {
+        .help => {
+            try writeLoopHelp(stdout);
+            return .ok;
+        },
+        .run => {
+            std.heap.page_allocator.free(command.run.prompt);
+            try stderr.writeAll("matcha loop run is not available yet\n");
+            return .failure;
+        },
+        .@"resume" => {
+            try stderr.writeAll("matcha loop resume is not available yet\n");
+            return .failure;
+        },
+        else => {},
+    }
+
+    var store = loop_store.Store.init(std.heap.page_allocator, io, store_root) catch |err| {
+        try stderr.print("Cannot initialize loop store: {s}\n", .{@errorName(err)});
+        return .failure;
+    };
+    defer store.deinit();
+
+    switch (command) {
+        .list => return writeLoopList(&store, stdout, stderr),
+        .show => |options| {
+            const id = resolveLoopId(options.id, io) orelse {
+                try stderr.writeAll("Loop ID required; pass <id> or set MATCHA_LOOP_ID\n");
+                return .usage;
+            };
+            return writeLoopShow(&store, id, stdout, stderr);
+        },
+        .update => |options| {
+            const id = resolveLoopId(options.id, io) orelse {
+                try stderr.writeAll("Loop ID required; pass <id> or set MATCHA_LOOP_ID\n");
+                return .usage;
+            };
+            return updateLoop(&store, id, options, stdout, stderr);
+        },
+        .verify => |options| {
+            const id = resolveLoopId(options.id, io) orelse {
+                try stderr.writeAll("Loop ID required; pass <id> or set MATCHA_LOOP_ID\n");
+                return .usage;
+            };
+            return verifyLoop(&store, id, options, stdout, stderr);
+        },
+        else => unreachable,
+    }
+}
+
+fn resolveLoopId(explicit_id: ?[]const u8, io: std.Io) ?[]const u8 {
+    _ = io;
+    if (explicit_id) |id| return id;
+    const env = std.c.getenv("MATCHA_LOOP_ID") orelse return null;
+    const value = std.mem.span(env);
+    return if (value.len > 0) value else null;
+}
+
+fn updateLoop(store: *const loop_store.Store, id: []const u8, options: loop_options.UpdateOptions, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
+    var parsed = store.loadState(id) catch |err| return reportLoopStoreError(err, id, stderr);
+    defer parsed.deinit();
+    var state = parsed.value;
+    switch (options.status) {
+        .complete => {
+            if (state.status != .active) {
+                try stderr.print("Cannot mark loop {s} complete from status {s}\n", .{ id, @tagName(state.status) });
+                return .failure;
+            }
+            state.status = if (state.verify_enabled) .verifying else .complete;
+            state.completion_summary = options.summary;
+        },
+        .blocked => {
+            if (state.status != .active) {
+                try stderr.print("Cannot record blocker for loop {s} from status {s}\n", .{ id, @tagName(state.status) });
+                return .failure;
+            }
+            state.blocked_strikes = @min(state.blocked_strikes +| 1, 3);
+            state.last_blocker_summary = options.summary;
+            if (state.blocked_strikes >= 3) {
+                state.status = .blocked;
+            } else {
+                state.status = .active;
+            }
+        },
+    }
+    state.updated_at_ms = @intCast(@max(0, std.Io.Clock.real.now(store.io).toMilliseconds()));
+    store.saveState(state) catch |err| return reportLoopStoreError(err, id, stderr);
+    if (options.status == .blocked and state.status == .active) {
+        try stdout.print("Blocker recorded (strike {d}/3); loop remains active—attempt an alternative path.\n", .{state.blocked_strikes});
+    } else {
+        try stdout.print("Loop {s} status: {s}\n", .{ id, @tagName(state.status) });
+    }
+    return .ok;
+}
+
+fn verifyLoop(store: *const loop_store.Store, id: []const u8, options: loop_options.VerifyOptions, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
+    var parsed = store.loadState(id) catch |err| return reportLoopStoreError(err, id, stderr);
+    defer parsed.deinit();
+    var state = parsed.value;
+    if (state.status != .verifying) {
+        try stderr.print("Cannot verify loop {s} from status {s}\n", .{ id, @tagName(state.status) });
+        return .failure;
+    }
+    if (options.passed) {
+        state.status = .complete;
+    } else {
+        state.status = .active;
+        state.blocked_strikes = 0;
+        state.last_verifier_feedback = options.reason;
+    }
+    state.updated_at_ms = @intCast(@max(0, std.Io.Clock.real.now(store.io).toMilliseconds()));
+    store.saveState(state) catch |err| return reportLoopStoreError(err, id, stderr);
+    try stdout.print("Loop {s} verification: {s}\n", .{ id, if (options.passed) "passed" else "rejected" });
+    return .ok;
+}
+
+fn writeLoopList(store: *const loop_store.Store, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
+    const ids = store.listLoopIds() catch |err| return reportLoopStoreError(err, "<loops>", stderr);
+    defer {
+        for (ids) |id| store.allocator.free(id);
+        store.allocator.free(ids);
+    }
+    try stdout.writeAll("ID\tSTATUS\tBACKEND\tTURNS\tTOKENS\tOBJECTIVE\n");
+    for (ids) |id| {
+        var parsed = store.loadState(id) catch |err| return reportLoopStoreError(err, id, stderr);
+        defer parsed.deinit();
+        const objective = try oneLineObjective(store.allocator, parsed.value.objective);
+        defer store.allocator.free(objective);
+        const clipped = truncateUtf8(objective, 40);
+        try stdout.print("{s}\t{s}\t{s}\t{d}\t{d}\t{s}{s}\n", .{
+            id,
+            @tagName(parsed.value.status),
+            @tagName(parsed.value.backend),
+            parsed.value.turns_completed,
+            parsed.value.tokens_used,
+            clipped,
+            if (clipped.len < objective.len) "…" else "",
+        });
+    }
+    return .ok;
+}
+
+fn writeLoopShow(store: *const loop_store.Store, id: []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
+    var parsed = store.loadState(id) catch |err| return reportLoopStoreError(err, id, stderr);
+    defer parsed.deinit();
+    const state = parsed.value;
+    try stdout.print("ID: {s}\nStatus: {s}\nBackend: {s}\nVerifier: {s}\nVerification: {s}\nTurns: {d}\nTokens: {d}\nBudgets: max-turns=", .{
+        state.id,                                                               @tagName(state.status),                              @tagName(state.backend),
+        if (state.verifier_backend) |backend| @tagName(backend) else "default", if (state.verify_enabled) "enabled" else "disabled", state.turns_completed,
+        state.tokens_used,
+    });
+    if (state.max_turns) |value| try stdout.print("{d}", .{value}) else try stdout.writeAll("unlimited");
+    try stdout.writeAll(", token-budget=");
+    if (state.token_budget) |value| try stdout.print("{d}", .{value}) else try stdout.writeAll("unlimited");
+    try stdout.writeAll(", timeout=");
+    if (state.timeout_seconds) |value| try stdout.print("{d}s", .{value}) else try stdout.writeAll("unlimited");
+    try stdout.print("\nSession: {s}\nWorking directory: {s}\nObjective:\n{s}\n", .{ state.worker_session_id orelse "none", state.cwd, state.objective });
+    const history = store.readRecentTurnLog(id, 5) catch |err| switch (err) {
+        error.FileNotFound => "",
+        else => return reportLoopStoreError(err, id, stderr),
+    };
+    defer store.allocator.free(history);
+    try stdout.writeAll("Recent turns:\n");
+    if (history.len == 0) try stdout.writeAll("  (none)\n") else try stdout.print("{s}", .{history});
+    return .ok;
+}
+
+fn reportLoopStoreError(err: anyerror, id: []const u8, stderr: *std.Io.Writer) !ExitCode {
+    if (err == error.FileNotFound or err == error.NotDir) {
+        try stderr.print("Loop not found: {s}\n", .{id});
+    } else {
+        try stderr.print("Loop store error for {s}: {s}\n", .{ id, @errorName(err) });
+    }
+    return .failure;
+}
+
+fn truncateUtf8(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and end < text.len and (text[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return text[0..end];
+}
+
+fn oneLineObjective(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (words.next()) |word| {
+        if (result.items.len > 0) try result.append(allocator, ' ');
+        try result.appendSlice(allocator, word);
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+fn writeLoopUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeAll("Usage: matcha loop <run|resume|list|show|update|verify|help> [options]\n");
+}
+
+pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeAll(
+        \\matcha loop
+        \\
+        \\Usage:
+        \\  matcha loop -b <codex|droid|agy> <prompt> [options]
+        \\  matcha loop list
+        \\  matcha loop show [<id>]
+        \\  matcha loop update [<id>] --status <complete|blocked> [--summary <text>]
+        \\  matcha loop verify [<id>] --pass | --fail --reason <text>
+        \\
+        \\Loop callbacks accept MATCHA_LOOP_ID when <id> is omitted.
+        \\Use matcha loop --help for this help.
+        \\
+    );
 }
 
 fn isHelpCommand(command: []const u8) bool {
@@ -541,6 +787,7 @@ pub fn writeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  plan             Render a plan based on the given input
         \\  map              Render a map based on the given input
         \\  serve            Serve generated Matcha HTML artifacts on the local network
+        \\  loop             Run or inspect a persistent autonomous loop
         \\
         \\Plan commands:
         \\  matcha plan --help              Show detailed help for plan rendering
@@ -551,6 +798,9 @@ pub fn writeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\Serve commands:
         \\  matcha serve --help             Show detailed help for serve mode
+        \\
+        \\Loop commands:
+        \\  matcha loop --help              Show loop commands and options
         \\
         \\Options:
         \\  -i, --input <path>    JSON file to render
@@ -618,6 +868,7 @@ pub fn writeUsageGuide(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha map --input path/to/map.json --output path/to/map.html
         \\  matcha plan read path/to/plan.json          Print Markdown to stdout
         \\  matcha plan read path/to/plan.html          Read a matcha-generated plan HTML back as Markdown
+        \\  matcha loop --help                         Run or inspect a persistent loop
         \\
         \\Defaults:
         \\  matcha plan reads sample_plan.json and writes dist/plan.html.
@@ -1751,6 +2002,7 @@ fn expectMissingValue(expected_flag: []const u8, result: RenderOptionsResult) !v
                 return;
             },
             .unknown_option => return error.WrongError,
+            else => return error.WrongError,
         },
     }
 }
@@ -1764,6 +2016,87 @@ fn expectUnknownOption(expected_option: []const u8, result: RenderOptionsResult)
                 try std.testing.expectEqualStrings(expected_option, option);
                 return;
             },
+            else => return error.WrongError,
         },
     }
+}
+
+test "loop CLI help, list, show, update, and verify callbacks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(store_root);
+    var store = try loop_store.Store.init(std.testing.allocator, std.testing.io, store_root);
+    defer store.deinit();
+    const state: loop_store.LoopState = .{
+        .id = "6722c1a0-0001",
+        .backend = .codex,
+        .cwd = "/work",
+        .objective = "repair the edge case",
+        .started_at_ms = 100,
+        .updated_at_ms = 100,
+        .turns_completed = 2,
+        .tokens_used = 99,
+        .blocked_strikes = 0,
+    };
+    try store.createLoop(state);
+    try store.appendTurnLog(state.id, .{ .turn = 1, .role = .worker, .backend = .codex, .outcome = .continued, .summary = "implemented core" });
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    var code = try runArgsWithLoopStoreRoot(&.{ "loop", "--help" }, std.testing.io, &stdout, &stderr, store_root);
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], "matcha loop") != null);
+
+    stdout = .fixed(&stdout_buffer);
+    stderr = .fixed(&stderr_buffer);
+    code = try runArgsWithLoopStoreRoot(&.{ "loop", "list" }, std.testing.io, &stdout, &stderr, store_root);
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], "repair the edge case") != null);
+
+    stdout = .fixed(&stdout_buffer);
+    stderr = .fixed(&stderr_buffer);
+    code = try runArgsWithLoopStoreRoot(&.{ "loop", "show", state.id }, std.testing.io, &stdout, &stderr, store_root);
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], "implemented core") != null);
+
+    var strike: u8 = 1;
+    while (strike <= 3) : (strike += 1) {
+        stdout = .fixed(&stdout_buffer);
+        stderr = .fixed(&stderr_buffer);
+        code = try runArgsWithLoopStoreRoot(&.{ "loop", "update", state.id, "--status", "blocked", "--summary", "blocked step" }, std.testing.io, &stdout, &stderr, store_root);
+        try std.testing.expectEqual(ExitCode.ok, code);
+        var loaded = try store.loadState(state.id);
+        defer loaded.deinit();
+        try std.testing.expectEqual(if (strike == 3) loop_store.LoopStatus.blocked else loop_store.LoopStatus.active, loaded.value.status);
+        try std.testing.expectEqual(strike, loaded.value.blocked_strikes);
+    }
+
+    var loaded = try store.loadState(state.id);
+    defer loaded.deinit();
+    var active = loaded.value;
+    active.status = .active;
+    active.verify_enabled = true;
+    active.blocked_strikes = 2;
+    try store.saveState(active);
+    stdout = .fixed(&stdout_buffer);
+    stderr = .fixed(&stderr_buffer);
+    code = try runArgsWithLoopStoreRoot(&.{ "loop", "update", state.id, "--status", "complete", "--summary", "ready" }, std.testing.io, &stdout, &stderr, store_root);
+    try std.testing.expectEqual(ExitCode.ok, code);
+    var verifying = try store.loadState(state.id);
+    defer verifying.deinit();
+    try std.testing.expectEqual(loop_store.LoopStatus.verifying, verifying.value.status);
+    try std.testing.expectEqualStrings("ready", verifying.value.completion_summary.?);
+
+    stdout = .fixed(&stdout_buffer);
+    stderr = .fixed(&stderr_buffer);
+    code = try runArgsWithLoopStoreRoot(&.{ "loop", "verify", state.id, "--fail", "--reason", "missing edge test" }, std.testing.io, &stdout, &stderr, store_root);
+    try std.testing.expectEqual(ExitCode.ok, code);
+    var rejected = try store.loadState(state.id);
+    defer rejected.deinit();
+    try std.testing.expectEqual(loop_store.LoopStatus.active, rejected.value.status);
+    try std.testing.expectEqual(@as(u8, 0), rejected.value.blocked_strikes);
+    try std.testing.expectEqualStrings("missing edge test", rejected.value.last_verifier_feedback.?);
 }

@@ -146,6 +146,64 @@ pub const Store = struct {
         }
         return latest;
     }
+
+    pub fn listLoopIds(self: *const Store) ![][]const u8 {
+        var root_dir = try self.ensureRoot();
+        defer root_dir.close(self.io);
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+        var iterator = root_dir.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            if (entry.kind != .directory or !validLoopId(entry.name)) continue;
+            try ids.append(self.allocator, try self.allocator.dupe(u8, entry.name));
+        }
+        std.mem.sort([]const u8, ids.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        return ids.toOwnedSlice(self.allocator);
+    }
+
+    pub fn readRecentTurnLog(self: *const Store, id: []const u8, max_lines: usize) ![]const u8 {
+        if (!validLoopId(id)) return error.InvalidLoopId;
+        if (max_lines == 0) return self.allocator.dupe(u8, "");
+        var root_dir = try self.ensureRoot();
+        defer root_dir.close(self.io);
+        var loop_dir = try root_dir.openDir(self.io, id, .{});
+        defer loop_dir.close(self.io);
+        const file = try loop_dir.openFile(self.io, "turns.jsonl", .{});
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        const read_limit: u64 = 128 * 1024;
+        const start = if (stat.size > read_limit) stat.size - read_limit else 0;
+        const length: usize = @intCast(stat.size - start);
+        const bytes = try self.allocator.alloc(u8, length);
+        defer self.allocator.free(bytes);
+        const read = try file.readPositionalAll(self.io, bytes, start);
+        const content = bytes[0..read];
+        var line_start: usize = 0;
+        if (start != 0) {
+            if (std.mem.indexOfScalar(u8, content, '\n')) |newline| line_start = newline + 1 else return self.allocator.dupe(u8, "");
+        }
+        var boundaries: usize = 0;
+        var index = content.len;
+        var selected = line_start;
+        while (index > line_start) {
+            index -= 1;
+            if (content[index] == '\n' and index + 1 < content.len) {
+                boundaries += 1;
+                if (boundaries == max_lines) {
+                    selected = index + 1;
+                    break;
+                }
+            }
+        }
+        return self.allocator.dupe(u8, content[selected..]);
+    }
 };
 
 fn validLoopId(id: []const u8) bool {
@@ -241,6 +299,17 @@ test "turn log appends worker and verifier records and latest id sorts lexically
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"role\":\"verifier\"") != null);
+    const tail = try store.readRecentTurnLog("6722c1a0-0001", 1);
+    defer std.testing.allocator.free(tail);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "worker") == null);
+    const ids = try store.listLoopIds();
+    defer {
+        for (ids) |id| std.testing.allocator.free(id);
+        std.testing.allocator.free(ids);
+    }
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqualStrings("6722c1a0-0001", ids[0]);
     const latest = (try store.resolveLatestLoopId()).?;
     defer std.testing.allocator.free(latest);
     try std.testing.expectEqualStrings("6722c1a0-0002", latest);
