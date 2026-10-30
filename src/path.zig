@@ -21,9 +21,13 @@ pub fn expandHomePath(
         return home;
     }
 
-    const buffer = try allocator.alloc(u8, home.len + input.len - 1);
+    const buffer = allocator.alloc(u8, home.len + input.len - 1) catch |err| {
+        allocator.free(home);
+        return err;
+    };
     std.mem.copyForwards(u8, buffer[0..home.len], home);
     std.mem.copyForwards(u8, buffer[home.len..], input[1..]);
+    allocator.free(home);
 
     return buffer;
 }
@@ -63,7 +67,9 @@ test "expands home path with HOME when available" {
     defer std.testing.allocator.free(home);
     const expanded = try expandHomePath(std.testing.allocator, "~/plans/input.json");
     defer std.testing.allocator.free(expanded);
-    try std.testing.expectEqualStrings(home ++ "/plans/input.json", expanded);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/plans/input.json", .{home});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, expanded);
 }
 
 test "detects parent directories" {
