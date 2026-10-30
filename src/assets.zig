@@ -56,6 +56,31 @@ pub const llm_uml_output_format: TextAsset = .{
     .contents = @embedFile("../llm_uml_output_format.txt"),
 };
 
+pub const loop_initial: TextAsset = .{
+    .name = "loop_initial.md",
+    .contents = @embedFile("../prompts/loop_initial.md"),
+};
+
+pub const loop_continuation: TextAsset = .{
+    .name = "loop_continuation.md",
+    .contents = @embedFile("../prompts/loop_continuation.md"),
+};
+
+pub const loop_verifier: TextAsset = .{
+    .name = "loop_verifier.md",
+    .contents = @embedFile("../prompts/loop_verifier.md"),
+};
+
+pub const loop_objective_updated: TextAsset = .{
+    .name = "loop_objective_updated.md",
+    .contents = @embedFile("../prompts/loop_objective_updated.md"),
+};
+
+pub const loop_budget_limit: TextAsset = .{
+    .name = "loop_budget_limit.md",
+    .contents = @embedFile("../prompts/loop_budget_limit.md"),
+};
+
 pub const required_assets = [_]TextAsset{
     plan_js,
     plan_css,
@@ -66,6 +91,11 @@ pub const required_assets = [_]TextAsset{
     serve_css,
     llm_output_format,
     llm_uml_output_format,
+    loop_initial,
+    loop_continuation,
+    loop_verifier,
+    loop_objective_updated,
+    loop_budget_limit,
 };
 
 pub const themes = [_]ThemeAsset{
@@ -220,6 +250,32 @@ test "embedded serve assets are non-empty and lookup-able" {
 
     try std.testing.expect(optionalServeJs() != null);
     try std.testing.expect(optionalServeCss() != null);
+}
+
+test "embedded loop prompts are non-empty, registered, and contain required guardrails" {
+    const prompts = [_]TextAsset{
+        loop_initial,
+        loop_continuation,
+        loop_verifier,
+        loop_objective_updated,
+        loop_budget_limit,
+    };
+    for (prompts) |prompt| {
+        try std.testing.expect(prompt.contents.len > 0);
+        const registered = assetByName(prompt.name).?;
+        try std.testing.expectEqualStrings(prompt.contents, registered.contents);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, loop_initial.contents, "<loop_objective>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "<loop_objective>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "{{ budget_section }}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "{{ verifier_section }}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "<verifier_rejection>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "{{ blocked_strikes }}/3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_initial.contents, "matcha loop update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "matcha loop update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_verifier.contents, "matcha loop verify --pass") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_verifier.contents, "matcha loop verify --fail --reason") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_verifier.contents, "Do not modify tracked project files") != null);
 }
 
 test "theme css can be streamed in manifest order" {
