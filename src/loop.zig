@@ -14,6 +14,16 @@ pub const Services = struct {
     parent_environment: *const std.process.Environ.Map,
     runner: backend.BackendRunner,
     stdout: *std.Io.Writer,
+    clock: ?Clock = null,
+};
+
+pub const Clock = struct {
+    context: *anyopaque,
+    nowMillisecondsFn: *const fn (context: *anyopaque) u64,
+
+    fn nowMilliseconds(self: Clock) u64 {
+        return self.nowMillisecondsFn(self.context);
+    }
 };
 
 pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
@@ -22,7 +32,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     defer allocator.free(cwd);
     const id = try services.store.generateLoopId();
     defer allocator.free(id);
-    const now = nowMilliseconds(services.io);
+    const now = nowMilliseconds(services);
     const state: store_mod.LoopState = .{
         .id = id,
         .status = .active,
@@ -47,6 +57,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     try presenter.loopStarted();
 
     var verifier_unconfirmed_attempts: u8 = 0;
+    var budget_wrapup_done = false;
     while (true) {
         var loaded = try services.store.loadState(id);
         const current = loaded.value;
@@ -54,6 +65,10 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
 
         switch (current.status) {
             .complete => {
+                if (budget_wrapup_done and !current.verify_enabled) {
+                    var limited = current;
+                    return finishBudgetLimited(services, &presenter, &limited, .unverified_completion);
+                }
                 const outcome = current.completion_summary orelse "Loop completed and verification passed.";
                 try presenter.loopFinished(current.status, current.turns_completed, current.tokens_used, outcome);
                 return .ok;
@@ -70,6 +85,17 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
             .active, .verifying => {},
         }
 
+        if (current.status == .active and current.turns_completed > 0 and budget_wrapup_done) {
+            var limited = current;
+            return finishBudgetLimited(services, &presenter, &limited, .wrapup_recorded);
+        }
+        const budget_reason = if (current.status == .active and current.turns_completed > 0)
+            reachedBudget(services, current)
+        else
+            null;
+        const is_budget_wrapup = budget_reason != null and !budget_wrapup_done;
+        if (is_budget_wrapup) budget_wrapup_done = true;
+
         const role: store_mod.TurnRole = if (current.status == .verifying) .verifier else .worker;
         const turn_number = current.turns_completed +| 1;
         const turn_backend: backend.BackendKind = if (role == .verifier) current.verifier_backend orelse current.backend else current.backend;
@@ -82,18 +108,20 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
 
         const prompt_kind: prompts.PromptKind = if (role == .verifier)
             .verifier
+        else if (is_budget_wrapup)
+            .budget_limit
         else if (current.turns_completed == 0)
             .initial
         else
             .continuation;
-        const prompt = try prompts.renderPrompt(allocator, prompt_kind, promptContext(services.io, current, turn_number));
+        const prompt = try prompts.renderPrompt(allocator, prompt_kind, promptContext(services, current, turn_number));
         defer allocator.free(prompt);
 
         // A verifier rejection is injected once into the next worker continuation.
         if (role == .worker and current.last_verifier_feedback != null) {
             var updated = current;
             updated.last_verifier_feedback = null;
-            updated.updated_at_ms = nowMilliseconds(services.io);
+            updated.updated_at_ms = nowMilliseconds(services);
             try services.store.saveState(updated);
         }
 
@@ -111,7 +139,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         var child_environment = try backend.buildChildEnvironment(allocator, services.io, services.parent_environment, id);
         defer child_environment.deinit();
 
-        const started_ms = nowMilliseconds(services.io);
+        const started_ms = nowMilliseconds(services);
         try presenter.turnStarted(turn_number, role, current.tokens_used);
         var persist_context = PersistSessionContext{ .store = services.store, .loop_id = id };
         var request = backend.TurnRequest{
@@ -132,13 +160,17 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
             request.on_session_id = PersistSessionContext.persist;
         }
         var result = services.runner.runTurn(request) catch |err| {
+            if (is_budget_wrapup) {
+                var limited = current;
+                return finishBudgetLimited(services, &presenter, &limited, .wrapup_failed);
+            }
             try services.stdout.print("Loop {s} backend turn failed: {s}\n", .{ id, @errorName(err) });
             try services.stdout.flush();
             return .failure;
         };
         defer result.deinit();
         try presenter.checkError();
-        const elapsed_ms = nowMilliseconds(services.io) -| started_ms;
+        const elapsed_ms = nowMilliseconds(services) -| started_ms;
 
         var after_turn_parsed = try services.store.loadState(id);
         defer after_turn_parsed.deinit();
@@ -147,13 +179,19 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         const blocked_strikes_before = current.blocked_strikes;
         after_turn.turns_completed +|= 1;
         after_turn.tokens_used +|= result.tokens_used;
-        after_turn.updated_at_ms = nowMilliseconds(services.io);
+        after_turn.updated_at_ms = nowMilliseconds(services);
 
         if (role == .worker and after_turn.status == .active) {
             if (after_turn.blocked_strikes == blocked_strikes_before) {
                 after_turn.blocked_strikes = 0;
                 after_turn.last_blocker_summary = null;
             }
+        }
+        const wrapup_claimed_unverified_completion = is_budget_wrapup and role == .worker and after_turn.status == .complete and !after_turn.verify_enabled;
+        if (is_budget_wrapup and role == .worker and after_turn.status != .verifying and
+            !(after_turn.status == .complete and after_turn.verify_enabled))
+        {
+            after_turn.status = .budget_limited;
         }
 
         const verifier_exited_without_verdict = role == .verifier and after_turn.status == .verifying and result.exit_code != 0 and !result.was_interrupted;
@@ -177,6 +215,9 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
             try services.store.saveState(after_turn);
             if (after_turn.status != previous_status) try presenter.statusChanged(previous_status, after_turn.status);
             try presenter.turnCompleted(after_turn.status, result.tokens_used, elapsed_ms);
+            if (is_budget_wrapup and role == .worker and after_turn.status != .blocked) {
+                return finishBudgetLimited(services, &presenter, &after_turn, .wrapup_failed);
+            }
             try presenter.loopFinished(after_turn.status, after_turn.turns_completed, after_turn.tokens_used, summary);
             return .failure;
         }
@@ -198,6 +239,10 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         try services.store.saveState(after_turn);
         if (after_turn.status != previous_status) try presenter.statusChanged(previous_status, after_turn.status);
         try presenter.turnCompleted(after_turn.status, result.tokens_used, elapsed_ms);
+        if (is_budget_wrapup and after_turn.status == .budget_limited) {
+            const reason: BudgetFinish = if (wrapup_claimed_unverified_completion) .unverified_completion else .wrapup_recorded;
+            return finishBudgetLimited(services, &presenter, &after_turn, reason);
+        }
         if (role == .verifier) {
             if (after_turn.status == .complete) continue;
             if (after_turn.status == .active) {
@@ -213,7 +258,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
                 retry_state.status = .active;
                 retry_state.blocked_strikes = 0;
                 retry_state.last_verifier_feedback = "Verifier exited without calling 'matcha loop verify'. Retry the verifier or address its findings, then report completion again.";
-                retry_state.updated_at_ms = nowMilliseconds(services.io);
+                retry_state.updated_at_ms = nowMilliseconds(services);
                 try services.store.saveState(retry_state);
                 try presenter.statusChanged(.verifying, .active);
                 verifier_unconfirmed_attempts = 0;
@@ -225,8 +270,8 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     }
 }
 
-fn promptContext(io: std.Io, state: store_mod.LoopState, turn_number: u32) prompts.PromptContext {
-    const current_ms = nowMilliseconds(io);
+fn promptContext(services: Services, state: store_mod.LoopState, turn_number: u32) prompts.PromptContext {
+    const current_ms = nowMilliseconds(services);
     return .{
         .objective = state.objective,
         .loop_id = state.id,
@@ -243,8 +288,51 @@ fn promptContext(io: std.Io, state: store_mod.LoopState, turn_number: u32) promp
     };
 }
 
-fn nowMilliseconds(io: std.Io) u64 {
-    return @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+fn nowMilliseconds(services: Services) u64 {
+    if (services.clock) |clock| return clock.nowMilliseconds();
+    return @intCast(@max(0, std.Io.Clock.real.now(services.io).toMilliseconds()));
+}
+
+const BudgetReason = enum { max_turns, token_budget, timeout };
+const BudgetFinish = enum { wrapup_recorded, wrapup_failed, unverified_completion };
+
+fn reachedBudget(services: Services, state: store_mod.LoopState) ?BudgetReason {
+    if (state.max_turns) |limit| if (state.turns_completed >= limit) return .max_turns;
+    if (state.token_budget) |limit| if (state.tokens_used >= limit) return .token_budget;
+    if (state.timeout_seconds) |limit| {
+        const elapsed_ms = nowMilliseconds(services) -| state.started_at_ms;
+        if (elapsed_ms / 1000 >= limit) return .timeout;
+    }
+    return null;
+}
+
+fn finishBudgetLimited(
+    services: Services,
+    presenter: *stream.Presenter,
+    state: *store_mod.LoopState,
+    reason: BudgetFinish,
+) !ExitCode {
+    const previous = state.status;
+    state.status = .budget_limited;
+    state.updated_at_ms = nowMilliseconds(services);
+    try services.store.saveState(state.*);
+    if (previous != state.status) try presenter.statusChanged(previous, state.status);
+    const outcome = switch (reason) {
+        .wrapup_recorded => "Budget reached; wrap-up recorded.",
+        .wrapup_failed => "Budget reached; wrap-up turn failed.",
+        .unverified_completion => "Budget reached; completion was not independently verified.",
+    };
+    const elapsed_seconds = (nowMilliseconds(services) -| state.started_at_ms) / 1000;
+    const summary = try std.fmt.allocPrint(services.allocator, "{s} Turns: {d}. Tokens: {d}. Elapsed: {d}s. Resume with: matcha loop resume {s}", .{
+        outcome,
+        state.turns_completed,
+        state.tokens_used,
+        elapsed_seconds,
+        state.id,
+    });
+    defer services.allocator.free(summary);
+    try presenter.loopFinished(state.status, state.turns_completed, state.tokens_used, summary);
+    return .failure;
 }
 
 fn turnOutcome(role: store_mod.TurnRole, status: store_mod.LoopStatus) store_mod.TurnOutcome {
@@ -267,7 +355,7 @@ const PersistSessionContext = struct {
         defer parsed.deinit();
         var state = parsed.value;
         state.worker_session_id = session_id;
-        state.updated_at_ms = nowMilliseconds(self.store.io);
+        state.updated_at_ms = @intCast(@max(0, std.Io.Clock.real.now(self.store.io).toMilliseconds()));
         try self.store.saveState(state);
     }
 };
@@ -307,6 +395,7 @@ test "worker continuation, independent verifier rejection, repair, and pass" {
     });
     try std.testing.expectEqual(ExitCode.ok, exit_code);
     try std.testing.expectEqual(@as(usize, 5), fake.calls.items.len);
+    for (fake.calls.items) |call| try std.testing.expect(std.mem.indexOf(u8, call.prompt, "soft wrap-up turn") == null);
     try expectFakeCall(&fake.calls.items[0], .codex, false, "Implement the feature");
     try expectFakeCall(&fake.calls.items[1], .codex, true, "Implement the feature");
     try expectFakeCall(&fake.calls.items[2], .agy, false, "Implement the feature");
@@ -466,7 +555,193 @@ test "three consecutive blocker reports stop the loop" {
     try std.testing.expectEqual(@as(u8, 3), state.value.blocked_strikes);
 }
 
-const FakeStep = enum { worker_progress, worker_complete, verifier_reject, verifier_no_verdict, worker_repaired, verifier_pass, worker_blocked };
+test "max turns runs one budget wrap-up and ends budget-limited" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_progress, .worker_progress, .worker_budget_wrapup } };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+    }, .{ .backend = .codex, .verify_enabled = false, .max_turns = 2, .prompt = "Finish the work." });
+    try expectBudgetRun(&store, &fake, output.written(), allocator, exit_code, 3, 30);
+}
+
+test "token budget runs one budget wrap-up and ends budget-limited" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_progress, .worker_progress, .worker_budget_wrapup }, .tokens_per_turn = 25000 };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+    }, .{ .backend = .codex, .verify_enabled = false, .token_budget = 50000, .prompt = "Finish the work." });
+    try expectBudgetRun(&store, &fake, output.written(), allocator, exit_code, 3, 75000);
+}
+
+test "timeout uses the injected clock and runs one budget wrap-up" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var fake_clock = FakeClock{ .now_ms = 1000 };
+    var fake = FakeRunner{
+        .store = &store,
+        .script = &.{ .worker_progress, .worker_budget_wrapup },
+        .clock = &fake_clock,
+        .advance_clock_ms = 2000,
+    };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+        .clock = fake_clock.reader(),
+    }, .{ .backend = .codex, .verify_enabled = false, .timeout_seconds = 1, .prompt = "Finish the work." });
+    try expectBudgetRun(&store, &fake, output.written(), allocator, exit_code, 2, 20);
+}
+
+test "budget wrap-up completion must pass the independent verifier" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_progress, .worker_complete, .verifier_pass } };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+    }, .{ .backend = .codex, .max_turns = 1, .prompt = "Finish the work." });
+    try std.testing.expectEqual(ExitCode.ok, exit_code);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[1].prompt, "soft wrap-up turn") != null);
+    try std.testing.expect(fake.calls.items[2].session_id_absent);
+    const id = try store.resolveLatestLoopId();
+    defer allocator.free(id.?);
+    var state = try store.loadState(id.?);
+    defer state.deinit();
+    try std.testing.expectEqual(store_mod.LoopStatus.complete, state.value.status);
+}
+
+test "budget wrap-up cannot claim unverified completion when verification is disabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_progress, .worker_complete } };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+    }, .{ .backend = .codex, .verify_enabled = false, .max_turns = 1, .prompt = "Finish the work." });
+    try std.testing.expectEqual(ExitCode.failure, exit_code);
+    const id = try store.resolveLatestLoopId();
+    defer allocator.free(id.?);
+    var state = try store.loadState(id.?);
+    defer state.deinit();
+    try std.testing.expectEqual(store_mod.LoopStatus.budget_limited, state.value.status);
+}
+
+fn expectBudgetRun(
+    store: *store_mod.Store,
+    fake: *const FakeRunner,
+    output: []const u8,
+    allocator: std.mem.Allocator,
+    exit_code: ExitCode,
+    expected_turns: u32,
+    expected_tokens: u64,
+) !void {
+    try std.testing.expectEqual(ExitCode.failure, exit_code);
+    try std.testing.expectEqual(@as(usize, if (expected_turns == 3) 3 else 2), fake.calls.items.len);
+    for (fake.calls.items, 0..) |call, index| {
+        const is_wrapup = index + 1 == fake.calls.items.len;
+        try std.testing.expectEqual(is_wrapup, std.mem.indexOf(u8, call.prompt, "soft wrap-up turn") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, output, "matcha loop resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Turns:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Tokens:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Elapsed:") != null);
+    const id = try store.resolveLatestLoopId();
+    defer allocator.free(id.?);
+    var state = try store.loadState(id.?);
+    defer state.deinit();
+    try std.testing.expectEqual(store_mod.LoopStatus.budget_limited, state.value.status);
+    try std.testing.expectEqual(expected_turns, state.value.turns_completed);
+    try std.testing.expectEqual(expected_tokens, state.value.tokens_used);
+}
+
+const FakeStep = enum { worker_progress, worker_complete, verifier_reject, verifier_no_verdict, worker_repaired, verifier_pass, worker_blocked, worker_budget_wrapup };
+
+const FakeClock = struct {
+    now_ms: u64,
+
+    fn reader(self: *FakeClock) Clock {
+        return .{ .context = @ptrCast(self), .nowMillisecondsFn = FakeClock.now };
+    }
+
+    fn now(context: *anyopaque) u64 {
+        const self: *FakeClock = @ptrCast(@alignCast(context));
+        return self.now_ms;
+    }
+};
 
 const FakeCall = struct {
     backend: backend.BackendKind,
@@ -484,6 +759,9 @@ const FakeRunner = struct {
     script: []const FakeStep,
     calls: std.ArrayList(FakeCall) = .empty,
     next_step: usize = 0,
+    tokens_per_turn: u64 = 10,
+    clock: ?*FakeClock = null,
+    advance_clock_ms: u64 = 0,
 
     fn runner(self: *FakeRunner) backend.BackendRunner {
         return .{ .context = @ptrCast(self), .runTurnFn = FakeRunner.runTurn };
@@ -545,14 +823,16 @@ const FakeRunner = struct {
                 state.last_blocker_summary = "Need another path.";
                 state.status = if (state.blocked_strikes >= 3) .blocked else .active;
             },
+            .worker_budget_wrapup => {},
         }
         try self.store.saveState(state);
+        if (self.clock) |clock| clock.now_ms +|= self.advance_clock_ms;
         if (request.event_handler) |handler| handler(request.event_context, .{ .assistant_text = "fake progress" });
         return .{
             .allocator = self.store.allocator,
             .exit_code = 0,
             .session_id = if (is_verifier) try self.store.allocator.dupe(u8, "verifier-session") else try self.store.allocator.dupe(u8, "worker-session"),
-            .tokens_used = 10,
+            .tokens_used = self.tokens_per_turn,
             .last_assistant_text = try self.store.allocator.dupe(u8, "fake progress"),
             .stderr_tail = try self.store.allocator.dupe(u8, ""),
             .was_interrupted = false,
