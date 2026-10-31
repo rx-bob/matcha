@@ -300,7 +300,7 @@ const StreamCallbackState = struct {
                     };
                     return;
                 },
-                .ignored => return,
+                .ignored, .thinking => return,
             };
             pair.recordContext(self.request.io, self.request.loop_id, self.request.log_context, kind, payload) catch |err| {
                 self.failed(err);

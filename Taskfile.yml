@@ -75,7 +75,8 @@ tasks:
     cmds:
       - mkdir -p dist
       - zig build release
-      - cp -f zig-out/bin/matcha-release {{.OUT}}
+      - rm -f {{.OUT}}
+      - cp zig-out/bin/matcha-release {{.OUT}}
 
   install:
     desc: Install the compiled CLI to ~/.local/bin
@@ -83,6 +84,7 @@ tasks:
       - build
     cmds:
       - mkdir -p ~/.local/bin
+      - rm -f ~/.local/bin/{{.APP}}
       - cp {{.OUT}} ~/.local/bin/{{.APP}}
 
   clean:

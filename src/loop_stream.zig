@@ -24,11 +24,80 @@ pub const TokenUsage = struct {
 
 pub const NormalizedEvent = union(enum) {
     session_id: []const u8,
+    thinking: void,
     tool_call: ToolSummary,
     assistant_text: []const u8,
     token_usage: TokenUsage,
     error_message: []const u8,
     ignored: void,
+};
+
+pub const ActivityState = enum {
+    idle,
+    starting,
+    thinking,
+    verifying,
+    running_command,
+    reading_files,
+    editing_files,
+    searching,
+    running_tool,
+    responding,
+    completed,
+    failed,
+
+    pub fn label(self: ActivityState) []const u8 {
+        return switch (self) {
+            .idle => "Idle",
+            .starting => "Starting loop...",
+            .thinking => "Thinking...",
+            .verifying => "Verifying...",
+            .running_command => "Running command...",
+            .reading_files => "Reading files...",
+            .editing_files => "Editing files...",
+            .searching => "Searching...",
+            .running_tool => "Running tool...",
+            .responding => "Responding...",
+            .completed => "Turn completed",
+            .failed => "Error encountered",
+        };
+    }
+
+    pub fn isAnimated(self: ActivityState) bool {
+        return switch (self) {
+            .starting,
+            .thinking,
+            .verifying,
+            .running_command,
+            .reading_files,
+            .editing_files,
+            .searching,
+            .running_tool,
+            .responding,
+            => true,
+            .idle, .completed, .failed => false,
+        };
+    }
+
+    pub fn glyph(self: ActivityState, frame: usize) []const u8 {
+        const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+        if (self.isAnimated()) return frames[frame % frames.len];
+        return switch (self) {
+            .completed => "✓",
+            .failed => "✗",
+            .idle => "·",
+            else => "●",
+        };
+    }
+
+    pub fn escape(self: ActivityState) []const u8 {
+        return switch (self) {
+            .completed => "\x1b[38;2;144;238;144m",
+            .failed => "\x1b[38;2;243;139;168m",
+            .idle => "\x1b[38;2;130;148;135m",
+            else => "\x1b[38;2;144;238;144m",
+        };
+    }
 };
 
 pub const TurnAccumulator = struct {
@@ -51,18 +120,24 @@ pub const StreamError = std.Io.Reader.StreamError || std.mem.Allocator.Error;
 
 const TextStyle = enum {
     state,
+    meta,
+    separator,
     green,
     assistant,
     command_latest,
     command_old,
+    err,
 
     fn escape(self: TextStyle) []const u8 {
         return switch (self) {
-            .state => "\x1b[38;2;255;165;0m",
+            .state => "\x1b[38;2;163;217;165m",
+            .meta => "\x1b[38;2;130;148;135m",
+            .separator => "\x1b[38;2;68;92;74m",
             .green => "\x1b[38;2;144;238;144m",
-            .command_latest => "\x1b[38;2;255;255;255m",
-            .command_old => "\x1b[38;2;192;192;192m",
-            .assistant => "\x1b[48;2;0;64;32m",
+            .command_latest => "\x1b[38;2;232;240;234m",
+            .command_old => "\x1b[38;2;138;154;142m",
+            .assistant => "\x1b[38;2;242;247;243m",
+            .err => "\x1b[38;2;243;139;168m",
         };
     }
 };
@@ -101,6 +176,9 @@ pub const Presenter = struct {
     command_count: usize = 0,
     command_ids: std.ArrayList([]const u8) = .empty,
     plain_commands: std.ArrayList([]const u8) = .empty,
+    activity: ActivityState = .idle,
+    activity_detail: ?[]const u8 = null,
+    spinner_frame: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -121,6 +199,8 @@ pub const Presenter = struct {
         if (self.io) |io| self.output_mutex.unlock(io);
         if (self.last_error_message) |message| self.allocator.free(message);
         self.last_error_message = null;
+        if (self.activity_detail) |detail| self.allocator.free(detail);
+        self.activity_detail = null;
         if (self.history) |*history| history.deinit();
         self.style_spans.deinit(self.allocator);
         for (self.command_ids.items) |id| self.allocator.free(id);
@@ -149,9 +229,17 @@ pub const Presenter = struct {
         self.role = role;
     }
 
+    fn setActivity(self: *Presenter, next: ActivityState, detail: ?[]const u8) !void {
+        const owned = if (detail) |text| if (text.len > 0) try self.allocator.dupe(u8, text) else null else null;
+        if (self.activity_detail) |previous| self.allocator.free(previous);
+        self.activity_detail = owned;
+        self.activity = next;
+    }
+
     pub fn loopStarted(self: *Presenter) !void {
         try self.lockOutput();
         defer self.unlockOutput();
+        try self.setActivity(.starting, null);
         switch (self.mode) {
             .live => {
                 try self.beginTerminalUi();
@@ -172,6 +260,7 @@ pub const Presenter = struct {
         if (turn_number > 1 and self.mode != .json) try self.writeTurnSeparator();
         self.turn_number = turn_number;
         self.role = role;
+        try self.setActivity(if (role == .verifier) .verifying else .thinking, null);
         try self.updateStatusBar();
         switch (self.mode) {
             .live => {
@@ -198,20 +287,13 @@ pub const Presenter = struct {
         const width = terminalColumns();
         const start = if (self.terminal_ui) self.history.?.written().len else 0;
         const direct_color = !self.terminal_ui and c.isatty(c.STDOUT_FILENO) == 1;
-        if (direct_color) try self.writer.writeAll("\x1b[38;2;144;238;144m");
-        var hashes: [128]u8 = undefined;
-        @memset(&hashes, '#');
-        for (0..2) |_| {
-            var remaining = width;
-            while (remaining > 0) {
-                const count = @min(remaining, hashes.len);
-                try self.bodyWriter().writeAll(hashes[0..count]);
-                remaining -= count;
-            }
-            try self.bodyWriter().writeByte('\n');
+        if (direct_color) try self.writer.writeAll(TextStyle.separator.escape());
+        for (0..width) |_| {
+            try self.bodyWriter().writeAll("─");
         }
+        try self.bodyWriter().writeByte('\n');
         if (self.terminal_ui) {
-            try self.style_spans.append(self.allocator, .{ .start = start, .end = self.history.?.written().len, .style = .green });
+            try self.style_spans.append(self.allocator, .{ .start = start, .end = self.history.?.written().len, .style = .separator });
         }
         if (direct_color) try self.writer.writeAll("\x1b[0m");
         try self.flush();
@@ -220,52 +302,76 @@ pub const Presenter = struct {
     pub fn handleEvent(self: *Presenter, event: NormalizedEvent) !void {
         try self.lockOutput();
         defer self.unlockOutput();
-        try self.updateStatusBar();
         switch (event) {
-            .session_id => |session_id| switch (self.mode) {
-                .live => {
-                    try self.printState("  session: {s}\n", .{session_id});
-                    try self.flush();
-                },
-                .quiet => {},
-                .json => try self.writeJson(.{ .type = "turn.session", .loop_id = self.loop_id, .turn = self.turn_number, .session_id = session_id }),
+            .session_id => |session_id| {
+                try self.updateStatusBar();
+                switch (self.mode) {
+                    .live => {
+                        try self.printStyled(.meta, "  session: {s}\n", .{session_id});
+                        try self.flush();
+                    },
+                    .quiet => {},
+                    .json => try self.writeJson(.{ .type = "turn.session", .loop_id = self.loop_id, .turn = self.turn_number, .session_id = session_id }),
+                }
             },
-            .tool_call => |tool| switch (self.mode) {
-                .live => {
-                    if (isCommand(tool.name)) try self.recordCommand(tool);
-                },
-                .quiet => {},
-                .json => try self.writeJson(.{ .type = "turn.tool", .loop_id = self.loop_id, .turn = self.turn_number, .tool = tool.name, .detail = tool.detail }),
+            .thinking => {
+                try self.setActivity(if (self.role == .verifier) .verifying else .thinking, null);
+                try self.updateStatusBar();
             },
-            .assistant_text => |text| switch (self.mode) {
-                .live => {
-                    try self.finishCommandGroup();
-                    try self.printState("  assistant: ", .{});
-                    try self.printStyled(.green, "\"", .{});
-                    try self.printStyled(.assistant, "{s}", .{std.mem.trimEnd(u8, text, "\r\n")});
-                    try self.printStyled(.green, "\"", .{});
-                    try self.bodyWriter().writeByte('\n');
-                    try self.flush();
-                },
-                .quiet => {},
-                .json => try self.writeJson(.{ .type = "turn.assistant", .loop_id = self.loop_id, .turn = self.turn_number, .text = text }),
+            .tool_call => |tool| {
+                const shown_detail = if (isCommand(tool.name)) stripShellWrapper(tool.detail) else tool.detail;
+                try self.setActivity(classifyToolActivity(tool.name), if (shown_detail.len > 0) shown_detail else tool.name);
+                try self.updateStatusBar();
+                switch (self.mode) {
+                    .live => {
+                        if (isCommand(tool.name)) try self.recordCommand(tool);
+                    },
+                    .quiet => {},
+                    .json => try self.writeJson(.{ .type = "turn.tool", .loop_id = self.loop_id, .turn = self.turn_number, .tool = tool.name, .detail = tool.detail }),
+                }
             },
-            .token_usage => {},
+            .assistant_text => |text| {
+                try self.setActivity(.responding, null);
+                try self.updateStatusBar();
+                switch (self.mode) {
+                    .live => {
+                        try self.finishCommandGroup();
+                        try self.printStyled(.meta, "  assistant: ", .{});
+                        try self.printStyled(.green, "\"", .{});
+                        try self.printStyled(.assistant, "{s}", .{std.mem.trimEnd(u8, text, "\r\n")});
+                        try self.printStyled(.green, "\"", .{});
+                        try self.bodyWriter().writeByte('\n');
+                        try self.flush();
+                    },
+                    .quiet => {},
+                    .json => try self.writeJson(.{ .type = "turn.assistant", .loop_id = self.loop_id, .turn = self.turn_number, .text = text }),
+                }
+            },
+            .token_usage => {
+                try self.updateStatusBar();
+            },
             .error_message => |message| {
                 const copy = try self.allocator.dupe(u8, message);
                 if (self.last_error_message) |old| self.allocator.free(old);
                 self.last_error_message = copy;
+                try self.setActivity(.failed, message);
+                try self.updateStatusBar();
                 switch (self.mode) {
                     .live => {
-                        try self.bodyWriter().writeAll("  error: ");
-                        try writeOneLine(self.bodyWriter(), message, 240);
-                        try self.bodyWriter().writeByte('\n');
+                        var err_line: std.Io.Writer.Allocating = .init(self.allocator);
+                        defer err_line.deinit();
+                        try err_line.writer.writeAll("  error: ");
+                        try writeOneLine(&err_line.writer, message, 240);
+                        try err_line.writer.writeByte('\n');
+                        try self.printStyled(.err, "{s}", .{err_line.written()});
                         try self.flush();
                     },
                     .quiet, .json => {},
                 }
             },
-            .ignored => {},
+            .ignored => {
+                try self.updateStatusBar();
+            },
         }
     }
 
@@ -288,6 +394,7 @@ pub const Presenter = struct {
         try self.lockOutput();
         defer self.unlockOutput();
         try self.finishCommandGroup();
+        try self.setActivity(.completed, @tagName(status));
         try self.updateStatusBar();
         switch (self.mode) {
             .live => {
@@ -319,7 +426,7 @@ pub const Presenter = struct {
         try self.updateStatusBar();
         switch (self.mode) {
             .live => {
-                try self.printState("  status: {s} -> {s}\n", .{ @tagName(previous), @tagName(next) });
+                try self.printStyled(.meta, "  status: {s} -> {s}\n", .{ @tagName(previous), @tagName(next) });
                 try self.flush();
             },
             .quiet => {
@@ -336,6 +443,7 @@ pub const Presenter = struct {
         try self.lockOutput();
         defer self.unlockOutput();
         try self.finishCommandGroup();
+        try self.setActivity(.idle, null);
         try self.endTerminalUi();
         switch (self.mode) {
             .live => {
@@ -382,7 +490,8 @@ pub const Presenter = struct {
         var text = std.Io.Writer.Allocating.init(self.allocator);
         defer text.deinit();
         try text.writer.writeAll("Ran ");
-        try writeOneLine(&text.writer, if (tool.detail.len > 0) tool.detail else tool.name, 512);
+        const command = stripShellWrapper(tool.detail);
+        try writeOneLine(&text.writer, if (command.len > 0) command else tool.name, 512);
         try text.writer.writeByte('\n');
         if (self.terminal_ui) {
             if (self.command_count == 3) {
@@ -464,10 +573,14 @@ pub const Presenter = struct {
         try self.writer.flush();
     }
 
+    fn historyHeight(self: *const Presenter) usize {
+        return @max(self.terminal_rows -| 2, 1);
+    }
+
     fn drawHistory(self: *Presenter) !void {
         var rows = try self.visibleHistoryRows();
         defer rows.deinit(self.allocator);
-        const height = self.terminal_rows - 1;
+        const height = self.historyHeight();
         const last_top = rows.items.len -| height;
         const top = @min(self.view_top orelse last_top, last_top);
         for (0..height) |row| {
@@ -490,8 +603,19 @@ pub const Presenter = struct {
                         break;
                     }
                     if (color) |sequence| try self.writer.writeAll(sequence);
-                    for (text[position .. end - offset]) |byte| {
-                        try self.writer.writeByte(if (byte < 32 or byte == 127) ' ' else byte);
+                    const slice = text[position .. end - offset];
+                    var byte_index: usize = 0;
+                    while (byte_index < slice.len) {
+                        const byte = slice[byte_index];
+                        if (byte < 32 or byte == 127) {
+                            try self.writer.writeByte(' ');
+                            byte_index += 1;
+                        } else {
+                            const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+                            const count = @min(seq_len, slice.len - byte_index);
+                            try self.writer.writeAll(slice[byte_index .. byte_index + count]);
+                            byte_index += count;
+                        }
                     }
                     if (color != null) try self.writer.writeAll("\x1b[0m");
                     position = end - offset;
@@ -503,7 +627,7 @@ pub const Presenter = struct {
     fn navigate(self: *Presenter, action: Navigation) !void {
         var rows = try self.visibleHistoryRows();
         defer rows.deinit(self.allocator);
-        const height = self.terminal_rows - 1;
+        const height = self.historyHeight();
         const bottom = rows.items.len -| height;
         const top = self.view_top orelse bottom;
         self.view_top = switch (action) {
@@ -526,7 +650,7 @@ pub const Presenter = struct {
         self.terminal_rows = window.ws_row;
         self.history = std.Io.Writer.Allocating.init(self.allocator);
         self.terminal_ui = true;
-        try self.writer.print("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H\x1b[1;{d}r\x1b[1;1H", .{self.terminal_rows - 1});
+        try self.writer.print("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H\x1b[1;{d}r\x1b[1;1H", .{self.historyHeight()});
         try self.updateStatusBar();
         try self.beginInputReader();
         self.stop_status_ticker.store(false, .release);
@@ -556,6 +680,35 @@ pub const Presenter = struct {
             elapsed_text,
             if (self.view_top == null) "LIVE" else "SCROLLED (End: live)",
         });
+        try self.writer.writeAll("\x1b[?2026h\x1b[s");
+        if (self.terminal_rows >= 3) {
+            const prefix = self.activity.glyph(self.spinner_frame);
+            const label = self.activity.label();
+            try self.writer.print("\x1b[{d};1H\x1b[2K{s} {s} {s}\x1b[0m", .{
+                self.terminal_rows - 1,
+                self.activity.escape(),
+                prefix,
+                label,
+            });
+            var used_columns: usize = 3 + utf8Columns(label);
+            if (self.activity_detail) |detail| {
+                if (detail.len > 0 and used_columns + 3 < columns) {
+                    var detail_writer: std.Io.Writer.Allocating = .init(self.allocator);
+                    defer detail_writer.deinit();
+                    try detail_writer.writer.writeAll(" — ");
+                    try writeOneLine(&detail_writer.writer, detail, 160);
+                    const detail_line = detail_writer.written();
+                    var detail_bytes: usize = 0;
+                    while (detail_bytes < detail_line.len and used_columns < columns) : (used_columns += 1) {
+                        const char_bytes = std.unicode.utf8ByteSequenceLength(detail_line[detail_bytes]) catch 1;
+                        detail_bytes += @min(char_bytes, detail_line.len - detail_bytes);
+                    }
+                    try self.writer.writeAll("\x1b[38;2;130;148;135m");
+                    try self.writer.writeAll(detail_line[0..detail_bytes]);
+                    try self.writer.writeAll("\x1b[0m");
+                }
+            }
+        }
         // Status symbols such as » and ∞ occupy one column despite their UTF-8 length.
         var shown_bytes: usize = 0;
         var shown_columns: usize = 0;
@@ -564,7 +717,7 @@ pub const Presenter = struct {
             shown_bytes += @min(char_bytes, line.len - shown_bytes);
         }
         const shown = line[0..shown_bytes];
-        try self.writer.print("\x1b[?2026h\x1b[s\x1b[{d};1H\x1b[0;38;2;0;0;0;48;2;144;238;144m", .{self.terminal_rows});
+        try self.writer.print("\x1b[{d};1H\x1b[0;38;2;0;0;0;48;2;144;238;144m", .{self.terminal_rows});
         try self.writer.writeAll(shown);
         for (shown_columns..columns) |_| try self.writer.writeByte(' ');
         try self.writer.writeAll("\x1b[0m\x1b[u\x1b[?2026l");
@@ -625,10 +778,13 @@ pub const Presenter = struct {
 fn statusTicker(presenter: *Presenter) void {
     const io = presenter.io orelse return;
     while (!presenter.stop_status_ticker.load(.acquire)) {
-        io.sleep(.{ .nanoseconds = std.time.ns_per_s }, .awake) catch return;
+        io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch return;
         if (presenter.stop_status_ticker.load(.acquire)) return;
         presenter.output_mutex.lockUncancelable(io);
-        if (!presenter.stop_status_ticker.load(.acquire)) presenter.updateStatusBar() catch {};
+        if (!presenter.stop_status_ticker.load(.acquire)) {
+            presenter.spinner_frame +%= 1;
+            presenter.updateStatusBar() catch {};
+        }
         presenter.output_mutex.unlock(io);
     }
 }
@@ -711,6 +867,45 @@ fn isCommand(name: []const u8) bool {
     return false;
 }
 
+/// Strips a shell launcher such as `/bin/zsh -lc "cmd"` so only `cmd` is displayed.
+fn stripShellWrapper(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const space = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return trimmed;
+    const program = std.fs.path.basename(trimmed[0..space]);
+    const shells = [_][]const u8{ "sh", "bash", "zsh", "dash", "fish", "ksh" };
+    var is_shell = false;
+    for (shells) |shell| {
+        if (std.mem.eql(u8, program, shell)) is_shell = true;
+    }
+    if (!is_shell) return trimmed;
+    var rest = std.mem.trimStart(u8, trimmed[space..], " ");
+    var saw_command_flag = false;
+    while (rest.len > 0 and rest[0] == '-') {
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse return trimmed;
+        if (std.mem.indexOfScalar(u8, rest[1..end], 'c') != null) saw_command_flag = true;
+        rest = std.mem.trimStart(u8, rest[end..], " ");
+    }
+    if (!saw_command_flag or rest.len == 0) return trimmed;
+    if (rest.len >= 2 and (rest[0] == '"' or rest[0] == '\'') and rest[rest.len - 1] == rest[0]) {
+        return rest[1 .. rest.len - 1];
+    }
+    return rest;
+}
+
+pub fn classifyToolActivity(name: []const u8) ActivityState {
+    if (isCommand(name)) return .running_command;
+    for ([_][]const u8{ "read", "read_file", "view_file", "cat", "open_file", "list_dir", "ls" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return .reading_files;
+    }
+    for ([_][]const u8{ "edit", "edit_file", "write", "write_file", "apply_patch", "patch", "file_change", "create_file", "replace_file_content", "multi_replace_file_content" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return .editing_files;
+    }
+    for ([_][]const u8{ "grep", " grep_search", "rg", "search", "find", "find_by_name", "glob", "web_search", "search_web" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, std.mem.trim(u8, candidate, " "))) return .searching;
+    }
+    return .running_tool;
+}
+
 fn terminalColumns() usize {
     if (c.isatty(c.STDOUT_FILENO) != 1) return 80;
     var window: c.struct_winsize = undefined;
@@ -731,6 +926,16 @@ fn truncateUtf8(text: []const u8, limit: usize) []const u8 {
     var end = limit;
     while (end > 0 and end < text.len and (text[end] & 0xc0) == 0x80) : (end -= 1) {}
     return text[0..end];
+}
+
+fn utf8Columns(text: []const u8) usize {
+    var index: usize = 0;
+    var count: usize = 0;
+    while (index < text.len) : (count += 1) {
+        const char_bytes = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+        index += @min(char_bytes, text.len - index);
+    }
+    return count;
 }
 
 /// Consumes JSONL one line at a time. Callback string slices are valid only until
@@ -910,7 +1115,10 @@ fn processCodex(
     if (std.mem.startsWith(u8, kind, "item.")) {
         const item = field(root, "item") orelse return;
         const item_type = stringField(item, "type") orelse "";
-        if (std.mem.eql(u8, item_type, "agent_message")) {
+        if (std.mem.eql(u8, item_type, "reasoning")) {
+            handler(context, .thinking);
+            emitted.* = true;
+        } else if (std.mem.eql(u8, item_type, "agent_message")) {
             if (std.mem.eql(u8, kind, "item.completed")) {
                 if (stringField(item, "text")) |text| try emitAssistant(allocator, accumulator, text, false, context, handler, emitted);
             }
@@ -921,7 +1129,7 @@ fn processCodex(
             emitted.* = true;
         } else if (isCodexTool(item_type)) {
             const name = stringField(item, "tool_name") orelse item_type;
-            const detail = stringField(item, "command") orelse stringField(item, "title") orelse "";
+            const detail = stringField(item, "command") orelse stringField(item, "title") orelse stringField(item, "path") orelse stringField(item, "query") orelse "";
             handler(context, .{ .tool_call = .{ .name = name, .detail = detail, .id = stringField(item, "id") } });
             emitted.* = true;
         }
@@ -950,6 +1158,11 @@ fn processDroid(
 ) std.mem.Allocator.Error!void {
     const kind = stringField(root, "type") orelse return;
     if (std.mem.eql(u8, kind, "system")) return;
+    if (std.mem.eql(u8, kind, "thinking") or std.mem.eql(u8, kind, "reasoning")) {
+        handler(context, .thinking);
+        emitted.* = true;
+        return;
+    }
 
     if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_use") or std.mem.eql(u8, kind, "tool_result")) {
         emitToolFromObject(root, context, handler, emitted);
@@ -994,10 +1207,15 @@ fn processAgy(
     if (std.mem.eql(u8, kind, "step_update")) {
         const step = field(root, "step_update") orelse root;
         const step_type = stringField(step, "step_type") orelse "";
+        if (std.mem.eql(u8, step_type, "thinking") or std.mem.eql(u8, step_type, "reasoning")) {
+            handler(context, .thinking);
+            emitted.* = true;
+            return;
+        }
         if (std.mem.eql(u8, step_type, "tool") or field(step, "tool_info") != null) {
             const info = field(step, "tool_info") orelse step;
             const name = stringField(info, "name") orelse stringField(info, "tool_name") orelse "tool";
-            const detail = stringField(info, "description") orelse stringField(info, "command") orelse "";
+            const detail = stringField(info, "description") orelse stringField(info, "command") orelse stringField(info, "path") orelse stringField(info, "file_path") orelse "";
             handler(context, .{ .tool_call = .{ .name = name, .detail = detail } });
             emitted.* = true;
         }
@@ -1065,7 +1283,7 @@ fn emitUsage(value: std.json.Value, accumulator: *TurnAccumulator, context: ?*an
 fn emitToolFromObject(value: std.json.Value, context: ?*anyopaque, handler: EventHandler, emitted: *bool) void {
     const name = stringField(value, "tool_name") orelse stringField(value, "toolName") orelse stringField(value, "name") orelse stringField(value, "tool") orelse "tool";
     const input = field(value, "input") orelse field(value, "arguments") orelse .null;
-    const detail = stringField(value, "command") orelse stringField(input, "command") orelse stringField(value, "description") orelse "";
+    const detail = stringField(value, "command") orelse stringField(input, "command") orelse stringField(value, "description") orelse stringField(input, "file_path") orelse stringField(input, "path") orelse stringField(input, "query") orelse stringField(input, "pattern") orelse "";
     handler(context, .{ .tool_call = .{ .name = name, .detail = detail, .id = stringField(value, "tool_use_id") orelse stringField(value, "id") } });
     emitted.* = true;
 }
@@ -1324,6 +1542,7 @@ const Capture = struct {
         var captured: CapturedEvent = .{ .kind = std.meta.activeTag(event) };
         switch (event) {
             .session_id => |id| captured.text = self.allocator.dupe(u8, id) catch unreachable,
+            .thinking => {},
             .tool_call => |tool| {
                 captured.name = self.allocator.dupe(u8, tool.name) catch unreachable;
                 captured.text = self.allocator.dupe(u8, tool.detail) catch unreachable;
@@ -1344,6 +1563,15 @@ const Capture = struct {
         return result;
     }
 };
+
+test "shell launcher wrappers are stripped from displayed commands" {
+    try std.testing.expectEqualStrings("zig build test", stripShellWrapper("/bin/zsh -lc \"zig build test\""));
+    try std.testing.expectEqualStrings("ls -la", stripShellWrapper("bash -c 'ls -la'"));
+    try std.testing.expectEqualStrings("echo hi", stripShellWrapper("/bin/sh -c echo hi"));
+    try std.testing.expectEqualStrings("rg foo src", stripShellWrapper("/bin/bash --noprofile -lc \"rg foo src\""));
+    try std.testing.expectEqualStrings("zig build", stripShellWrapper("zig build"));
+    try std.testing.expectEqualStrings("/bin/zsh script.sh", stripShellWrapper("/bin/zsh script.sh"));
+}
 
 test "scroll navigation accepts arrows pages and SGR wheel reports" {
     try std.testing.expectEqual(Navigation.up, navigation("[A").?);
@@ -1374,7 +1602,7 @@ test "scroll viewport stays on older logs as new output arrives and End resumes 
     defer presenter.deinit();
     presenter.history = std.Io.Writer.Allocating.init(std.testing.allocator);
     presenter.terminal_ui = true;
-    presenter.terminal_rows = 4;
+    presenter.terminal_rows = 5;
     try presenter.bodyWriter().writeAll("one\ntwo\nthree\nfour\nfive\nsix\n");
     try presenter.navigate(.up);
     try std.testing.expectEqual(@as(?usize, 0), presenter.view_top);
@@ -1388,6 +1616,61 @@ test "scroll viewport stays on older logs as new output arrives and End resumes 
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "eight") != null);
 }
 
+test "pinned activity bar updates on turn lifecycle and tool events" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var presenter = Presenter.init(std.testing.allocator, &output.writer, .live, "activity", .codex);
+    defer presenter.deinit();
+    presenter.history = std.Io.Writer.Allocating.init(std.testing.allocator);
+    presenter.terminal_ui = true;
+    presenter.terminal_rows = 6;
+
+    try presenter.turnStarted(1, .worker, 0);
+    try std.testing.expectEqual(ActivityState.thinking, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[5;1H\x1b[2K\x1b[38;2;144;238;144m ⠋ Thinking...\x1b[0m") != null);
+
+    output.clearRetainingCapacity();
+    presenter.spinner_frame = 1;
+    try presenter.handleEvent(.{ .tool_call = .{ .name = "command_execution", .detail = "zig build test" } });
+    try std.testing.expectEqual(ActivityState.running_command, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "⠙ Running command...\x1b[0m\x1b[38;2;130;148;135m — zig build test\x1b[0m") != null);
+
+    output.clearRetainingCapacity();
+    try presenter.handleEvent(.{ .tool_call = .{ .name = "read_file", .detail = "src/loop_stream.zig" } });
+    try std.testing.expectEqual(ActivityState.reading_files, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "⠙ Reading files...\x1b[0m\x1b[38;2;130;148;135m — src/loop_stream.zig\x1b[0m") != null);
+
+    output.clearRetainingCapacity();
+    try presenter.handleEvent(.{ .tool_call = .{ .name = "edit_file", .detail = "src/loop_stream.zig" } });
+    try std.testing.expectEqual(ActivityState.editing_files, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "⠙ Editing files...\x1b[0m\x1b[38;2;130;148;135m — src/loop_stream.zig\x1b[0m") != null);
+
+    output.clearRetainingCapacity();
+    try presenter.handleEvent(.{ .tool_call = .{ .name = "web_search", .detail = "zig io writer" } });
+    try std.testing.expectEqual(ActivityState.searching, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "⠙ Searching...\x1b[0m\x1b[38;2;130;148;135m — zig io writer\x1b[0m") != null);
+
+    output.clearRetainingCapacity();
+    try presenter.handleEvent(.thinking);
+    try std.testing.expectEqual(ActivityState.thinking, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "⠙ Thinking...") != null);
+
+    output.clearRetainingCapacity();
+    try presenter.handleEvent(.{ .assistant_text = "All tests pass\n" });
+    try std.testing.expectEqual(ActivityState.responding, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "⠙ Responding...") != null);
+
+    output.clearRetainingCapacity();
+    try presenter.turnStarted(2, .verifier, 10);
+    try std.testing.expectEqual(ActivityState.verifying, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "⠙ Verifying...") != null);
+
+    output.clearRetainingCapacity();
+    try presenter.turnCompleted(.complete, 20, 50);
+    try std.testing.expectEqual(ActivityState.completed, presenter.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;144;238;144m ✓ Turn completed\x1b[0m\x1b[38;2;130;148;135m — complete\x1b[0m") != null);
+}
+
 test "assistant label and quotes have independent colors from message text" {
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
@@ -1398,7 +1681,7 @@ test "assistant label and quotes have independent colors from message text" {
     presenter.terminal_rows = 4;
     try presenter.handleEvent(.{ .assistant_text = "hello\n" });
     try std.testing.expectEqualStrings("  assistant: \"hello\"\n", presenter.history.?.written());
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;255;165;0m  assistant: \x1b[0m\x1b[38;2;144;238;144m\"\x1b[0m\x1b[48;2;0;64;32mhello\x1b[0m\x1b[38;2;144;238;144m\"\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;130;148;135m  assistant: \x1b[0m\x1b[38;2;144;238;144m\"\x1b[0m\x1b[38;2;242;247;243mhello\x1b[0m\x1b[38;2;144;238;144m\"\x1b[0m") != null);
 }
 
 test "command groups retain only three executions and preserve older groups" {
