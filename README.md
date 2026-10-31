@@ -113,7 +113,7 @@ retain the flat JSON format at `$XDG_CONFIG_HOME/matcha/loop.json` (otherwise
 file and preserves other supported settings.
 
 Supported loop fields are `backend`, `backend_bin`, `model`, `max_turns`, `prompt_file`,
-`verifier` (object; legacy backend names remain accepted), `verify_enabled`, `yolo`, `token_budget`,
+`verifier` (object; legacy backend names remain accepted), `verify_enabled`, `yolo`, `sandbox`, `token_budget`,
 `timeout_seconds`, `output_mode` (`live`, `quiet`, `json`), and
 `extra_backend_args`. Unknown fields, invalid types, unsupported versions, and
 nonpositive configured limits fail before execution. Omitted fields inherit;
@@ -196,3 +196,41 @@ sessions remain fresh. Live and JSON turn status identify the executing backend
 and model. New snapshots retain override presence and isolated arguments; older
 snapshots keep their historical shared model and arguments across resume and
 callback updates.
+
+
+### Loop sandbox policy
+
+`--sandbox workspace-write` and `--sandbox danger-full-access` select Codex
+filesystem isolation independently of approval bypass. `danger-full-access`
+does not add `--yolo` or change approval flags. Droid and Agy have no verified
+equivalent independent controls and reject those policies. Read-only is rejected
+for all supervised loops because worker/verifier callbacks must write loop state;
+Matcha does not silently add writable exceptions.
+
+`--sandbox backend-default` resets to native policy without injecting sandbox,
+autonomy, or approval options. Native settings must still permit callbacks. With
+no structured policy, existing adapter defaults and `--yolo` behavior are retained.
+See [versioned capability evidence](LOOP_SANDBOX_CAPABILITIES.md) for inspected
+local versions, argument placement, and the per-backend table.
+
+Project/user JSON supports `"sandbox": "workspace-write"` (or another named
+policy). `sandbox: null` is an explicit backend-default reset. A layer cannot
+contain both `sandbox` and `yolo` keys. Higher-layer sandbox clears inherited
+yolo; higher-layer `yolo: true` clears inherited sandbox. `yolo: false` alone
+clears inherited bypass without changing an inherited sandbox selection.
+
+Policies apply to worker and enabled verifier. Unsupported combinations and
+known conflicting native permission flags fail before either executable is
+probed or launched. Native passthrough remains supported without structured
+policy; Matcha does not implement a general vendor argument parser.
+
+```sh
+matcha loop "fix the build" --sandbox workspace-write
+matcha loop resume --last --sandbox workspace-write
+matcha loop resume --last --sandbox backend-default
+```
+
+Resume validates the candidate policy before atomically replacing saved settings;
+a failed downgrade leaves prior state intact. Old snapshots retain historical
+policy and passthrough behavior until an explicit resume policy is selected.
+Help and `loop show` distinguish sandbox choice from the explicit yolo bypass.

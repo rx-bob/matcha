@@ -21,6 +21,8 @@ pub const LoopState = struct {
     model: ?[]const u8 = null,
     output_mode: options.OutputMode = .live,
     yolo: bool = false,
+    sandbox: ?options.SandboxPolicy = null,
+    policy_validation_enabled: bool = false,
     cwd: []const u8,
     objective: []const u8,
     worker_session_id: ?[]const u8 = null,
@@ -271,7 +273,8 @@ test "store creates and round-trips every state field with atomic overwrite" {
         .backend_bin = "/tools/my backend",
         .model = "model \"quoted\"",
         .output_mode = .quiet,
-        .yolo = true,
+        .sandbox = .@"workspace-write",
+        .policy_validation_enabled = true,
         .cwd = "/work/tree",
         .objective = "line one\nline \"two\" \\ end",
         .worker_session_id = "sess-1",
@@ -308,6 +311,8 @@ test "store creates and round-trips every state field with atomic overwrite" {
     try std.testing.expectEqual(state.verify_enabled, loaded.value.verify_enabled);
     try std.testing.expectEqualStrings(state.model.?, loaded.value.model.?);
     try std.testing.expectEqual(state.yolo, loaded.value.yolo);
+    try std.testing.expectEqual(state.sandbox, loaded.value.sandbox);
+    try std.testing.expectEqual(state.policy_validation_enabled, loaded.value.policy_validation_enabled);
     try std.testing.expectEqualStrings(state.cwd, loaded.value.cwd);
     try std.testing.expectEqualStrings(state.objective, loaded.value.objective);
     try std.testing.expectEqualStrings(state.worker_session_id.?, loaded.value.worker_session_id.?);
@@ -352,6 +357,8 @@ test "store reads legacy version one snapshots with historical shared execution 
     var legacy = try store.loadState("legacy-0001");
     defer legacy.deinit();
     try std.testing.expectEqual(@as(u32, 1), legacy.value.schema_version);
+    try std.testing.expect(legacy.value.sandbox == null);
+    try std.testing.expect(!legacy.value.policy_validation_enabled);
     try std.testing.expectEqual(options.BackendKind.agy, legacy.value.verifier_backend.?);
     try std.testing.expectEqualStrings("shared-model", legacy.value.model.?);
     try std.testing.expectEqualStrings("shared-arg", legacy.value.extra_args[0]);

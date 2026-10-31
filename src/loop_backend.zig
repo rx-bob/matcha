@@ -362,11 +362,68 @@ pub const ChildEnvironment = struct {
 
 pub const BackendOptions = struct {
     backend: BackendKind,
+    sandbox: ?options.SandboxPolicy = null,
+    legacy_policy_passthrough: bool = false,
     backend_bin: ?[]const u8 = null,
     model: ?[]const u8 = null,
     yolo: bool = false,
     extra_args: []const []const u8 = &.{},
 };
+
+/// Capability evidence and the callback restriction are recorded in
+/// LOOP_SANDBOX_CAPABILITIES.md. No vendor discovery runs during execution.
+pub fn validatePolicy(config: BackendOptions, diagnostic: ?*std.Io.Writer) !void {
+    if (config.yolo and config.sandbox != null) {
+        if (diagnostic) |writer| try writer.writeAll("sandbox and yolo cannot both be selected\n");
+        return error.ConflictingPolicy;
+    }
+    if (config.sandbox) |policy| {
+        if (policy == .@"read-only") {
+            if (diagnostic) |writer| try writer.writeAll("read-only cannot run a supervised loop: Matcha callbacks must write the loop store; no writable exception is added automatically. Choose workspace-write for Codex or backend-default.\n");
+            return error.ReadOnlyPreventsCallbacks;
+        }
+        if (config.backend != .codex and policy != .@"backend-default") {
+            if (diagnostic) |writer| try writer.print("Backend {s} cannot enforce sandbox {s} independently of approvals. Supported sandbox choices: backend-default. --yolo is a separate explicit bypass.\n", .{ @tagName(config.backend), @tagName(policy) });
+            return error.UnsupportedSandboxPolicy;
+        }
+    }
+    if (config.sandbox != null or (config.yolo and !config.legacy_policy_passthrough)) {
+        if (conflictingNativePolicy(config.backend, config.extra_args)) |arg| {
+            if (diagnostic) |writer| try writer.print("Structured permission policy conflicts with native argument {s}; remove one policy source.\n", .{arg});
+            return error.ConflictingNativePolicy;
+        }
+    }
+}
+
+fn flagMatches(arg: []const u8, flag: []const u8) bool {
+    return std.mem.eql(u8, arg, flag) or (std.mem.startsWith(u8, arg, flag) and arg.len > flag.len and arg[flag.len] == '=');
+}
+
+fn codexPolicyConfig(raw_value: []const u8) bool {
+    const value = if (std.mem.startsWith(u8, raw_value, "=")) raw_value[1..] else raw_value;
+    const key = std.mem.trim(u8, value[0 .. std.mem.indexOfScalar(u8, value, '=') orelse value.len], " \t\"'");
+    return std.mem.eql(u8, key, "sandbox_mode") or std.mem.eql(u8, key, "approval_policy") or
+        std.mem.eql(u8, key, "sandbox_permissions") or std.mem.eql(u8, key, "sandbox_workspace_write") or
+        std.mem.startsWith(u8, key, "sandbox_workspace_write.") or std.mem.startsWith(u8, key, "approval_policy.");
+}
+
+fn conflictingNativePolicy(kind: BackendKind, args: []const []const u8) ?[]const u8 {
+    for (args, 0..) |arg, i| {
+        const flags: []const []const u8 = switch (kind) {
+            .codex => &.{ "-s", "--sandbox", "-a", "--ask-for-approval", "--full-auto", "--approve-for-me", "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--add-dir" },
+            .droid => &.{ "--auto", "--skip-permissions-unsafe", "--settings" },
+            .agy => &.{ "--sandbox", "--mode", "--dangerously-skip-permissions", "--settings" },
+        };
+        for (flags) |flag| if (flagMatches(arg, flag)) return arg;
+        if (kind == .codex) {
+            if ((std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) and i + 1 < args.len and codexPolicyConfig(args[i + 1])) return arg;
+            if (std.mem.startsWith(u8, arg, "--config=") and codexPolicyConfig(arg["--config=".len..])) return arg;
+            if (std.mem.startsWith(u8, arg, "-c") and arg.len > 2 and codexPolicyConfig(arg[2..])) return arg;
+            if ((std.mem.startsWith(u8, arg, "-s") or std.mem.startsWith(u8, arg, "-a")) and arg.len > 2 and arg[1] != '-') return arg;
+        }
+    }
+    return null;
+}
 
 /// Build argv for one backend invocation. A null session ID starts a fresh session.
 /// `prompt_file` is used by Droid; Codex and Agy consume the prompt through stdin.
@@ -377,6 +434,7 @@ pub fn buildArgv(
     session_id: ?[]const u8,
     prompt_file: []const u8,
 ) !Argv {
+    try validatePolicy(config, null);
     var builder = ArgvBuilder.init(allocator);
     errdefer builder.deinit();
 
@@ -393,6 +451,15 @@ fn buildCodex(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u
     try builder.add("exec");
     if (config.yolo) {
         try builder.add("--dangerously-bypass-approvals-and-sandbox");
+    } else if (config.sandbox) |policy| {
+        if (policy != .@"backend-default") {
+            try builder.add("--sandbox");
+            try builder.add(@tagName(policy));
+            if (policy == .@"workspace-write") {
+                try builder.add("--add-dir");
+                try builder.add(loop_dir);
+            }
+        }
     } else {
         if (!hasSandboxOverride(config.extra_args)) {
             try builder.add("-s");
@@ -428,8 +495,12 @@ fn hasSandboxOverride(args: []const []const u8) bool {
 fn buildDroid(builder: *ArgvBuilder, config: BackendOptions, session_id: ?[]const u8, prompt_file: []const u8) !void {
     try builder.add(config.backend_bin orelse "droid");
     try builder.add("exec");
-    try builder.add(if (config.yolo) "--skip-permissions-unsafe" else "--auto");
-    if (!config.yolo) try builder.add("high");
+    if (config.yolo) {
+        try builder.add("--skip-permissions-unsafe");
+    } else if (config.sandbox == null) {
+        try builder.add("--auto");
+        try builder.add("high");
+    }
     if (session_id) |id| {
         try builder.add("-s");
         try builder.add(id);
@@ -450,12 +521,14 @@ fn buildAgy(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u8,
     try builder.add("-p");
     if (config.yolo) {
         try builder.add("--dangerously-skip-permissions");
-    } else {
+    } else if (config.sandbox == null) {
         try builder.add("--mode");
         try builder.add("auto");
     }
-    try builder.add("--add-dir");
-    try builder.add(loop_dir);
+    if (config.sandbox == null) {
+        try builder.add("--add-dir");
+        try builder.add(loop_dir);
+    }
     if (session_id) |id| {
         try builder.add("--conversation");
         try builder.add(id);
@@ -918,4 +991,86 @@ test "preflight checks selected executable without running it" {
     try tmp.dir.writeFile(io, .{ .sub_path = "no-execute", .data = "#!/bin/sh\n" });
     request.config.backend_bin = "./no-execute";
     try std.testing.expectError(error.AccessDenied, real.runner().preflight(request));
+}
+
+test "sandbox capability table covers initial and resumed argv without approval bypass" {
+    const a = std.testing.allocator;
+    const policies = [_]options.SandboxPolicy{ .@"read-only", .@"workspace-write", .@"danger-full-access", .@"backend-default" };
+    for ([_]BackendKind{ .codex, .droid, .agy }) |kind| {
+        for (policies) |policy| {
+            for ([_]?[]const u8{ null, "saved-session" }) |session| {
+                const config: BackendOptions = .{ .backend = kind, .sandbox = policy };
+                if (policy == .@"read-only") {
+                    try std.testing.expectError(error.ReadOnlyPreventsCallbacks, buildArgv(a, config, "/loop/store", session, "prompt.md"));
+                } else if (kind != .codex and policy != .@"backend-default") {
+                    try std.testing.expectError(error.UnsupportedSandboxPolicy, buildArgv(a, config, "/loop/store", session, "prompt.md"));
+                } else {
+                    var argv = try buildArgv(a, config, "/loop/store", session, "prompt.md");
+                    defer argv.deinit();
+                    for (argv.items) |arg| {
+                        try std.testing.expect(!std.mem.eql(u8, arg, "--dangerously-bypass-approvals-and-sandbox"));
+                        try std.testing.expect(!std.mem.eql(u8, arg, "--skip-permissions-unsafe"));
+                        try std.testing.expect(!std.mem.eql(u8, arg, "--dangerously-skip-permissions"));
+                        try std.testing.expect(!std.mem.eql(u8, arg, "--auto"));
+                        try std.testing.expect(!std.mem.eql(u8, arg, "--mode"));
+                    }
+                    if (policy == .@"backend-default") {
+                        for (argv.items) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--sandbox"));
+                    } else {
+                        try std.testing.expectEqualStrings("--sandbox", argv.items[2]);
+                        try std.testing.expectEqualStrings(@tagName(policy), argv.items[3]);
+                        if (session != null) {
+                            const resume_index = for (argv.items, 0..) |arg, index| {
+                                if (std.mem.eql(u8, arg, "resume")) break index;
+                            } else unreachable;
+                            try std.testing.expect(resume_index > 3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "structured permission choices reject known native conflicts and preserve unrelated flags" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { kind: BackendKind, args: []const []const u8 }{
+        .{ .kind = .codex, .args = &.{ "-s", "danger-full-access" } },
+        .{ .kind = .codex, .args = &.{"--sandbox=workspace-write"} },
+        .{ .kind = .codex, .args = &.{ "-c", "sandbox_mode=\"danger-full-access\"" } },
+        .{ .kind = .codex, .args = &.{"--config=approval_policy=\"never\""} },
+        .{ .kind = .codex, .args = &.{"-csandbox_workspace_write.network_access=true"} },
+        .{ .kind = .codex, .args = &.{"-c=sandbox_mode=workspace-write"} },
+        .{ .kind = .codex, .args = &.{ "-c", "sandbox_workspace_write={network_access=true}" } },
+        .{ .kind = .codex, .args = &.{"--full-auto"} },
+        .{ .kind = .codex, .args = &.{ "--add-dir", "/extra" } },
+        .{ .kind = .droid, .args = &.{"--auto=high"} },
+        .{ .kind = .droid, .args = &.{"--skip-permissions-unsafe"} },
+        .{ .kind = .agy, .args = &.{"--sandbox"} },
+        .{ .kind = .agy, .args = &.{"--mode=auto"} },
+        .{ .kind = .agy, .args = &.{"--dangerously-skip-permissions"} },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(error.ConflictingNativePolicy, validatePolicy(.{ .backend = case.kind, .sandbox = .@"backend-default", .extra_args = case.args }, null));
+        try std.testing.expectError(error.ConflictingNativePolicy, validatePolicy(.{ .backend = case.kind, .yolo = true, .extra_args = case.args }, null));
+        try validatePolicy(.{ .backend = case.kind, .extra_args = case.args }, null);
+    }
+    try std.testing.expectError(error.ConflictingPolicy, validatePolicy(.{ .backend = .codex, .yolo = true, .sandbox = .@"workspace-write" }, null));
+    var safe = try buildArgv(a, .{ .backend = .codex, .sandbox = .@"workspace-write", .extra_args = &.{ "-c", "model_reasoning_effort=\"high\"" } }, "/loop", null, "prompt");
+    defer safe.deinit();
+    var diagnostic: std.Io.Writer.Allocating = .init(a);
+    defer diagnostic.deinit();
+    try std.testing.expectError(error.ReadOnlyPreventsCallbacks, validatePolicy(.{ .backend = .codex, .sandbox = .@"read-only" }, &diagnostic.writer));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "callbacks") != null);
+    try std.testing.expectError(error.UnsupportedSandboxPolicy, validatePolicy(.{ .backend = .droid, .sandbox = .@"danger-full-access" }, &diagnostic.writer));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "Supported sandbox choices: backend-default") != null);
+}
+
+test "legacy yolo passthrough remains unchanged until an explicit policy override" {
+    const a = std.testing.allocator;
+    var legacy = try buildArgv(a, .{ .backend = .codex, .yolo = true, .legacy_policy_passthrough = true, .extra_args = &.{ "-s", "workspace-write" } }, "/loop", "saved", "prompt");
+    defer legacy.deinit();
+    try expectArgv(&legacy, &.{ "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-s", "workspace-write", "resume", "--json", "saved", "-" });
+    try std.testing.expectError(error.ConflictingNativePolicy, buildArgv(a, .{ .backend = .codex, .yolo = true, .extra_args = &.{ "-s", "workspace-write" } }, "/loop", "saved", "prompt"));
+    try std.testing.expectError(error.ConflictingNativePolicy, buildArgv(a, .{ .backend = .codex, .sandbox = .@"workspace-write", .legacy_policy_passthrough = true, .extra_args = &.{ "-s", "workspace-write" } }, "/loop", "saved", "prompt"));
 }

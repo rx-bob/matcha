@@ -253,7 +253,7 @@ fn runLoopCommandWithInputs(
                 .stdout = stdout,
                 .stderr = stderr,
             };
-            return switch (loop_runtime.resumeLoop(services, resolved_id, resume_options.objective) catch |err| {
+            return switch (loop_runtime.resumeLoopWithPolicy(services, resolved_id, resume_options.objective, resume_options.sandbox, resume_options.yolo) catch |err| {
                 if (err == error.LoopCannotResume) {
                     try stderr.print("Cannot resume loop {s} from its current status\n", .{resolved_id});
                     return .failure;
@@ -635,6 +635,7 @@ fn writeLoopShow(store: *const loop_store.Store, id: []const u8, stdout: *std.Io
     if (state.token_budget) |value| try stdout.print("{d}", .{value}) else try stdout.writeAll("unlimited");
     try stdout.writeAll(", timeout=");
     if (state.timeout_seconds) |value| try stdout.print("{d}s", .{value}) else try stdout.writeAll("unlimited");
+    try stdout.print("\nSandbox: {s}", .{if (state.sandbox) |policy| @tagName(policy) else "adapter default"});
     try stdout.print("\nExecutable: {s}", .{state.backend_bin orelse @tagName(state.backend)});
     try stdout.print("\nModel: {s}\nYolo: {s}\nSession: {s}\nWorking directory: {s}\nObjective:\n{s}\n", .{
         state.model orelse "backend default",
@@ -697,7 +698,7 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha loop [options] <prompt> [options]
         \\  matcha loop --prompt-file <path> [options]
         \\  matcha loop config
-        \\  matcha loop resume [<id>|--last] [--objective <new objective>]
+        \\  matcha loop resume [<id>|--last] [--objective <new objective>] [--sandbox <policy>|--yolo]
         \\  matcha loop list
         \\  matcha loop show [<id>]
         \\  matcha loop update [<id>] --status <complete|blocked> [--summary <text>]
@@ -712,6 +713,10 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\Verifier overrides: --verifier-model <model>, --verifier-bin <executable>,
         \\  repeatable --verifier-arg=<argument>. Empty model/bin selects native default.
         \\Arguments after -- belong only to the worker in new loops.
+        \\--sandbox <workspace-write|danger-full-access|backend-default> selects isolation.
+        \\Codex supports the first two; backend-default resets to native policy for all backends.
+        \\Read-only cannot support loop callbacks. Sandbox never implies --yolo approval bypass.
+        \\--sandbox and --yolo conflict in one layer; either replaces an inherited policy.
         \\--backend-bin <executable> selects one executable; arguments belong after --.
         \\--config <path> selects a project config instead of launch-directory .matcha.json.
         \\Precedence: CLI > project > user defaults. Prompt: explicit > pipe > configured file.
@@ -2825,4 +2830,71 @@ test "unavailable verifier fails real preflight before any worker or durable loo
     }
     try std.testing.expectEqual(@as(usize, 0), ids.len);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "turn.started") == null);
+}
+
+test "CLI resume sandbox replaces saved yolo without reloading config" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try loop_store.Store.init(a, io, root);
+    defer store.deinit();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    defer a.free(cwd);
+    const initial: loop_store.LoopState = .{ .id = "sandbox-0001", .status = .paused, .backend = .codex, .yolo = true, .verify_enabled = false, .cwd = cwd, .objective = "saved objective", .started_at_ms = 1, .updated_at_ms = 1 };
+    try store.createLoop(initial);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var fake = ResumeCliFake{ .allocator = a, .store = &store };
+    defer fake.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var diagnostic: std.Io.Writer.Allocating = .init(a);
+    defer diagnostic.deinit();
+    const code = try runArgsRuntime(&.{ "loop", "resume", initial.id, "--sandbox=workspace-write" }, io, &out.writer, &diagnostic.writer, root, &env, fake.runner());
+    try std.testing.expectEqual(ExitCode.ok, code);
+    var saved = try store.loadState(initial.id);
+    defer saved.deinit();
+    try std.testing.expect(!saved.value.yolo);
+    try std.testing.expectEqual(loop_options.SandboxPolicy.@"workspace-write", saved.value.sandbox.?);
+    try std.testing.expectEqualStrings(initial.objective, saved.value.objective);
+}
+
+test "CLI rejects unsupported enabled verifier policy before worker but permits disabled verifier" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |disabled| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        const project = try std.fs.path.join(a, &.{ root, "project.json" });
+        defer a.free(project);
+        try tmp.dir.writeFile(io, .{ .sub_path = "project.json", .data = "{\"schema_version\":1,\"loop\":{\"verifier\":{\"backend\":\"agy\"}}}" });
+        var store = try loop_store.Store.init(a, io, root);
+        defer store.deinit();
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var fake = ResumeCliFake{ .allocator = a, .store = &store };
+        defer fake.deinit();
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        var diagnostic: std.Io.Writer.Allocating = .init(a);
+        defer diagnostic.deinit();
+        const args: []const []const u8 = if (disabled) &.{ "task", "--sandbox=workspace-write", "--no-verify" } else &.{ "task", "--sandbox=workspace-write" };
+        const code = try runLoopCommandWithInputs(io, args, &out.writer, &diagnostic.writer, root, &env, fake.runner(), .{ .project_path = project });
+        try std.testing.expectEqual(if (disabled) ExitCode.ok else ExitCode.failure, code);
+        try std.testing.expectEqual(disabled, fake.prompt != null);
+        if (!disabled) {
+            const ids = try store.listLoopIds();
+            defer {
+                for (ids) |id| a.free(id);
+                a.free(ids);
+            }
+            try std.testing.expectEqual(@as(usize, 0), ids.len);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "agy") != null);
+        }
+    }
 }

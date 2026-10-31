@@ -103,6 +103,8 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         .model = run_options.model,
         .output_mode = run_options.output_mode,
         .yolo = run_options.yolo,
+        .sandbox = run_options.sandbox,
+        .policy_validation_enabled = true,
         .cwd = cwd,
         .objective = run_options.prompt,
         .started_at_ms = now,
@@ -119,11 +121,27 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
 }
 
 pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !ExitCode {
+    return resumeLoopWithPolicy(services, id, objective, null, false);
+}
+
+pub fn resumeLoopWithPolicy(services: Services, id: []const u8, objective: ?[]const u8, sandbox: ?options.SandboxPolicy, yolo: bool) !ExitCode {
     const allocator = services.allocator;
     var loaded = try services.store.loadState(id);
     defer loaded.deinit();
     var state = loaded.value;
     if (state.status == .complete or state.status == .blocked) return error.LoopCannotResume;
+    if (sandbox != null and yolo) {
+        if (services.stderr) |writer| try writer.writeAll("Sandbox and yolo cannot be selected together.\n");
+        return .failure;
+    }
+    if (sandbox != null or yolo) state.policy_validation_enabled = true;
+    if (sandbox) |policy| {
+        state.sandbox = policy;
+        state.yolo = false;
+    } else if (yolo) {
+        state.sandbox = null;
+        state.yolo = true;
+    }
 
     const cwd = try std.process.currentPathAlloc(services.io, allocator);
     defer allocator.free(cwd);
@@ -159,6 +177,7 @@ fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
         .verify_enabled = state.verify_enabled,
         .model = state.model,
         .yolo = state.yolo,
+        .sandbox = state.sandbox,
         .max_turns = state.max_turns,
         .token_budget = state.token_budget,
         .timeout_seconds = state.timeout_seconds,
@@ -172,7 +191,7 @@ fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
 pub fn roleSettings(state: store_mod.LoopState, role: store_mod.TurnRole) backend.BackendOptions {
     const selected = if (role == .verifier) state.verifier_backend orelse state.backend else state.backend;
     const same_backend = selected == state.backend;
-    const worker: backend.BackendOptions = .{ .backend = selected, .backend_bin = if (same_backend) state.backend_bin else null, .model = state.model, .yolo = state.yolo, .extra_args = state.extra_args };
+    const worker: backend.BackendOptions = .{ .backend = selected, .backend_bin = if (same_backend) state.backend_bin else null, .model = state.model, .yolo = state.yolo, .sandbox = state.sandbox, .legacy_policy_passthrough = !state.policy_validation_enabled, .extra_args = state.extra_args };
     if (role == .worker) return worker;
     const verifier = state.verifier_options;
     return .{
@@ -180,11 +199,21 @@ pub fn roleSettings(state: store_mod.LoopState, role: store_mod.TurnRole) backen
         .backend_bin = if (verifier.backend_bin_explicit) verifier.backend_bin else if (same_backend) state.backend_bin else null,
         .model = if (verifier.model_explicit) verifier.model else if (same_backend or !state.separate_verifier_settings) state.model else null,
         .yolo = state.yolo,
+        .sandbox = state.sandbox,
+        .legacy_policy_passthrough = !state.policy_validation_enabled,
         .extra_args = if (verifier.args_explicit or state.separate_verifier_settings) verifier.args else state.extra_args,
     };
 }
 
 fn preflightRoles(services: Services, state: store_mod.LoopState) !void {
+    // Reject incompatible settings for either role before probing any executable.
+    for ([_]store_mod.TurnRole{ .worker, .verifier }) |role| {
+        if (role == .verifier and !state.verify_enabled) continue;
+        backend.validatePolicy(roleSettings(state, role), services.stderr) catch |err| {
+            if (services.stderr) |writer| try writer.print("Cannot start {s}: {s}\n", .{ @tagName(role), @errorName(err) });
+            return err;
+        };
+    }
     var environment = try backend.buildChildEnvironment(services.allocator, services.io, services.parent_environment, state.id);
     defer environment.deinit();
     for ([_]store_mod.TurnRole{ .worker, .verifier }) |role| {
@@ -1508,5 +1537,178 @@ test "disabled verifier skips preflight and failing enabled preflight creates no
             a.free(ids);
         }
         try std.testing.expectEqual(@as(usize, if (enabled) 0 else 1), ids.len);
+    }
+}
+
+test "unsupported verifier policy prevents all preflight and worker calls unless disabled" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |enabled| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try store_mod.Store.init(a, std.testing.io, root);
+        defer store.deinit();
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var fake = FakeRunner{ .store = &store, .script = &.{.worker_complete} };
+        defer fake.deinit(a);
+        const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer, .stderr = &output.writer };
+        try std.testing.expectEqual(if (enabled) ExitCode.failure else ExitCode.ok, try run(services, .{ .backend = .codex, .verifier = .agy, .sandbox = .@"workspace-write", .verify_enabled = enabled, .prompt = "task", .output_mode = .quiet }));
+        try std.testing.expectEqual(@as(usize, if (enabled) 0 else 1), fake.preflight_calls.items.len);
+        try std.testing.expectEqual(@as(usize, if (enabled) 0 else 1), fake.calls.items.len);
+        if (enabled) try std.testing.expect(std.mem.indexOf(u8, output.written(), "verifier") != null);
+    }
+}
+
+test "resume sandbox candidate downgrades captured yolo and rejects invalid candidate without a write" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |unsupported_verifier| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try store_mod.Store.init(a, std.testing.io, root);
+        defer store.deinit();
+        const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+        defer a.free(cwd);
+        const initial: store_mod.LoopState = .{ .id = "saved-policy", .status = .paused, .backend = .codex, .verifier_backend = .agy, .verify_enabled = unsupported_verifier, .yolo = true, .cwd = cwd, .objective = "saved objective", .worker_session_id = "saved-session", .started_at_ms = 1, .updated_at_ms = 1 };
+        try store.createLoop(initial);
+        const state_path = try std.fs.path.join(a, &.{ root, initial.id, "state.json" });
+        defer a.free(state_path);
+        const before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, a, .limited(65536));
+        defer a.free(before);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var fake = FakeRunner{ .store = &store, .script = &.{.worker_complete} };
+        defer fake.deinit(a);
+        const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer, .stderr = &output.writer };
+        const result = try resumeLoopWithPolicy(services, initial.id, "candidate objective", .@"workspace-write", false);
+        try std.testing.expectEqual(if (unsupported_verifier) ExitCode.failure else ExitCode.ok, result);
+        var after = try store.loadState(initial.id);
+        defer after.deinit();
+        if (unsupported_verifier) {
+            const durable = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, a, .limited(65536));
+            defer a.free(durable);
+            try std.testing.expectEqualStrings(before, durable);
+            try std.testing.expectEqual(@as(usize, 0), fake.preflight_calls.items.len);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+        } else {
+            try std.testing.expect(!after.value.yolo);
+            try std.testing.expectEqual(options.SandboxPolicy.@"workspace-write", after.value.sandbox.?);
+            try std.testing.expectEqualStrings("candidate objective", after.value.objective);
+            const argv = try std.json.parseFromSlice([]const []const u8, a, fake.calls.items[0].argv_json, .{});
+            defer argv.deinit();
+            try std.testing.expect(argvHas(argv.value, "workspace-write"));
+            try std.testing.expect(!argvHas(argv.value, "--dangerously-bypass-approvals-and-sandbox"));
+        }
+    }
+}
+
+test "contradictory structured native policy fails before runner preflight" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try store_mod.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{} };
+    defer fake.deinit(a);
+    const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer, .stderr = &output.writer };
+    try std.testing.expectEqual(ExitCode.failure, try run(services, .{ .backend = .codex, .sandbox = .@"workspace-write", .extra_backend_args = &.{"--sandbox=danger-full-access"}, .prompt = "task" }));
+    try std.testing.expectEqual(@as(usize, 0), fake.preflight_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "resume explicit yolo replaces saved sandbox and backend default clears saved bypass" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |select_yolo| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try store_mod.Store.init(a, std.testing.io, root);
+        defer store.deinit();
+        const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+        defer a.free(cwd);
+        const initial: store_mod.LoopState = .{ .id = "policy-reset", .status = .paused, .backend = .codex, .verify_enabled = false, .yolo = !select_yolo, .sandbox = if (select_yolo) .@"workspace-write" else null, .cwd = cwd, .objective = "task", .worker_session_id = "saved-session", .started_at_ms = 1, .updated_at_ms = 1 };
+        try store.createLoop(initial);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var fake = FakeRunner{ .store = &store, .script = &.{.worker_complete} };
+        defer fake.deinit(a);
+        const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer };
+        try std.testing.expectEqual(ExitCode.ok, try resumeLoopWithPolicy(services, initial.id, null, if (select_yolo) null else .@"backend-default", select_yolo));
+        var saved = try store.loadState(initial.id);
+        defer saved.deinit();
+        try std.testing.expectEqual(select_yolo, saved.value.yolo);
+        try std.testing.expectEqual(@as(?options.SandboxPolicy, if (select_yolo) null else .@"backend-default"), saved.value.sandbox);
+        const argv = try std.json.parseFromSlice([]const []const u8, a, fake.calls.items[0].argv_json, .{});
+        defer argv.deinit();
+        try std.testing.expectEqual(select_yolo, argvHas(argv.value, "--dangerously-bypass-approvals-and-sandbox"));
+        try std.testing.expect(!argvHas(argv.value, "workspace-write"));
+    }
+}
+
+test "legacy native policy passthrough survives ordinary resume but explicit selection is strict" {
+    const a = std.testing.allocator;
+    const Case = enum { legacy_resume, explicit_resume, new_loop };
+    for ([_]Case{ .legacy_resume, .explicit_resume, .new_loop }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try store_mod.Store.init(a, std.testing.io, root);
+        defer store.deinit();
+        const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+        defer a.free(cwd);
+        const state: store_mod.LoopState = .{ .id = "historical-policy", .status = .paused, .backend = .codex, .verify_enabled = false, .yolo = true, .extra_args = &.{"--sandbox=workspace-write"}, .cwd = cwd, .objective = "saved", .worker_session_id = "saved-session", .started_at_ms = 1, .updated_at_ms = 1 };
+        const state_path = try std.fs.path.join(a, &.{ root, state.id, "state.json" });
+        defer a.free(state_path);
+        var original: ?[]u8 = null;
+        defer if (original) |bytes| a.free(bytes);
+        if (case != .new_loop) {
+            try store.createLoop(state);
+            original = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, a, .limited(65536));
+        }
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var fake = FakeRunner{ .store = &store, .script = &.{.worker_complete} };
+        defer fake.deinit(a);
+        const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer, .stderr = &output.writer };
+        const result = switch (case) {
+            .legacy_resume => try resumeLoop(services, state.id, null),
+            .explicit_resume => try resumeLoopWithPolicy(services, state.id, null, null, true),
+            .new_loop => try run(services, .{ .backend = .codex, .verify_enabled = false, .yolo = true, .extra_backend_args = state.extra_args, .prompt = "task" }),
+        };
+        try std.testing.expectEqual(if (case == .legacy_resume) ExitCode.ok else ExitCode.failure, result);
+        try std.testing.expectEqual(@as(usize, if (case == .legacy_resume) 1 else 0), fake.calls.items.len);
+        try std.testing.expectEqual(@as(usize, if (case == .legacy_resume) 1 else 0), fake.preflight_calls.items.len);
+        if (case == .legacy_resume) {
+            var saved = try store.loadState(state.id);
+            defer saved.deinit();
+            try std.testing.expect(!saved.value.policy_validation_enabled);
+            const argv = try std.json.parseFromSlice([]const []const u8, a, fake.calls.items[0].argv_json, .{});
+            defer argv.deinit();
+            try std.testing.expect(argvHas(argv.value, "--sandbox=workspace-write"));
+            try std.testing.expect(argvHas(argv.value, "--dangerously-bypass-approvals-and-sandbox"));
+        } else if (case == .explicit_resume) {
+            const durable = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, a, .limited(65536));
+            defer a.free(durable);
+            try std.testing.expectEqualStrings(original.?, durable);
+        }
     }
 }

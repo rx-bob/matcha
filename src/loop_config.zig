@@ -13,6 +13,7 @@ pub const Config = struct {
     verifier_options: options.VerifierOptions = .{},
     verify_enabled: bool = true,
     yolo: bool = false,
+    sandbox: ?options.SandboxPolicy = null,
     token_budget: ?u64 = null,
     timeout_seconds: ?u64 = null,
     output_mode: options.OutputMode = .live,
@@ -64,7 +65,9 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, cli: options.RunOptions
     for (result.run.verifier_options.args, 0..) |v, i| verifier_args[i] = try a.dupe(u8, v);
     result.run.verifier_options.args = verifier_args;
     result.run.verify_enabled = if (!cli.verify_enabled) false else if (cli.verifier != null or cli.verifier_options.model_explicit or cli.verifier_options.backend_bin_explicit or cli.verifier_options.args_explicit) true else settings.verify_enabled;
-    result.run.yolo = cli.yolo or settings.yolo;
+    if (cli.sandbox != null and cli.yolo) return error.ConflictingPolicy;
+    result.run.sandbox = if (cli.yolo) null else cli.sandbox orelse settings.sandbox;
+    result.run.yolo = if (cli.sandbox != null) false else cli.yolo or settings.yolo;
     result.run.token_budget = cli.token_budget orelse settings.token_budget;
     result.run.timeout_seconds = cli.timeout_seconds orelse settings.timeout_seconds;
     result.run.output_mode = if (cli.output_mode != .live) cli.output_mode else settings.output_mode;
@@ -109,10 +112,32 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
             if (!std.mem.eql(u8, entry.key_ptr.*, "loop") and !std.mem.eql(u8, entry.key_ptr.*, "schema_version")) return error.UnknownField;
         }
     }
+    if (value.object.contains("sandbox") and value.object.contains("yolo")) {
+        try diagnostic.print("Config {s}: sandbox and yolo cannot both be selected in one layer\n", .{source});
+        return error.ConflictingPolicy;
+    }
     var iter = value.object.iterator();
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
         const raw = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "sandbox")) {
+            if (raw != .string and raw != .null) {
+                try diagnostic.print("Config {s}, field sandbox: expected policy name or null\n", .{source});
+                return error.InvalidFieldType;
+            }
+            settings.sandbox = if (raw == .null) .@"backend-default" else std.meta.stringToEnum(options.SandboxPolicy, raw.string) orelse {
+                try diagnostic.print("Config {s}, field sandbox: expected read-only, workspace-write, danger-full-access, or backend-default\n", .{source});
+                return error.InvalidEnumTag;
+            };
+            settings.yolo = false;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "yolo")) {
+            if (raw != .bool) return error.InvalidFieldType;
+            settings.yolo = raw.bool;
+            if (raw.bool) settings.sandbox = null;
+            continue;
+        }
         if (std.mem.eql(u8, key, "verifier")) {
             applyVerifier(a, settings, raw, source, verifier_present, io, resolve_paths, diagnostic) catch |err| {
                 try diagnostic.print("Config {s}, field verifier: {s}\n", .{ source, @errorName(err) });
@@ -430,7 +455,7 @@ test "resolution only opens selected files and diagnoses invalid explicit source
         .{ .json = "{\"schema_version\":1,\"loop\":{\"verifier\":2}}", .err = error.InvalidFieldType },
         .{ .json = "{\"loop\":{}}", .err = error.MissingSchemaVersion },
         .{ .json = "{\"schema_version\":1,\"loop\":{\"mispelled\":true}}", .err = error.UnknownField },
-        .{ .json = "{\"schema_version\":1,\"loop\":{\"yolo\":\"true\"}}", .err = error.UnexpectedToken },
+        .{ .json = "{\"schema_version\":1,\"loop\":{\"yolo\":\"true\"}}", .err = error.InvalidFieldType },
         .{ .json = "{\"schema_version\":1,\"loop\":{\"max_turns\":0}}", .err = error.InvalidLimit },
     };
     for (cases) |case| {
@@ -639,4 +664,58 @@ test "nested verifier resolved allocations clean partial failures" {
         if (succeeded and !failing.has_induced_failure) break;
     }
     try std.testing.expect(succeeded);
+}
+
+test "policy layers replace inherited sandbox or yolo as one choice" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const user = try std.fs.path.join(a, &.{ root, "user.json" });
+    defer a.free(user);
+    const project = try std.fs.path.join(a, &.{ root, "project.json" });
+    defer a.free(project);
+    var diagnostic: std.Io.Writer.Allocating = .init(a);
+    defer diagnostic.deinit();
+    const cases = [_]struct { user: []const u8, project: []const u8, sandbox: ?options.SandboxPolicy, yolo: bool }{
+        .{ .user = "{\"yolo\":true}", .project = "{\"sandbox\":\"workspace-write\"}", .sandbox = .@"workspace-write", .yolo = false },
+        .{ .user = "{\"sandbox\":\"workspace-write\"}", .project = "{\"yolo\":true}", .sandbox = null, .yolo = true },
+        .{ .user = "{\"yolo\":true}", .project = "{\"sandbox\":null}", .sandbox = .@"backend-default", .yolo = false },
+        .{ .user = "{\"sandbox\":\"danger-full-access\"}", .project = "{\"yolo\":false}", .sandbox = .@"danger-full-access", .yolo = false },
+        .{ .user = "{\"yolo\":true}", .project = "{\"yolo\":false}", .sandbox = null, .yolo = false },
+        .{ .user = "{}", .project = "{}", .sandbox = null, .yolo = false },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user.json", .data = case.user });
+        const encoded = try std.fmt.allocPrint(a, "{{\"schema_version\":1,\"loop\":{s}}}", .{case.project});
+        defer a.free(encoded);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = encoded });
+        var resolved = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task" }, user, project, &diagnostic.writer);
+        defer resolved.deinit();
+        try std.testing.expectEqual(case.sandbox, resolved.run.sandbox);
+        try std.testing.expectEqual(case.yolo, resolved.run.yolo);
+        var cli_sandbox = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task", .sandbox = .@"read-only" }, user, project, &diagnostic.writer);
+        defer cli_sandbox.deinit();
+        try std.testing.expectEqual(options.SandboxPolicy.@"read-only", cli_sandbox.run.sandbox.?);
+        try std.testing.expect(!cli_sandbox.run.yolo);
+        var cli_yolo = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task", .yolo = true }, user, project, &diagnostic.writer);
+        defer cli_yolo.deinit();
+        try std.testing.expect(cli_yolo.run.sandbox == null);
+        try std.testing.expect(cli_yolo.run.yolo);
+    }
+    const invalid = [_]struct { json: []const u8, err: anyerror }{
+        .{ .json = "{\"sandbox\":\"workspace-write\",\"yolo\":true}", .err = error.ConflictingPolicy },
+        .{ .json = "{\"yolo\":false,\"sandbox\":null}", .err = error.ConflictingPolicy },
+        .{ .json = "{\"sandbox\":1}", .err = error.InvalidFieldType },
+        .{ .json = "{\"sandbox\":\"1\"}", .err = error.InvalidEnumTag },
+        .{ .json = "{\"sandbox\":\"full\"}", .err = error.InvalidEnumTag },
+    };
+    for (invalid) |case| {
+        const encoded = try std.fmt.allocPrint(a, "{{\"schema_version\":1,\"loop\":{s}}}", .{case.json});
+        defer a.free(encoded);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = encoded });
+        try std.testing.expectError(case.err, resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task" }, null, project, &diagnostic.writer));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), project) != null);
 }

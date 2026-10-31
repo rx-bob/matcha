@@ -2,6 +2,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 
 pub const BackendKind = enum { codex, droid, agy };
+pub const SandboxPolicy = enum { @"read-only", @"workspace-write", @"danger-full-access", @"backend-default" };
 pub const OutputMode = enum { live, quiet, json };
 pub const LoopStatus = enum { complete, blocked };
 
@@ -24,6 +25,7 @@ pub const RunOptions = struct {
     verify_enabled: bool = true,
     model: ?[]const u8 = null,
     yolo: bool = false,
+    sandbox: ?SandboxPolicy = null,
     max_turns: ?u32 = null,
     turn_limit_explicit: bool = false,
     token_budget: ?u64 = null,
@@ -43,7 +45,7 @@ pub fn deinitParsedRun(allocator: std.mem.Allocator, run: RunOptions) void {
     allocator.free(run.verifier_options.args);
 }
 
-pub const ResumeOptions = struct { id: ?[]const u8 = null, last: bool = false, objective: ?[]const u8 = null };
+pub const ResumeOptions = struct { id: ?[]const u8 = null, last: bool = false, objective: ?[]const u8 = null, sandbox: ?SandboxPolicy = null, yolo: bool = false };
 pub const ShowOptions = struct { id: ?[]const u8 = null };
 pub const UpdateOptions = struct { id: ?[]const u8 = null, status: LoopStatus, summary: ?[]const u8 = null };
 pub const VerifyOptions = struct { id: ?[]const u8 = null, passed: bool, reason: ?[]const u8 = null };
@@ -95,6 +97,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     var no_verify = false;
     var model: ?[]const u8 = null;
     var yolo = false;
+    var sandbox: ?SandboxPolicy = null;
     var max_turns: ?u32 = null;
     var turn_limit_explicit = false;
     var token_budget: ?u64 = null;
@@ -181,6 +184,12 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
             model = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
         } else if (std.mem.startsWith(u8, arg, "--model=")) {
             model = arg["--model=".len..];
+        } else if (std.mem.eql(u8, arg, "--sandbox")) {
+            i += 1;
+            const value = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+            sandbox = std.meta.stringToEnum(SandboxPolicy, value) orelse return .{ .err = .{ .invalid_loop_arguments = "--sandbox requires read-only, workspace-write, danger-full-access, or backend-default" } };
+        } else if (std.mem.startsWith(u8, arg, "--sandbox=")) {
+            sandbox = std.meta.stringToEnum(SandboxPolicy, arg["--sandbox=".len..]) orelse return .{ .err = .{ .invalid_loop_arguments = "--sandbox requires read-only, workspace-write, danger-full-access, or backend-default" } };
         } else if (std.mem.eql(u8, arg, "--yolo")) {
             yolo = true;
         } else if (std.mem.eql(u8, arg, "--max-turns")) {
@@ -223,6 +232,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         }
     }
 
+    if (sandbox != null and yolo) return .{ .err = .{ .invalid_loop_arguments = "--sandbox cannot be combined with --yolo" } };
     if (no_verify and (verifier != null or verifier_options.model_explicit or verifier_options.backend_bin_explicit or verifier_options.args_explicit)) return .{ .err = .{ .invalid_loop_arguments = "verifier options cannot be combined with --no-verify" } };
     if (quiet_set and json_set) return .{ .err = .{ .invalid_loop_arguments = "--quiet cannot be combined with --json" } };
 
@@ -251,6 +261,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         .verify_enabled = !no_verify,
         .model = model,
         .yolo = yolo,
+        .sandbox = sandbox,
         .max_turns = max_turns,
         .turn_limit_explicit = turn_limit_explicit,
         .token_budget = token_budget,
@@ -305,8 +316,17 @@ fn parseResume(args: []const []const u8) LoopCommandResult {
             i += 1;
             if (i >= args.len or o.objective != null) return .{ .err = .{ .invalid_loop_arguments = "--objective requires one value" } };
             o.objective = args[i];
+        } else if (std.mem.eql(u8, args[i], "--sandbox")) {
+            i += 1;
+            if (i >= args.len) return .{ .err = .{ .missing_value = "--sandbox" } };
+            o.sandbox = std.meta.stringToEnum(SandboxPolicy, args[i]) orelse return .{ .err = .{ .invalid_loop_arguments = "--sandbox requires read-only, workspace-write, danger-full-access, or backend-default" } };
+        } else if (std.mem.startsWith(u8, args[i], "--sandbox=")) {
+            o.sandbox = std.meta.stringToEnum(SandboxPolicy, args[i]["--sandbox=".len..]) orelse return .{ .err = .{ .invalid_loop_arguments = "--sandbox requires read-only, workspace-write, danger-full-access, or backend-default" } };
+        } else if (std.mem.eql(u8, args[i], "--yolo")) {
+            o.yolo = true;
         } else return .{ .err = .{ .unknown_option = args[i] } };
     }
+    if (o.sandbox != null and o.yolo) return .{ .err = .{ .invalid_loop_arguments = "--sandbox cannot be combined with --yolo" } };
     return .{ .ok = .{ .@"resume" = o } };
 }
 
@@ -525,4 +545,33 @@ test "verifier argument allocation cleans success and every parser failure" {
         }
         try std.testing.expect(completed);
     }
+}
+
+test "run and resume parse explicit sandbox without approval bypass" {
+    for (std.meta.tags(SandboxPolicy)) |policy| {
+        const flag = try std.fmt.allocPrint(std.testing.allocator, "--sandbox={s}", .{@tagName(policy)});
+        defer std.testing.allocator.free(flag);
+        const parsed = parseLoopCommand(std.testing.allocator, &.{ "task", flag }, true, "");
+        try std.testing.expect(parsed == .ok);
+        defer deinitParsedRun(std.testing.allocator, parsed.ok.run);
+        try std.testing.expectEqual(policy, parsed.ok.run.sandbox.?);
+        try std.testing.expect(!parsed.ok.run.yolo);
+        const resumed = parseLoopCommand(std.testing.allocator, &.{ "resume", "--last", "--sandbox", @tagName(policy) }, true, "");
+        try std.testing.expect(resumed == .ok);
+        try std.testing.expectEqual(policy, resumed.ok.@"resume".sandbox.?);
+        try std.testing.expect(!resumed.ok.@"resume".yolo);
+    }
+    const yolo = parseLoopCommand(std.testing.allocator, &.{ "resume", "saved-id", "--yolo" }, true, "");
+    try std.testing.expect(yolo.ok.@"resume".yolo);
+    try std.testing.expect(yolo.ok.@"resume".sandbox == null);
+    for ([_][]const []const u8{
+        &.{ "task", "--sandbox=workspace-write", "--yolo" },
+        &.{ "--yolo", "--sandbox", "read-only", "task" },
+        &.{ "resume", "--sandbox=backend-default", "--yolo" },
+        &.{ "resume", "--yolo", "--sandbox", "danger-full-access" },
+        &.{ "--sandbox=1", "task" },
+        &.{ "--sandbox", "full", "task" },
+        &.{ "resume", "--sandbox" },
+        &.{ "resume", "--sandbox=" },
+    }) |args| try std.testing.expect(parseLoopCommand(std.testing.allocator, args, true, "") == .err);
 }
