@@ -169,7 +169,7 @@ fn runLoopCommandWithInputs(
         },
     };
     defer switch (command) {
-        .run => |run_options| if (run_options.prompt.len > 0) std.heap.page_allocator.free(run_options.prompt),
+        .run => |run_options| loop_options.deinitParsedRun(std.heap.page_allocator, run_options),
         else => {},
     };
     switch (command) {
@@ -643,6 +643,11 @@ fn writeLoopShow(store: *const loop_store.Store, id: []const u8, stdout: *std.Io
         state.cwd,
         state.objective,
     });
+    const verifier_execution = loop_runtime.roleSettings(state, .verifier);
+    try stdout.print("Verifier model: {s}\nVerifier executable: {s}\n", .{
+        verifier_execution.model orelse "backend default",
+        verifier_execution.backend_bin orelse @tagName(verifier_execution.backend),
+    });
     const history = store.readRecentTurnLog(id, 5) catch |err| switch (err) {
         error.FileNotFound => "",
         else => return reportLoopStoreError(err, id, stderr),
@@ -704,6 +709,9 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\Run options --model, -b, --max-turns, and --unlimited override saved defaults.
         \\Prompt may come from positional text, --prompt-file, or piped stdin. Options work before or after text.
         \\Options include --yolo, --verifier, --no-verify, --token-budget, --timeout, --quiet, and --json.
+        \\Verifier overrides: --verifier-model <model>, --verifier-bin <executable>,
+        \\  repeatable --verifier-arg=<argument>. Empty model/bin selects native default.
+        \\Arguments after -- belong only to the worker in new loops.
         \\--backend-bin <executable> selects one executable; arguments belong after --.
         \\--config <path> selects a project config instead of launch-directory .matcha.json.
         \\Precedence: CLI > project > user defaults. Prompt: explicit > pipe > configured file.
@@ -2714,4 +2722,107 @@ test "configured CLI captures winning prompt and callback writes preserve resolv
         }
         try std.testing.expect(found);
     }
+}
+
+const TwoRoleCliFake = struct {
+    store: *loop_store.Store,
+    calls: usize = 0,
+    fn runner(self: *TwoRoleCliFake) loop_backend.BackendRunner {
+        return .{ .context = self, .runTurnFn = runTurn };
+    }
+    fn runTurn(context: *anyopaque, request: loop_backend.TurnRequest) !loop_backend.TurnExecutionResult {
+        const self: *TwoRoleCliFake = @ptrCast(@alignCast(context));
+        var state = try self.store.loadState(request.loop_id);
+        defer state.deinit();
+        const verifying = self.calls == 1;
+        try std.testing.expectEqualStrings(request.loop_id, request.environ_map.get("MATCHA_LOOP_ID").?);
+        try std.testing.expectEqualStrings("shared", request.environ_map.get("FIXTURE_ENV").?);
+        try std.testing.expectEqualStrings(if (verifying) "/verifier executable" else "/worker executable", request.argv[0]);
+        var found_worker = false;
+        var found_verifier = false;
+        var found_model = false;
+        for (request.argv) |arg| {
+            if (std.mem.eql(u8, arg, "--worker-only")) found_worker = true;
+            if (std.mem.eql(u8, arg, "--verifier-only")) found_verifier = true;
+            if (std.mem.eql(u8, arg, if (verifying) "verifier-model" else "worker-model")) found_model = true;
+        }
+        try std.testing.expect(found_model);
+        try std.testing.expectEqual(!verifying, found_worker);
+        try std.testing.expectEqual(verifying, found_verifier);
+        if (verifying) {
+            try std.testing.expect(request.on_session_id == null);
+            try std.testing.expectEqual(ExitCode.ok, try verifyLoop(self.store, request.loop_id, .{ .passed = true }, request.diagnostics.?, request.diagnostics.?));
+        } else {
+            try std.testing.expectEqual(ExitCode.ok, try updateLoop(self.store, request.loop_id, .{ .status = .complete, .summary = "ready" }, request.diagnostics.?, request.diagnostics.?));
+        }
+        self.calls += 1;
+        return .{ .allocator = self.store.allocator, .exit_code = 0, .session_id = try self.store.allocator.dupe(u8, "worker-session"), .tokens_used = 1, .last_assistant_text = null, .stderr_tail = try self.store.allocator.dupe(u8, ""), .was_interrupted = false };
+    }
+};
+
+test "CLI verifier overrides reach separate roles and survive callback writes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const project = try std.fs.path.join(a, &.{ root, "absent.json" });
+    defer a.free(project);
+    var store = try loop_store.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("FIXTURE_ENV", "shared");
+    var fake = TwoRoleCliFake{ .store = &store };
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var diagnostic: std.Io.Writer.Allocating = .init(a);
+    defer diagnostic.deinit();
+    const result = try runLoopCommandWithInputs(std.testing.io, &.{ "task", "--backend-bin=/worker executable", "--model=worker-model", "--verifier=agy", "--verifier-model=verifier-model", "--verifier-bin=/verifier executable", "--verifier-arg=--verifier-only", "--json", "--", "--worker-only" }, &output.writer, &diagnostic.writer, root, &env, fake.runner(), .{ .project_path = project });
+    try std.testing.expectEqual(ExitCode.ok, result);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    const id = (try store.resolveLatestLoopId()).?;
+    defer a.free(id);
+    var state = try store.loadState(id);
+    defer state.deinit();
+    try std.testing.expectEqualStrings("verifier-model", state.value.verifier_options.model.?);
+    try std.testing.expect(state.value.verifier_options.model_explicit);
+    try std.testing.expectEqualStrings("/verifier executable", state.value.verifier_options.backend_bin.?);
+    try std.testing.expectEqualStrings("--verifier-only", state.value.verifier_options.args[0]);
+    try std.testing.expectEqualStrings("--worker-only", state.value.extra_args[0]);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "verifier-model") != null);
+}
+
+test "unavailable verifier fails real preflight before any worker or durable loop" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const project = try std.fs.path.join(a, &.{ root, "absent.json" });
+    defer a.free(project);
+    const worker = try loop_config.resolveExecutablePath(a, io, root, "./worker");
+    defer a.free(worker);
+    const file = try tmp.dir.createFile(io, "worker", .{ .permissions = .executable_file });
+    try file.writeStreamingAll(io, "#!/bin/sh\nexit 88\n");
+    file.close(io);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var diagnostic: std.Io.Writer.Allocating = .init(a);
+    defer diagnostic.deinit();
+    const result = try runLoopCommandWithInputs(io, &.{ "task", "--backend-bin", worker, "--verifier-bin=/no/such/verifier" }, &output.writer, &diagnostic.writer, root, &env, null, .{ .project_path = project });
+    try std.testing.expectEqual(ExitCode.failure, result);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "/no/such/verifier") != null);
+    var store = try loop_store.Store.init(a, io, root);
+    defer store.deinit();
+    const ids = try store.listLoopIds();
+    defer {
+        for (ids) |id| a.free(id);
+        a.free(ids);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "turn.started") == null);
 }

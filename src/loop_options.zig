@@ -5,12 +5,22 @@ pub const BackendKind = enum { codex, droid, agy };
 pub const OutputMode = enum { live, quiet, json };
 pub const LoopStatus = enum { complete, blocked };
 
+pub const VerifierOptions = struct {
+    model: ?[]const u8 = null,
+    model_explicit: bool = false,
+    backend_bin: ?[]const u8 = null,
+    backend_bin_explicit: bool = false,
+    args: []const []const u8 = &.{},
+    args_explicit: bool = false,
+};
+
 pub const RunOptions = struct {
     backend: BackendKind,
     backend_bin: ?[]const u8 = null,
     backend_explicit: bool = false,
     verifier: ?BackendKind = null,
     verifier_explicit: bool = false,
+    verifier_options: VerifierOptions = .{},
     verify_enabled: bool = true,
     model: ?[]const u8 = null,
     yolo: bool = false,
@@ -26,6 +36,12 @@ pub const RunOptions = struct {
     config_path: ?[]const u8 = null,
     extra_backend_args: []const []const u8 = &.{},
 };
+
+/// Only for a successful parser result; runtime/resolved options have other owners.
+pub fn deinitParsedRun(allocator: std.mem.Allocator, run: RunOptions) void {
+    allocator.free(run.prompt);
+    allocator.free(run.verifier_options.args);
+}
 
 pub const ResumeOptions = struct { id: ?[]const u8 = null, last: bool = false, objective: ?[]const u8 = null };
 pub const ShowOptions = struct { id: ?[]const u8 = null };
@@ -73,6 +89,9 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     var backend_explicit = false;
     var backend_bin: ?[]const u8 = null;
     var verifier: ?BackendKind = null;
+    var verifier_options: VerifierOptions = .{};
+    var verifier_args: std.ArrayList([]const u8) = .empty;
+    defer verifier_args.deinit(allocator);
     var no_verify = false;
     var model: ?[]const u8 = null;
     var yolo = false;
@@ -99,7 +118,28 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
             extra_args = args[i + 1 ..];
             break;
         }
-        if (std.mem.eql(u8, arg, "--backend-bin")) {
+        if (std.mem.eql(u8, arg, "--verifier-model") or std.mem.startsWith(u8, arg, "--verifier-model=")) {
+            const value = if (std.mem.startsWith(u8, arg, "--verifier-model=")) arg["--verifier-model=".len..] else blk: {
+                i += 1;
+                break :blk if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+            };
+            verifier_options.model_explicit = true;
+            verifier_options.model = if (value.len == 0) null else value;
+        } else if (std.mem.eql(u8, arg, "--verifier-bin") or std.mem.startsWith(u8, arg, "--verifier-bin=")) {
+            const value = if (std.mem.startsWith(u8, arg, "--verifier-bin=")) arg["--verifier-bin=".len..] else blk: {
+                i += 1;
+                break :blk if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+            };
+            verifier_options.backend_bin_explicit = true;
+            verifier_options.backend_bin = if (value.len == 0) null else value;
+        } else if (std.mem.eql(u8, arg, "--verifier-arg") or std.mem.startsWith(u8, arg, "--verifier-arg=")) {
+            const value = if (std.mem.startsWith(u8, arg, "--verifier-arg=")) arg["--verifier-arg=".len..] else blk: {
+                i += 1;
+                break :blk if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+            };
+            verifier_options.args_explicit = true;
+            verifier_args.append(allocator, value) catch return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
+        } else if (std.mem.eql(u8, arg, "--backend-bin")) {
             i += 1;
             backend_bin = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
             if (backend_bin.?.len == 0) return .{ .err = .{ .missing_value = arg } };
@@ -183,7 +223,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         }
     }
 
-    if (no_verify and verifier != null) return .{ .err = .{ .invalid_loop_arguments = "--verifier cannot be combined with --no-verify" } };
+    if (no_verify and (verifier != null or verifier_options.model_explicit or verifier_options.backend_bin_explicit or verifier_options.args_explicit)) return .{ .err = .{ .invalid_loop_arguments = "verifier options cannot be combined with --no-verify" } };
     if (quiet_set and json_set) return .{ .err = .{ .invalid_loop_arguments = "--quiet cannot be combined with --json" } };
 
     if (prompt_parts.items.len > 0 and prompt_file != null) return .{ .err = .{ .invalid_loop_arguments = "positional prompt and --prompt-file cannot be combined" } };
@@ -196,12 +236,18 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         prompt = allocator.dupe(u8, trimmed) catch return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
     }
 
+    verifier_options.args = verifier_args.toOwnedSlice(allocator) catch {
+        allocator.free(prompt);
+        return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
+    };
+
     return .{ .ok = .{ .run = .{
         .backend = backend,
         .backend_explicit = backend_explicit,
         .backend_bin = backend_bin,
         .verifier = verifier,
         .verifier_explicit = verifier != null,
+        .verifier_options = verifier_options,
         .verify_enabled = !no_verify,
         .model = model,
         .yolo = yolo,
@@ -439,4 +485,44 @@ test "backend binary is one argument in both option forms" {
     }
     try std.testing.expect(parseLoopCommand(std.testing.allocator, &.{"--backend-bin="}, true, "") == .err);
     try std.testing.expect(parseLoopCommand(std.testing.allocator, &.{"--backend-bin"}, true, "") == .err);
+}
+
+test "verifier CLI arguments remain isolated and preserve native-default selections" {
+    const a = std.testing.allocator;
+    const parsed = parseLoopCommand(a, &.{ "task", "--verifier-model=", "--verifier-bin=", "--verifier-arg=--example", "--verifier-arg", "literal value", "--", "--worker-only" }, true, "");
+    const run_options = parsed.ok.run;
+    defer deinitParsedRun(a, run_options);
+    try std.testing.expect(run_options.verifier_options.model_explicit);
+    try std.testing.expect(run_options.verifier_options.model == null);
+    try std.testing.expect(run_options.verifier_options.backend_bin_explicit);
+    try std.testing.expect(run_options.verifier_options.backend_bin == null);
+    try std.testing.expectEqual(@as(usize, 2), run_options.verifier_options.args.len);
+    try std.testing.expectEqualStrings("--example", run_options.verifier_options.args[0]);
+    try std.testing.expectEqualStrings("literal value", run_options.verifier_options.args[1]);
+    try std.testing.expectEqualStrings("--worker-only", run_options.extra_backend_args[0]);
+    for ([_][]const u8{ "--verifier=agy", "--verifier-model=m", "--verifier-bin=tool", "--verifier-arg=--foo" }) |flag| {
+        try std.testing.expect(parseLoopCommand(a, &.{ "task", "--no-verify", flag }, true, "") == .err);
+    }
+}
+
+test "verifier argument allocation cleans success and every parser failure" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |malformed| {
+        var completed = false;
+        for (0..32) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            const args: []const []const u8 = if (malformed) &.{ "--verifier-arg=a", "--verifier-arg=b", "--unknown" } else &.{ "task", "words", "--verifier-arg=a", "--verifier-arg=b" };
+            const parsed = parseLoopCommand(failing.allocator(), args, true, "");
+            switch (parsed) {
+                .ok => |command| deinitParsedRun(failing.allocator(), command.run),
+                .err => {},
+            }
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            if (!failing.has_induced_failure) {
+                completed = true;
+                break;
+            }
+        }
+        try std.testing.expect(completed);
+    }
 }

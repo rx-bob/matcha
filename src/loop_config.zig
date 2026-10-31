@@ -10,6 +10,7 @@ pub const Config = struct {
     max_turns: ?u32 = null,
     prompt_file: ?[]const u8 = null,
     verifier: ?options.BackendKind = null,
+    verifier_options: options.VerifierOptions = .{},
     verify_enabled: bool = true,
     yolo: bool = false,
     token_budget: ?u64 = null,
@@ -45,7 +46,24 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, cli: options.RunOptions
     result.run.max_turns = if (cli.turn_limit_explicit) cli.max_turns else settings.max_turns;
     result.run.verifier_explicit = cli.verifier_explicit or verifier_present;
     result.run.verifier = cli.verifier orelse settings.verifier;
-    result.run.verify_enabled = if (!cli.verify_enabled) false else if (cli.verifier != null) true else settings.verify_enabled;
+    result.run.verifier_options = settings.verifier_options;
+    if (cli.verifier_options.model_explicit) {
+        result.run.verifier_options.model = cli.verifier_options.model;
+        result.run.verifier_options.model_explicit = true;
+    }
+    if (cli.verifier_options.backend_bin_explicit) {
+        result.run.verifier_options.backend_bin = if (cli.verifier_options.backend_bin) |v| try resolveExecutablePath(a, io, ".", v) else null;
+        result.run.verifier_options.backend_bin_explicit = true;
+    }
+    if (cli.verifier_options.args_explicit) {
+        result.run.verifier_options.args = cli.verifier_options.args;
+        result.run.verifier_options.args_explicit = true;
+    }
+    if (result.run.verifier_options.model) |v| result.run.verifier_options.model = try a.dupe(u8, v);
+    const verifier_args = try a.alloc([]const u8, result.run.verifier_options.args.len);
+    for (result.run.verifier_options.args, 0..) |v, i| verifier_args[i] = try a.dupe(u8, v);
+    result.run.verifier_options.args = verifier_args;
+    result.run.verify_enabled = if (!cli.verify_enabled) false else if (cli.verifier != null or cli.verifier_options.model_explicit or cli.verifier_options.backend_bin_explicit or cli.verifier_options.args_explicit) true else settings.verify_enabled;
     result.run.yolo = cli.yolo or settings.yolo;
     result.run.token_budget = cli.token_budget orelse settings.token_budget;
     result.run.timeout_seconds = cli.timeout_seconds orelse settings.timeout_seconds;
@@ -72,13 +90,13 @@ fn applyLayer(a: std.mem.Allocator, io: std.Io, settings: *Config, source: []con
         try diagnostic.print("Invalid config {s}: {s}\n", .{ source, @errorName(err) });
         return err;
     };
-    applyObject(a, settings, root, source, project, diagnostic, verifier_present, io) catch |err| {
+    applyObject(a, settings, root, source, project, diagnostic, verifier_present, io, true) catch |err| {
         try diagnostic.print("Invalid config {s}: {s}\n", .{ source, @errorName(err) });
         return err;
     };
 }
 
-fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, source: []const u8, project: bool, diagnostic: *std.Io.Writer, verifier_present: *bool, io: std.Io) !void {
+fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, source: []const u8, project: bool, diagnostic: *std.Io.Writer, verifier_present: *bool, io: std.Io, resolve_paths: bool) !void {
     if (root != .object) return error.InvalidConfigObject;
     if (root.object.get("schema_version")) |version| {
         if (version != .integer or version.integer != 1) return error.UnsupportedSchemaVersion;
@@ -95,7 +113,14 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
         const raw = entry.value_ptr.*;
-        if (std.mem.eql(u8, key, "verifier")) verifier_present.* = true;
+        if (std.mem.eql(u8, key, "verifier")) {
+            applyVerifier(a, settings, raw, source, verifier_present, io, resolve_paths, diagnostic) catch |err| {
+                try diagnostic.print("Config {s}, field verifier: {s}\n", .{ source, @errorName(err) });
+                return err;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, key, "verifier_options")) return error.UnknownField;
         if (std.mem.eql(u8, key, "max_turns") or std.mem.eql(u8, key, "token_budget") or std.mem.eql(u8, key, "timeout_seconds")) {
             if (raw != .integer and raw != .null) {
                 try diagnostic.print("Config {s}, field {s}: expected integer or null\n", .{ source, key });
@@ -136,7 +161,7 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
             try diagnostic.print("Config {s}: unknown loop field {s}\n", .{ source, key });
             return error.UnknownField;
         }
-        if (std.mem.eql(u8, key, "backend_bin")) {
+        if (resolve_paths and std.mem.eql(u8, key, "backend_bin")) {
             if (settings.backend_bin) |binary_value| {
                 settings.backend_bin = resolveExecutablePath(a, io, std.fs.path.dirname(source) orelse ".", binary_value) catch |err| {
                     try diagnostic.print("Config {s}, field backend_bin: {s}\n", .{ source, @errorName(err) });
@@ -144,12 +169,61 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
                 };
             }
         }
-        if (std.mem.eql(u8, key, "prompt_file")) {
+        if (resolve_paths and std.mem.eql(u8, key, "prompt_file")) {
             if (settings.prompt_file) |file| settings.prompt_file = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(source) orelse ".", file });
         }
         if (std.mem.eql(u8, key, "max_turns") and settings.max_turns == 0) return error.InvalidLimit;
         if (std.mem.eql(u8, key, "token_budget") and settings.token_budget == 0) return error.InvalidLimit;
         if (std.mem.eql(u8, key, "timeout_seconds") and settings.timeout_seconds == 0) return error.InvalidLimit;
+    }
+}
+
+fn applyVerifier(a: std.mem.Allocator, settings: *Config, value: std.json.Value, source: []const u8, backend_present: *bool, io: std.Io, resolve_paths: bool, diagnostic: *std.Io.Writer) !void {
+    if (value == .null) {
+        settings.verifier = null;
+        settings.verifier_options = .{};
+        backend_present.* = true;
+        return;
+    }
+    if (value == .string) {
+        settings.verifier = std.meta.stringToEnum(options.BackendKind, value.string) orelse return error.InvalidEnumTag;
+        backend_present.* = true;
+        return;
+    }
+    if (value != .object) return error.InvalidFieldType;
+    var fields = value.object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const raw = entry.value_ptr.*;
+        errdefer diagnostic.print("Config {s}, verifier.{s} is invalid\n", .{ source, key }) catch {};
+        if (std.mem.eql(u8, key, "backend")) {
+            if (raw != .string and raw != .null) return error.InvalidFieldType;
+            settings.verifier = if (raw == .null) null else std.meta.stringToEnum(options.BackendKind, raw.string) orelse return error.InvalidEnumTag;
+            backend_present.* = true;
+        } else if (std.mem.eql(u8, key, "model")) {
+            if (raw != .string and raw != .null) return error.InvalidFieldType;
+            settings.verifier_options.model = if (raw == .null) null else raw.string;
+            settings.verifier_options.model_explicit = true;
+        } else if (std.mem.eql(u8, key, "backend_bin")) {
+            if (raw != .string and raw != .null) return error.InvalidFieldType;
+            if (raw == .string and (raw.string.len == 0 or std.mem.indexOfScalar(u8, raw.string, 0) != null)) return error.InvalidExecutable;
+            settings.verifier_options.backend_bin = if (raw == .null) null else if (resolve_paths) try resolveExecutablePath(a, io, std.fs.path.dirname(source) orelse ".", raw.string) else raw.string;
+            settings.verifier_options.backend_bin_explicit = true;
+        } else if (std.mem.eql(u8, key, "args")) {
+            if (raw != .array) return error.InvalidFieldType;
+            const args = try a.alloc([]const u8, raw.array.items.len);
+            for (raw.array.items, 0..) |item, i| {
+                if (item != .string) return error.InvalidFieldType;
+                args[i] = item.string;
+            }
+            settings.verifier_options.args = args;
+            settings.verifier_options.args_explicit = true;
+        } else if (std.mem.eql(u8, key, "reasoning_effort")) {
+            if (raw != .null) return error.UnsupportedVerifierReasoning;
+        } else {
+            try diagnostic.print("Config {s}: unknown verifier field {s}\n", .{ source, key });
+            return error.UnknownField;
+        }
     }
 }
 
@@ -183,12 +257,14 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io) !std.json.Parsed(Config) {
 fn loadAtPath(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8) !std.json.Parsed(Config) {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024));
     defer allocator.free(bytes);
-    var parsed = try std.json.parseFromSlice(Config, allocator, bytes, .{ .allocate = .alloc_always });
-    if (parsed.value.schema_version != 1) {
-        parsed.deinit();
-        return error.UnsupportedSchemaVersion;
-    }
-    return parsed;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    var settings: Config = .{};
+    var verifier_present = false;
+    var diagnostic: std.Io.Writer.Allocating = .init(parsed.arena.allocator());
+    defer diagnostic.deinit();
+    try applyObject(parsed.arena.allocator(), &settings, parsed.value, config_path, false, &diagnostic.writer, &verifier_present, io, false);
+    return .{ .arena = parsed.arena, .value = settings };
 }
 
 pub fn save(allocator: std.mem.Allocator, io: std.Io, config: Config) ![]const u8 {
@@ -465,4 +541,102 @@ test "backend executable resolution preserves source base and bare names" {
     try std.testing.expect(cleared.run.backend_bin == null);
     try std.testing.expectError(error.InvalidExecutable, resolveExecutablePath(a, std.testing.io, ".", ""));
     try std.testing.expectError(error.InvalidExecutable, resolveExecutablePath(a, std.testing.io, ".", "bad\x00name"));
+}
+
+test "nested verifier patches retain presence source paths and replacement args" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const user = try std.fs.path.join(a, &.{ root, "user.json" });
+    defer a.free(user);
+    const project = try std.fs.path.join(a, &.{ root, "project.json" });
+    defer a.free(project);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user.json", .data = "{\"model\":\"worker\",\"verifier\":{\"backend\":\"agy\",\"model\":\"user-verifier\",\"backend_bin\":\"./tools/verifier with spaces\",\"args\":[\"--user\"]}}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = "{\"schema_version\":1,\"loop\":{\"verifier\":{\"model\":null,\"args\":[]}}}" });
+    var diagnostic: std.Io.Writer.Allocating = .init(a);
+    defer diagnostic.deinit();
+    var resolved = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task" }, user, project, &diagnostic.writer);
+    defer resolved.deinit();
+    try std.testing.expectEqual(options.BackendKind.agy, resolved.run.verifier.?);
+    try std.testing.expect(resolved.run.verifier_options.model_explicit);
+    try std.testing.expect(resolved.run.verifier_options.model == null);
+    try std.testing.expectEqual(@as(usize, 0), resolved.run.verifier_options.args.len);
+    try std.testing.expect(resolved.run.verifier_options.args_explicit);
+    const expected = try resolveExecutablePath(a, std.testing.io, root, "./tools/verifier with spaces");
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved.run.verifier_options.backend_bin.?);
+    const parsed = options.parseLoopCommand(a, &.{ "task", "--verifier-model=cli", "--verifier-bin=", "--verifier-arg=--cli", "--verifier-arg", "value", "--", "--worker" }, true, "");
+    defer options.deinitParsedRun(a, parsed.ok.run);
+    var overridden = try resolve(a, std.testing.io, parsed.ok.run, user, project, &diagnostic.writer);
+    defer overridden.deinit();
+    try std.testing.expectEqualStrings("cli", overridden.run.verifier_options.model.?);
+    try std.testing.expect(overridden.run.verifier_options.backend_bin_explicit);
+    try std.testing.expect(overridden.run.verifier_options.backend_bin == null);
+    try std.testing.expectEqual(@as(usize, 2), overridden.run.verifier_options.args.len);
+    try std.testing.expectEqualStrings("--cli", overridden.run.verifier_options.args[0]);
+    try std.testing.expectEqualStrings("--worker", overridden.run.extra_backend_args[0]);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = "{\"schema_version\":1,\"loop\":{\"verifier\":null}}" });
+    var cleared = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task" }, user, project, &diagnostic.writer);
+    defer cleared.deinit();
+    try std.testing.expect(cleared.run.verifier == null);
+    try std.testing.expect(!cleared.run.verifier_options.model_explicit);
+    try std.testing.expect(!cleared.run.verifier_options.backend_bin_explicit);
+}
+
+test "nested verifier validation is strict and interactive edits preserve raw paths" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/loop.json", .{tmp.sub_path});
+    defer a.free(source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "loop.json", .data = "{\"verifier\":{\"backend\":\"droid\",\"model\":null,\"backend_bin\":\"./relative tool\",\"args\":[\"--literal\"]}}" });
+    var loaded = try loadAtPath(a, std.testing.io, source);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("./relative tool", loaded.value.verifier_options.backend_bin.?);
+    var edited = loaded.value;
+    edited.model = "worker-edit";
+    const saved = try saveAtPath(a, std.testing.io, try a.dupe(u8, source), edited);
+    defer a.free(saved);
+    var after = try loadAtPath(a, std.testing.io, source);
+    defer after.deinit();
+    try std.testing.expect(after.value.verifier_options.model_explicit);
+    try std.testing.expect(after.value.verifier_options.model == null);
+    try std.testing.expectEqualStrings("./relative tool", after.value.verifier_options.backend_bin.?);
+    try std.testing.expectEqualStrings("--literal", after.value.verifier_options.args[0]);
+    const cases = [_]struct { json: []const u8, err: anyerror }{
+        .{ .json = "{\"verifier\":{\"bogus\":true}}", .err = error.UnknownField },
+        .{ .json = "{\"verifier\":{\"model\":[65]}}", .err = error.InvalidFieldType },
+        .{ .json = "{\"verifier\":{\"backend\":\"1\"}}", .err = error.InvalidEnumTag },
+        .{ .json = "{\"verifier\":{\"args\":[12]}}", .err = error.InvalidFieldType },
+        .{ .json = "{\"verifier\":{\"reasoning_effort\":\"high\"}}", .err = error.UnsupportedVerifierReasoning },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "loop.json", .data = case.json });
+        try std.testing.expectError(case.err, loadAtPath(a, std.testing.io, source));
+    }
+}
+
+test "nested verifier resolved allocations clean partial failures" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/loop.json", .{tmp.sub_path});
+    defer a.free(source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "loop.json", .data = "{\"schema_version\":1,\"loop\":{\"verifier\":{\"model\":\"verifier\",\"backend_bin\":\"./tool\",\"args\":[\"--one\",\"two\"]}}}" });
+    var diagnostic: std.Io.Writer.Allocating = .init(a);
+    defer diagnostic.deinit();
+    var succeeded = false;
+    for (0..128) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        if (resolve(failing.allocator(), std.testing.io, .{ .backend = .codex, .prompt = "task" }, null, source, &diagnostic.writer)) |result| {
+            var owned = result;
+            owned.deinit();
+            succeeded = true;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (succeeded and !failing.has_induced_failure) break;
+    }
+    try std.testing.expect(succeeded);
 }

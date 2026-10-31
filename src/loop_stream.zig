@@ -79,6 +79,7 @@ pub const Presenter = struct {
     final_summary: ?[]const u8 = null,
     io: ?std.Io = null,
     model: ?[]const u8 = null,
+    owned_role_model: ?[]const u8 = null,
     max_turns: ?u32 = null,
     elapsed_base_seconds: u64 = 0,
     status_started_at: ?std.Io.Timestamp = null,
@@ -113,6 +114,7 @@ pub const Presenter = struct {
     pub fn deinit(self: *Presenter) void {
         self.stopStatusTicker();
         self.stopInputReader();
+        defer if (self.owned_role_model) |model| self.allocator.free(model);
         if (self.io) |io| self.output_mutex.lockUncancelable(io);
         self.endTerminalUi() catch {};
         if (self.io) |io| self.output_mutex.unlock(io);
@@ -132,6 +134,18 @@ pub const Presenter = struct {
         self.max_turns = max_turns;
         self.elapsed_base_seconds = elapsed_base_seconds;
         self.status_started_at = std.Io.Clock.awake.now(io);
+    }
+
+    pub fn configureExecution(self: *Presenter, role: store.TurnRole, backend: BackendKind, model: ?[]const u8) !void {
+        const owned = if (model) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned) |value| self.allocator.free(value);
+        try self.lockOutput();
+        defer self.unlockOutput();
+        if (self.owned_role_model) |previous| self.allocator.free(previous);
+        self.owned_role_model = owned;
+        self.model = owned;
+        self.backend = backend;
+        self.role = role;
     }
 
     pub fn loopStarted(self: *Presenter) !void {
@@ -160,7 +174,7 @@ pub const Presenter = struct {
         try self.updateStatusBar();
         switch (self.mode) {
             .live => {
-                try self.printState("=== [loop {s} | turn {d} | {s}:{s} | {d} tok] ===\n", .{ self.loop_id, turn_number, @tagName(role), @tagName(self.backend), tokens_used });
+                try self.printState("=== [loop {s} | turn {d} | {s}:{s} | model={s} | {d} tok] ===\n", .{ self.loop_id, turn_number, @tagName(role), @tagName(self.backend), self.model orelse "default", tokens_used });
                 try self.flush();
             },
             .quiet => {
@@ -173,6 +187,7 @@ pub const Presenter = struct {
                 .turn = turn_number,
                 .role = @tagName(role),
                 .backend = @tagName(self.backend),
+                .model = self.model,
                 .tokens_used = tokens_used,
             }),
         }
@@ -288,6 +303,7 @@ pub const Presenter = struct {
                 .turn = self.turn_number,
                 .role = @tagName(self.role),
                 .backend = @tagName(self.backend),
+                .model = self.model,
                 .status = @tagName(status),
                 .tokens_used = tokens_used,
                 .elapsed_ms = elapsed_ms,
@@ -1144,7 +1160,7 @@ test "live, quiet, and json presenters format same turn events" {
     const json = try renderPresenterForTest(.json);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, live, "=== [loop loop-test | turn 2 | worker:codex | 100 tok] ===") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "=== [loop loop-test | turn 2 | worker:codex | model=default | 100 tok] ===") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "  -> Read: /repo/src/main.zig") == null);
     try std.testing.expect(std.mem.indexOf(u8, live, "  assistant: \"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "| 112 tok | 35 ms]") != null);
@@ -1344,4 +1360,24 @@ test "plain live command output flushes only the last three before assistant res
     }
     try presenter.handleEvent(.{ .assistant_text = "done" });
     try std.testing.expectEqualStrings("Ran b\nRan c\nRan d\n  assistant: \"done\"\n", output.written());
+}
+
+test "presenter reflects role backend model and owns changing model text" {
+    const a = std.testing.allocator;
+    for ([_]options.OutputMode{ .live, .json }) |mode| {
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var presenter = Presenter.init(a, &output.writer, mode, "roles", .codex);
+        defer presenter.deinit();
+        try presenter.configureExecution(.worker, .codex, "worker-model");
+        try presenter.turnStarted(1, .worker, 0);
+        const model = try a.dupe(u8, "verifier-model");
+        try presenter.configureExecution(.verifier, .agy, model);
+        @memset(model, 'x');
+        a.free(model);
+        try presenter.turnStarted(2, .verifier, 1);
+        try presenter.turnCompleted(.complete, 2, 10);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "verifier-model") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), if (mode == .json) "\"backend\":\"agy\"" else "verifier:agy") != null);
+    }
 }

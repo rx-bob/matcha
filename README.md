@@ -113,7 +113,7 @@ retain the flat JSON format at `$XDG_CONFIG_HOME/matcha/loop.json` (otherwise
 file and preserves other supported settings.
 
 Supported loop fields are `backend`, `backend_bin`, `model`, `max_turns`, `prompt_file`,
-`verifier` (backend name), `verify_enabled`, `yolo`, `token_budget`,
+`verifier` (object; legacy backend names remain accepted), `verify_enabled`, `yolo`, `token_budget`,
 `timeout_seconds`, `output_mode` (`live`, `quiet`, `json`), and
 `extra_backend_args`. Unknown fields, invalid types, unsupported versions, and
 nonpositive configured limits fail before execution. Omitted fields inherit;
@@ -146,9 +146,53 @@ command; pass extra arguments after `--`.
 Bare names resolve on the effective child PATH at invocation time. Values with
 a path separator resolve relative to their config file, or the launch directory
 for CLI values. Snapshots retain that selection across retries and resume.
-A verifier using the worker's backend shares its selected executable; a different
-backend uses its own standard executable. Native session attach hints quote the
+An omitted verifier executable inherits the worker selection only when both
+roles use the same backend; a different backend uses its own standard executable. Native session attach hints quote the
 selected executable, and interactive model discovery uses it when retaining the
 saved backend selection. Executable versions and wrappers must support the
 existing backend adapter's flags and protocol; Matcha does not install or probe
 agent builds by running trial tasks.
+
+
+### Verifier overrides
+
+New loops keep worker arguments after `--` separate from verifier arguments.
+Use repeatable `--verifier-arg=VALUE` to supply verifier arguments literally,
+including values beginning with `-`. CLI verifier arguments replace the configured
+array. `--verifier-model MODEL` and `--verifier-bin EXECUTABLE` override the other
+role settings. Empty equals forms (`--verifier-model=` / `--verifier-bin=`)
+explicitly select the backend's native model/default executable. Explicit verifier
+CLI options conflict with `--no-verify`.
+
+```json
+{
+  "schema_version": 1,
+  "loop": {
+    "backend": "codex",
+    "model": "worker-model",
+    "verifier": {
+      "backend": "agy",
+      "model": null,
+      "backend_bin": "./tools/verifier",
+      "args": ["--example", "literal value"]
+    }
+  }
+}
+```
+
+Verifier objects merge by field across config layers. Omitted model and executable
+inherit worker choices for the same backend, and use native defaults for a
+different backend. Explicit `null` selects native defaults and retains that
+choice when worker settings change. Arrays replace; `args: []` clears inherited
+verifier arguments. `verifier: null` resets the entire verifier configuration.
+Verifier paths resolve relative to the defining config; CLI paths use launch cwd.
+`reasoning_effort` is reserved: non-null values are rejected until reasoning
+controls are implemented.
+
+Both enabled roles undergo executable checks before the first worker starts and
+before resume changes state. Disabled verification skips verifier checks. Roles
+share environment, permission policy, cwd, and loop callback identity; verifier
+sessions remain fresh. Live and JSON turn status identify the executing backend
+and model. New snapshots retain override presence and isolated arguments; older
+snapshots keep their historical shared model and arguments across resume and
+callback updates.

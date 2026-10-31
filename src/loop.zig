@@ -97,6 +97,8 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         .backend_bin = run_options.backend_bin,
         .verifier_backend = run_options.verifier,
         .verifier_override_present = run_options.verifier_explicit,
+        .verifier_options = run_options.verifier_options,
+        .separate_verifier_settings = true,
         .verify_enabled = run_options.verify_enabled,
         .model = run_options.model,
         .output_mode = run_options.output_mode,
@@ -110,6 +112,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         .timeout_seconds = run_options.timeout_seconds,
         .extra_args = run_options.extra_backend_args,
     };
+    preflightRoles(services, state) catch return .failure;
     try services.store.createLoop(state);
 
     return runExisting(services, run_options, id);
@@ -130,6 +133,7 @@ pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !E
             try stderr.flush();
         }
     }
+    preflightRoles(services, state) catch return .failure;
     state.status = .active;
     // Upgrade only on resume, when state is already being changed and saved.
     // Listing and inspection leave legacy files byte-for-byte untouched.
@@ -151,6 +155,7 @@ fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
         .backend_bin = state.backend_bin,
         .verifier = state.verifier_backend,
         .verifier_explicit = state.verifier_override_present or state.verifier_backend != null,
+        .verifier_options = state.verifier_options,
         .verify_enabled = state.verify_enabled,
         .model = state.model,
         .yolo = state.yolo,
@@ -161,6 +166,41 @@ fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
         .prompt = state.objective,
         .extra_backend_args = state.extra_args,
     };
+}
+
+/// Resolve role settings from the current snapshot; inherited values track worker edits.
+pub fn roleSettings(state: store_mod.LoopState, role: store_mod.TurnRole) backend.BackendOptions {
+    const selected = if (role == .verifier) state.verifier_backend orelse state.backend else state.backend;
+    const same_backend = selected == state.backend;
+    const worker: backend.BackendOptions = .{ .backend = selected, .backend_bin = if (same_backend) state.backend_bin else null, .model = state.model, .yolo = state.yolo, .extra_args = state.extra_args };
+    if (role == .worker) return worker;
+    const verifier = state.verifier_options;
+    return .{
+        .backend = selected,
+        .backend_bin = if (verifier.backend_bin_explicit) verifier.backend_bin else if (same_backend) state.backend_bin else null,
+        .model = if (verifier.model_explicit) verifier.model else if (same_backend or !state.separate_verifier_settings) state.model else null,
+        .yolo = state.yolo,
+        .extra_args = if (verifier.args_explicit or state.separate_verifier_settings) verifier.args else state.extra_args,
+    };
+}
+
+fn preflightRoles(services: Services, state: store_mod.LoopState) !void {
+    var environment = try backend.buildChildEnvironment(services.allocator, services.io, services.parent_environment, state.id);
+    defer environment.deinit();
+    for ([_]store_mod.TurnRole{ .worker, .verifier }) |role| {
+        if (role == .verifier and !state.verify_enabled) continue;
+        services.runner.preflight(.{
+            .allocator = services.allocator,
+            .io = services.io,
+            .config = roleSettings(state, role),
+            .environ_map = &environment.map,
+            .cwd = state.cwd,
+            .diagnostics = services.stderr,
+        }) catch |err| {
+            if (services.stderr) |writer| try writer.print("Cannot start {s}: {s}\n", .{ @tagName(role), @errorName(err) });
+            return err;
+        };
+    }
 }
 
 test "resume options come only from captured snapshot, including legacy shared verifier settings" {
@@ -245,7 +285,8 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
 
         const role: store_mod.TurnRole = if (current.status == .verifying) .verifier else .worker;
         const turn_number = current.turns_completed +| 1;
-        const turn_backend: backend.BackendKind = if (role == .verifier) current.verifier_backend orelse current.backend else current.backend;
+        const execution = roleSettings(current, role);
+        const turn_backend = execution.backend;
         const session_id: ?[]const u8 = if (role == .verifier) null else current.worker_session_id;
         if (role == .worker and current.turns_completed > 0 and session_id == null) {
             try services.stdout.print("Loop {s} cannot continue: backend did not provide a worker session ID.\n", .{id});
@@ -278,18 +319,13 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
         defer allocator.free(loop_dir);
         const prompt_file = try std.fmt.allocPrint(allocator, "{s}{c}current_prompt.md", .{ loop_dir, std.Io.Dir.path.sep });
         defer allocator.free(prompt_file);
-        var argv = try backend.buildArgv(allocator, .{
-            .backend = turn_backend,
-            .backend_bin = if (turn_backend == current.backend) current.backend_bin else null,
-            .model = current.model,
-            .yolo = current.yolo,
-            .extra_args = current.extra_args,
-        }, loop_dir, session_id, prompt_file);
+        var argv = try backend.buildArgv(allocator, execution, loop_dir, session_id, prompt_file);
         defer argv.deinit();
         var child_environment = try backend.buildChildEnvironment(allocator, services.io, services.parent_environment, id);
         defer child_environment.deinit();
 
         const started_ms = nowMilliseconds(services);
+        try presenter.configureExecution(role, execution.backend, execution.model);
         try presenter.turnStarted(turn_number, role, current.tokens_used);
         var persist_context = PersistSessionContext{ .store = services.store, .loop_id = id };
         var request = backend.TurnRequest{
@@ -1123,6 +1159,7 @@ const FakeClock = struct {
 };
 
 const FakeCall = struct {
+    argv_json: []u8,
     executable: []u8,
     backend: backend.BackendKind,
     is_verifier: bool,
@@ -1132,6 +1169,7 @@ const FakeCall = struct {
     fn deinit(self: *FakeCall, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
         allocator.free(self.executable);
+        allocator.free(self.argv_json);
     }
 };
 
@@ -1140,15 +1178,24 @@ const FakeRunner = struct {
     script: []const FakeStep,
     calls: std.ArrayList(FakeCall) = .empty,
     next_step: usize = 0,
+    preflight_calls: std.ArrayList(backend.BackendKind) = .empty,
+    fail_second_preflight: bool = false,
     tokens_per_turn: u64 = 10,
     clock: ?*FakeClock = null,
     advance_clock_ms: u64 = 0,
 
     fn runner(self: *FakeRunner) backend.BackendRunner {
-        return .{ .context = @ptrCast(self), .runTurnFn = FakeRunner.runTurn };
+        return .{ .context = @ptrCast(self), .runTurnFn = FakeRunner.runTurn, .preflightFn = FakeRunner.preflight };
+    }
+
+    fn preflight(context: *anyopaque, request: backend.PreflightRequest) anyerror!void {
+        const self: *FakeRunner = @ptrCast(@alignCast(context));
+        try self.preflight_calls.append(self.store.allocator, request.config.backend);
+        if (self.fail_second_preflight and self.preflight_calls.items.len == 2) return error.FakeVerifierUnavailable;
     }
 
     fn deinit(self: *FakeRunner, allocator: std.mem.Allocator) void {
+        self.preflight_calls.deinit(allocator);
         for (self.calls.items) |*call| call.deinit(allocator);
         self.calls.deinit(allocator);
     }
@@ -1159,6 +1206,9 @@ const FakeRunner = struct {
         const step = self.script[self.next_step];
         self.next_step += 1;
         const is_verifier = step == .verifier_reject or step == .verifier_no_verdict or step == .verifier_pass;
+        try std.testing.expectEqual(!is_verifier, request.on_session_id != null);
+        try std.testing.expectEqualStrings(request.loop_id, request.environ_map.get("MATCHA_LOOP_ID").?);
+        if (request.environ_map.get("ROLE_TEST")) |value| try std.testing.expectEqualStrings("shared-value", value);
         const has_session_flag = switch (request.backend) {
             .codex => argvHas(request.argv, "resume"),
             .droid => argvHas(request.argv, "-s"),
@@ -1169,7 +1219,10 @@ const FakeRunner = struct {
             errdefer self.store.allocator.free(executable);
             const prompt = try self.store.allocator.dupe(u8, request.prompt);
             errdefer self.store.allocator.free(prompt);
+            const argv_json = try std.json.Stringify.valueAlloc(self.store.allocator, request.argv, .{});
+            errdefer self.store.allocator.free(argv_json);
             try self.calls.append(self.store.allocator, .{
+                .argv_json = argv_json,
                 .executable = executable,
                 .backend = request.backend,
                 .is_verifier = is_verifier,
@@ -1362,5 +1415,98 @@ test "custom executable survives retries continuation and resume with role isola
             defer state.deinit();
             try std.testing.expectEqualStrings("/custom/tool with spaces", state.value.backend_bin.?);
         }
+    }
+}
+
+test "role settings distinguish inherited native and explicit choices with legacy compatibility" {
+    var state: store_mod.LoopState = .{ .id = "role", .backend = .codex, .backend_bin = "/worker", .model = "worker-model", .cwd = "/repo", .objective = "task", .started_at_ms = 1, .updated_at_ms = 1, .yolo = true, .extra_args = &.{"--worker-only"}, .separate_verifier_settings = true };
+    const same = roleSettings(state, .verifier);
+    try std.testing.expectEqualStrings("worker-model", same.model.?);
+    try std.testing.expectEqualStrings("/worker", same.backend_bin.?);
+    try std.testing.expectEqual(@as(usize, 0), same.extra_args.len);
+    state.model = "updated-worker";
+    try std.testing.expectEqualStrings("updated-worker", roleSettings(state, .verifier).model.?);
+    state.verifier_options = .{ .model_explicit = true, .backend_bin_explicit = true, .args = &.{ "--verifier-only", "literal arg" }, .args_explicit = true };
+    const native = roleSettings(state, .verifier);
+    try std.testing.expect(native.model == null);
+    try std.testing.expect(native.backend_bin == null);
+    try std.testing.expectEqualStrings("literal arg", native.extra_args[1]);
+    state.verifier_options.model = "verifier-model";
+    state.verifier_options.backend_bin = "/verifier";
+    state.model = "changed-again";
+    try std.testing.expectEqualStrings("verifier-model", roleSettings(state, .verifier).model.?);
+    state.verifier_backend = .agy;
+    state.verifier_options = .{};
+    const different = roleSettings(state, .verifier);
+    try std.testing.expect(different.model == null and different.backend_bin == null);
+    try std.testing.expect(different.yolo);
+    state.separate_verifier_settings = false;
+    const legacy = roleSettings(state, .verifier);
+    try std.testing.expectEqualStrings("changed-again", legacy.model.?);
+    try std.testing.expectEqualStrings("--worker-only", legacy.extra_args[0]);
+    try std.testing.expect(legacy.backend_bin == null);
+}
+
+test "new worker and verifier execute isolated arguments after preflight" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |different| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try store_mod.Store.init(a, std.testing.io, root);
+        defer store.deinit();
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("ROLE_TEST", "shared-value");
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var fake = FakeRunner{ .store = &store, .script = &.{ .worker_complete, .verifier_pass } };
+        defer fake.deinit(a);
+        const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer };
+        try std.testing.expectEqual(ExitCode.ok, try run(services, .{ .backend = .codex, .backend_bin = "/worker", .model = "worker-model", .verifier = if (different) .agy else .codex, .verifier_options = .{ .model = "verifier-model", .model_explicit = true, .backend_bin = "/verifier", .backend_bin_explicit = true, .args = &.{ "--example", "literal --value" }, .args_explicit = true }, .extra_backend_args = &.{"--worker-only"}, .prompt = "task", .output_mode = .json }));
+        try std.testing.expectEqual(@as(usize, 2), fake.preflight_calls.items.len);
+        try std.testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+        const worker = try std.json.parseFromSlice([]const []const u8, a, fake.calls.items[0].argv_json, .{});
+        defer worker.deinit();
+        const verifier = try std.json.parseFromSlice([]const []const u8, a, fake.calls.items[1].argv_json, .{});
+        defer verifier.deinit();
+        try std.testing.expect(argvHas(worker.value, "--worker-only"));
+        try std.testing.expect(!argvHas(worker.value, "--example"));
+        try std.testing.expect(!argvHas(verifier.value, "--worker-only"));
+        try std.testing.expect(argvHas(verifier.value, "--example"));
+        try std.testing.expect(argvHas(verifier.value, "literal --value"));
+        try std.testing.expect(argvHas(verifier.value, "verifier-model"));
+        try std.testing.expectEqualStrings("/verifier", verifier.value[0]);
+        try std.testing.expect(fake.calls.items[1].session_id_absent);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"model\":\"verifier-model\"") != null);
+    }
+}
+
+test "disabled verifier skips preflight and failing enabled preflight creates no loop" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |enabled| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try store_mod.Store.init(a, std.testing.io, root);
+        defer store.deinit();
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var fake = FakeRunner{ .store = &store, .script = &.{.worker_complete}, .fail_second_preflight = true };
+        defer fake.deinit(a);
+        const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer };
+        try std.testing.expectEqual(if (enabled) ExitCode.failure else ExitCode.ok, try run(services, .{ .backend = .codex, .verifier = .agy, .verify_enabled = enabled, .prompt = "task", .output_mode = .quiet }));
+        try std.testing.expectEqual(@as(usize, if (enabled) 2 else 1), fake.preflight_calls.items.len);
+        try std.testing.expectEqual(@as(usize, if (enabled) 0 else 1), fake.calls.items.len);
+        const ids = try store.listLoopIds();
+        defer {
+            for (ids) |id| a.free(id);
+            a.free(ids);
+        }
+        try std.testing.expectEqual(@as(usize, if (enabled) 0 else 1), ids.len);
     }
 }

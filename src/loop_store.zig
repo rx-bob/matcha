@@ -14,6 +14,9 @@ pub const LoopState = struct {
     backend_bin: ?[]const u8 = null,
     verifier_backend: ?options.BackendKind = null,
     verifier_override_present: bool = false,
+    verifier_options: options.VerifierOptions = .{},
+    // Missing in old state: retain historical shared model and arguments.
+    separate_verifier_settings: bool = false,
     verify_enabled: bool = true,
     model: ?[]const u8 = null,
     output_mode: options.OutputMode = .live,
@@ -263,6 +266,8 @@ test "store creates and round-trips every state field with atomic overwrite" {
         .backend = .codex,
         .verifier_backend = .agy,
         .verifier_override_present = true,
+        .separate_verifier_settings = true,
+        .verifier_options = .{ .model_explicit = true, .backend_bin = "/verifier tool", .backend_bin_explicit = true, .args = &.{"--verify-only"}, .args_explicit = true },
         .backend_bin = "/tools/my backend",
         .model = "model \"quoted\"",
         .output_mode = .quiet,
@@ -292,6 +297,13 @@ test "store creates and round-trips every state field with atomic overwrite" {
     try std.testing.expectEqualStrings(state.backend_bin.?, loaded.value.backend_bin.?);
     try std.testing.expectEqual(state.verifier_backend, loaded.value.verifier_backend);
     try std.testing.expectEqual(state.verifier_override_present, loaded.value.verifier_override_present);
+    try std.testing.expect(loaded.value.separate_verifier_settings);
+    try std.testing.expect(loaded.value.verifier_options.model_explicit);
+    try std.testing.expect(loaded.value.verifier_options.model == null);
+    try std.testing.expectEqualStrings("/verifier tool", loaded.value.verifier_options.backend_bin.?);
+    try std.testing.expect(loaded.value.verifier_options.backend_bin_explicit);
+    try std.testing.expectEqualStrings("--verify-only", loaded.value.verifier_options.args[0]);
+    try std.testing.expect(loaded.value.verifier_options.args_explicit);
     try std.testing.expectEqual(state.output_mode, loaded.value.output_mode);
     try std.testing.expectEqual(state.verify_enabled, loaded.value.verify_enabled);
     try std.testing.expectEqualStrings(state.model.?, loaded.value.model.?);
@@ -344,6 +356,7 @@ test "store reads legacy version one snapshots with historical shared execution 
     try std.testing.expectEqualStrings("shared-model", legacy.value.model.?);
     try std.testing.expectEqualStrings("shared-arg", legacy.value.extra_args[0]);
     try std.testing.expect(legacy.value.verify_enabled);
+    try std.testing.expect(!legacy.value.separate_verifier_settings);
     try std.testing.expectEqual(@as(u32, 0), legacy.value.turns_completed);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "legacy-0001/state.json",

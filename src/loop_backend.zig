@@ -43,10 +43,24 @@ pub const TurnExecutionResult = struct {
     }
 };
 
+pub const PreflightRequest = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: BackendOptions,
+    environ_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    diagnostics: ?*std.Io.Writer = null,
+};
+
 /// Injectable backend runner, matching the callback shape used by CLI runners.
 pub const BackendRunner = struct {
     context: *anyopaque,
     runTurnFn: *const fn (context: *anyopaque, request: TurnRequest) anyerror!TurnExecutionResult,
+    preflightFn: ?*const fn (context: *anyopaque, request: PreflightRequest) anyerror!void = null,
+
+    pub fn preflight(self: BackendRunner, request: PreflightRequest) !void {
+        if (self.preflightFn) |check| try check(self.context, request);
+    }
 
     pub fn runTurn(self: BackendRunner, request: TurnRequest) anyerror!TurnExecutionResult {
         return self.runTurnFn(self.context, request);
@@ -55,7 +69,17 @@ pub const BackendRunner = struct {
 
 pub const RealBackendRunner = struct {
     pub fn runner(self: *RealBackendRunner) BackendRunner {
-        return .{ .context = @ptrCast(self), .runTurnFn = RealBackendRunner.runTurn };
+        return .{ .context = @ptrCast(self), .runTurnFn = RealBackendRunner.runTurn, .preflightFn = RealBackendRunner.preflight };
+    }
+
+    fn preflight(_: *anyopaque, request: PreflightRequest) !void {
+        checkExecutable(request) catch |err| {
+            if (request.diagnostics) |writer| {
+                try writer.print("Cannot use backend executable '{s}': {s}\n", .{ request.config.backend_bin orelse @tagName(request.config.backend), @errorName(err) });
+                try writer.flush();
+            }
+            return err;
+        };
     }
 
     fn runTurn(context: *anyopaque, request: TurnRequest) anyerror!TurnExecutionResult {
@@ -63,6 +87,37 @@ pub const RealBackendRunner = struct {
         return executeTurn(request);
     }
 };
+
+/// Validate each enabled role before starting work; spawning still validates again.
+fn checkExecutable(request: PreflightRequest) !void {
+    const command = request.config.backend_bin orelse @tagName(request.config.backend);
+    if (command.len == 0 or std.mem.indexOfScalar(u8, command, 0) != null) return error.InvalidExecutable;
+    if (std.mem.indexOfScalar(u8, command, '/') != null) return checkCandidate(request, command);
+    var entries = std.mem.splitScalar(u8, request.environ_map.get("PATH") orelse "/usr/local/bin:/bin:/usr/bin", ':');
+    var denied = false;
+    while (entries.next()) |entry| {
+        const candidate = try std.fmt.allocPrint(request.allocator, "{s}/{s}", .{ if (entry.len == 0) "." else entry, command });
+        defer request.allocator.free(candidate);
+        checkCandidate(request, candidate) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue,
+            error.AccessDenied, error.PermissionDenied, error.NotExecutable => {
+                denied = true;
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+    return if (denied) error.AccessDenied else error.FileNotFound;
+}
+
+fn checkCandidate(request: PreflightRequest, candidate: []const u8) !void {
+    const resolved = try std.fs.path.resolve(request.allocator, &.{ request.cwd, candidate });
+    defer request.allocator.free(resolved);
+    const stat = try std.Io.Dir.cwd().statFile(request.io, resolved, .{});
+    if (stat.kind != .file) return error.NotExecutable;
+    try std.Io.Dir.cwd().access(request.io, resolved, .{ .execute = true });
+}
 
 /// Zig's spawn searches the parent PATH even with an explicit child environment.
 /// Try literal path candidates so the actual child PATH determines selection.
@@ -834,4 +889,33 @@ test "custom wrapper launches literally through effective child PATH and reports
     try env.put("PATH", dir);
     const missing_argv = [_][]const u8{"sh"};
     try std.testing.expectError(error.BackendNotFound, executeTurn(.{ .allocator = a, .io = io, .backend = .codex, .argv = &missing_argv, .environ_map = &env, .loop_id = "fixture", .loop_dir = dir, .prompt = "prompt", .diagnostics = &diag.writer }));
+}
+
+test "preflight checks selected executable without running it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    defer a.free(cwd);
+    const root = try std.fs.path.resolve(a, &.{ cwd, ".zig-cache/tmp", &tmp.sub_path });
+    defer a.free(root);
+    const file = try tmp.dir.createFile(io, "verifier wrapper", .{ .permissions = .executable_file });
+    try file.writeStreamingAll(io, "#!/bin/sh\ntouch should-not-run\n");
+    file.close(io);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("PATH", ".");
+    var diagnostics: std.Io.Writer.Allocating = .init(a);
+    defer diagnostics.deinit();
+    var real: RealBackendRunner = .{};
+    var request: PreflightRequest = .{ .allocator = a, .io = io, .config = .{ .backend = .codex, .backend_bin = "verifier wrapper" }, .environ_map = &env, .cwd = root, .diagnostics = &diagnostics.writer };
+    try real.runner().preflight(request);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "should-not-run", .{}));
+    request.config.backend_bin = "missing verifier";
+    try std.testing.expectError(error.FileNotFound, real.runner().preflight(request));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "missing verifier") != null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "no-execute", .data = "#!/bin/sh\n" });
+    request.config.backend_bin = "./no-execute";
+    try std.testing.expectError(error.AccessDenied, real.runner().preflight(request));
 }
