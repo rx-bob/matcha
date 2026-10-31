@@ -1,6 +1,7 @@
 const std = @import("std");
 const options = @import("loop_options.zig");
 const stream = @import("loop_stream.zig");
+const loop_log = @import("loop_log.zig");
 
 pub const BackendKind = options.BackendKind;
 
@@ -24,6 +25,7 @@ pub const TurnRequest = struct {
     child_context: ?*anyopaque = null,
     on_child_id: ?OnChildId = null,
     diagnostics: ?*std.Io.Writer = null,
+    log_pair: ?*loop_log.Pair = null,
 };
 
 pub const TurnExecutionResult = struct {
@@ -186,7 +188,7 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     const stdout_file = child.stdout orelse return error.MissingChildStdout;
     const stderr_file = child.stderr orelse return error.MissingChildStderr;
 
-    var stderr_drain = StderrDrain.init(request.io, stderr_file);
+    var stderr_drain = StderrDrain.init(request.io, stderr_file, request.log_pair, request.loop_id);
     var stderr_thread = try std.Thread.spawn(.{}, StderrDrain.run, .{&stderr_drain});
     var stdin_write = StdinWrite.init(request.io, stdin_file, request.prompt);
     var stdin_thread = std.Thread.spawn(.{}, StdinWrite.run, .{&stdin_write}) catch |err| {
@@ -204,7 +206,7 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     };
     var stdout_buffer: [8192]u8 = undefined;
     var stdout_reader = stdout_file.readerStreaming(request.io, &stdout_buffer);
-    const stream_result = stream.readStream(request.allocator, &stdout_reader.interface, request.backend, &accumulator, &callback_state, StreamCallbackState.handle);
+    const stream_result = stream.readStreamRaw(request.allocator, &stdout_reader.interface, request.backend, &accumulator, &callback_state, StreamCallbackState.handle, @ptrCast(@constCast(&request)), if (request.log_pair != null) rawStdout else null);
 
     stdin_thread.join();
     stderr_thread.join();
@@ -265,6 +267,11 @@ const StreamCallbackState = struct {
     }
 };
 
+fn rawStdout(context: ?*anyopaque, bytes: []const u8) anyerror!void {
+    const request: *const TurnRequest = @ptrCast(@alignCast(context.?));
+    if (request.log_pair) |pair| try pair.raw(request.io, request.loop_id, "stdout", bytes);
+}
+
 const StdinWrite = struct {
     io: std.Io,
     file: std.Io.File,
@@ -290,9 +297,11 @@ const StderrDrain = struct {
     start: usize = 0,
     len: usize = 0,
     read_error: bool = false,
+    log_pair: ?*loop_log.Pair,
+    loop_id: []const u8,
 
-    fn init(io: std.Io, file: std.Io.File) StderrDrain {
-        return .{ .io = io, .file = file };
+    fn init(io: std.Io, file: std.Io.File, log_pair: ?*loop_log.Pair, loop_id: []const u8) StderrDrain {
+        return .{ .io = io, .file = file, .log_pair = log_pair, .loop_id = loop_id };
     }
 
     fn run(self: *StderrDrain) void {
@@ -306,6 +315,10 @@ const StderrDrain = struct {
                 },
             };
             if (count == 0) break;
+            if (self.log_pair) |pair| pair.raw(self.io, self.loop_id, "stderr", buffer[0..count]) catch {
+                self.read_error = true;
+                break;
+            };
             self.append(buffer[0..count]);
         }
         self.file.close(self.io);

@@ -45,6 +45,7 @@ pub const TurnAccumulator = struct {
 };
 
 pub const EventHandler = *const fn (?*anyopaque, NormalizedEvent) void;
+pub const RawHandler = *const fn (?*anyopaque, []const u8) anyerror!void;
 
 pub const StreamError = std.Io.Reader.StreamError || std.mem.Allocator.Error;
 
@@ -742,7 +743,20 @@ pub fn readStream(
     accumulator: *TurnAccumulator,
     context: ?*anyopaque,
     handler: EventHandler,
-) StreamError!void {
+) anyerror!void {
+    return readStreamRaw(allocator, reader, backend, accumulator, context, handler, null, null);
+}
+
+pub fn readStreamRaw(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    backend: BackendKind,
+    accumulator: *TurnAccumulator,
+    context: ?*anyopaque,
+    handler: EventHandler,
+    raw_context: ?*anyopaque,
+    raw_handler: ?RawHandler,
+) anyerror!void {
     var line_arena = std.heap.ArenaAllocator.init(allocator);
     defer line_arena.deinit();
 
@@ -764,6 +778,11 @@ pub fn readStream(
 
         const line = std.mem.trimEnd(u8, line_writer.written(), "\r");
         if (at_eof and line.len == 0) return;
+        if (raw_handler) |raw| {
+            const bytes = line_writer.written();
+            try raw(raw_context, bytes);
+            if (!at_eof) try raw(raw_context, "\n");
+        }
         try processLine(allocator, line_arena.allocator(), line, backend, accumulator, context, handler);
         if (at_eof) return;
     }

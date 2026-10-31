@@ -388,6 +388,7 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
             .child_context = null,
             .on_child_id = childIdChanged,
             .diagnostics = services.stderr,
+            .log_pair = if (log_pair) |*pair| pair else null,
         };
         if (role == .worker) {
             request.session_context = &persist_context;

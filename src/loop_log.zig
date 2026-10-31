@@ -6,6 +6,7 @@ pub const Pair = struct {
     events: std.Io.File,
     invocation_id: []const u8,
     sequence: u64 = 0,
+    mutex: std.atomic.Value(bool) = .init(false),
 
     pub fn deinit(self: *Pair, io: std.Io) void {
         self.readable.close(io);
@@ -14,6 +15,8 @@ pub const Pair = struct {
     }
 
     pub fn record(self: *Pair, io: std.Io, loop_id: []const u8, kind: []const u8, payload: []const u8) !void {
+        self.lock();
+        defer self.unlock();
         self.sequence += 1;
         const stamp = std.Io.Clock.real.now(io).toMilliseconds();
         var event_buffer: [1024]u8 = undefined;
@@ -24,6 +27,32 @@ pub const Pair = struct {
         var readable_writer = self.readable.writer(io, &readable_buffer);
         try readable_writer.interface.print("[{d}] {s}: {s}\n", .{ self.sequence, kind, payload });
         try readable_writer.interface.flush();
+    }
+
+    pub fn raw(self: *Pair, io: std.Io, loop_id: []const u8, stream_name: []const u8, bytes: []const u8) !void {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const chunk = bytes[offset..@min(offset + 3072, bytes.len)];
+            var encoded: [4096]u8 = undefined;
+            const text = std.base64.standard.Encoder.encode(&encoded, chunk);
+            self.lock();
+            defer self.unlock();
+            self.sequence += 1;
+            const stamp = std.Io.Clock.real.now(io).toMilliseconds();
+            var out_buffer: [5120]u8 = undefined;
+            var writer = self.events.writer(io, &out_buffer);
+            try writer.interface.print("{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":\"{f}\",\"invocation_id\":\"{s}\",\"kind\":\"raw\",\"stream\":\"{s}\",\"encoding\":\"base64\",\"payload\":\"{s}\"}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), self.invocation_id, stream_name, text });
+            try writer.interface.flush();
+            offset += chunk.len;
+        }
+    }
+
+    fn lock(self: *Pair) void {
+        while (self.mutex.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Pair) void {
+        self.mutex.store(false, .release);
     }
 };
 
