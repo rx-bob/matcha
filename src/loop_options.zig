@@ -9,6 +9,7 @@ pub const RunOptions = struct {
     backend: BackendKind,
     backend_explicit: bool = false,
     verifier: ?BackendKind = null,
+    verifier_explicit: bool = false,
     verify_enabled: bool = true,
     model: ?[]const u8 = null,
     yolo: bool = false,
@@ -18,7 +19,10 @@ pub const RunOptions = struct {
     timeout_seconds: ?u64 = null,
     output_mode: OutputMode = .live,
     prompt: []const u8,
+    prompt_explicit: bool = false,
+    extra_args_explicit: bool = false,
     prompt_file: ?[]const u8 = null,
+    config_path: ?[]const u8 = null,
     extra_backend_args: []const []const u8 = &.{},
 };
 
@@ -81,16 +85,25 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     defer prompt_parts.deinit(allocator);
     var positional = false;
     var prompt_file: ?[]const u8 = null;
+    var config_path: ?[]const u8 = null;
+    var extra_args_explicit = false;
     var extra_args: []const []const u8 = &.{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--")) {
+            extra_args_explicit = true;
             extra_args = args[i + 1 ..];
             break;
         }
-        if (std.mem.eql(u8, arg, "--prompt-file")) {
+        if (std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            config_path = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+        } else if (std.mem.startsWith(u8, arg, "--config=")) {
+            config_path = arg["--config=".len..];
+            if (config_path.?.len == 0) return .{ .err = .{ .missing_value = "--config" } };
+        } else if (std.mem.eql(u8, arg, "--prompt-file")) {
             i += 1;
             prompt_file = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
         } else if (std.mem.startsWith(u8, arg, "--prompt-file=")) {
@@ -172,12 +185,13 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         const trimmed = std.mem.trim(u8, stdin_bytes, " \t\r\n");
         if (trimmed.len == 0) return .{ .err = .missing_prompt };
         prompt = allocator.dupe(u8, trimmed) catch return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
-    } else if (prompt_file == null) return .{ .err = .missing_prompt };
+    }
 
     return .{ .ok = .{ .run = .{
         .backend = backend,
         .backend_explicit = backend_explicit,
         .verifier = verifier,
+        .verifier_explicit = verifier != null,
         .verify_enabled = !no_verify,
         .model = model,
         .yolo = yolo,
@@ -187,7 +201,10 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         .timeout_seconds = timeout_seconds,
         .output_mode = output_mode,
         .prompt = prompt,
+        .prompt_explicit = positional,
+        .extra_args_explicit = extra_args_explicit,
         .prompt_file = prompt_file,
+        .config_path = config_path,
         .extra_backend_args = extra_args,
     } } };
 }

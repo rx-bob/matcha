@@ -96,3 +96,41 @@ To make the compiled CLI available as `matcha`, install it into `~/.local/bin` a
 ```sh
 task install
 ```
+
+### Project loop configuration
+
+New loops read `.matcha.json` only in the launch directory. `--config PATH`
+(or `--config=PATH`) replaces that selection; an explicit file must exist.
+Project files use this envelope:
+
+```json
+{"schema_version":1,"loop":{"backend":"codex","model":null,"max_turns":10,"prompt_file":"prompts/task.md","verify_enabled":true}}
+```
+
+Settings resolve as CLI > project > user defaults > built-ins. User defaults
+retain the flat JSON format at `$XDG_CONFIG_HOME/matcha/loop.json` (otherwise
+`~/.config/matcha/loop.json`). Interactive `matcha loop config` edits that user
+file and preserves other supported settings.
+
+Supported loop fields are `backend`, `model`, `max_turns`, `prompt_file`,
+`verifier` (backend name), `verify_enabled`, `yolo`, `token_budget`,
+`timeout_seconds`, `output_mode` (`live`, `quiet`, `json`), and
+`extra_backend_args`. Unknown fields, invalid types, unsupported versions, and
+nonpositive configured limits fail before execution. Omitted fields inherit;
+`null` clears model, prompt file, verifier override, or a limit. Null limits
+mean unlimited. Booleans apply even when false; arrays replace, including `[]`.
+CLI `--unlimited` overrides inherited turn limits. Future map fields should merge
+by key; no map settings are exposed yet.
+
+Explicit positional text or `--prompt-file` wins over nonblank piped stdin,
+which wins over configured `prompt_file`. Explicit forms cannot be combined.
+Only the winning prompt file is read, at most 1 MiB; stdin has the same bound.
+Blank stdin permits configured-file fallback. Blank explicit input fails.
+Config file paths are relative to their defining config directory; CLI paths
+use the launch directory. Selecting a config elsewhere does not change worker cwd.
+
+Snapshots capture objective text, execution settings, budgets, and launch cwd.
+Resume uses those saved values even if source files change or disappear. Legacy
+snapshots retain their shared worker/verifier model and arguments; inspection
+never rewrites them. Ambient shell environment remains inherited. Callback
+updates preserve captured settings, and saves replace state atomically.

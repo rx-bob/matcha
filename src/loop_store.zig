@@ -5,13 +5,17 @@ const options = @import("loop_options.zig");
 pub const LoopStatus = enum { active, verifying, complete, paused, blocked, budget_limited };
 
 pub const LoopState = struct {
+    // Version 1 is the original persisted shape. New loops write version 2;
+    // optional fields retain defaults so historical state remains readable.
     schema_version: u32 = 1,
     id: []const u8,
     status: LoopStatus = .active,
     backend: options.BackendKind,
     verifier_backend: ?options.BackendKind = null,
+    verifier_override_present: bool = false,
     verify_enabled: bool = true,
     model: ?[]const u8 = null,
+    output_mode: options.OutputMode = .live,
     yolo: bool = false,
     cwd: []const u8,
     objective: []const u8,
@@ -112,7 +116,12 @@ pub const Store = struct {
         defer self.allocator.free(file_path);
         const bytes = try root_dir.readFileAlloc(self.io, file_path, self.allocator, .limited(16 * 1024 * 1024));
         defer self.allocator.free(bytes);
-        return std.json.parseFromSlice(LoopState, self.allocator, bytes, .{ .allocate = .alloc_always });
+        var parsed = try std.json.parseFromSlice(LoopState, self.allocator, bytes, .{ .allocate = .alloc_always });
+        if (parsed.value.schema_version == 0 or parsed.value.schema_version > 2) {
+            parsed.deinit();
+            return error.UnsupportedStateVersion;
+        }
+        return parsed;
     }
 
     pub fn appendTurnLog(self: *const Store, id: []const u8, record: TurnRecord) !void {
@@ -252,7 +261,9 @@ test "store creates and round-trips every state field with atomic overwrite" {
         .id = "6722c1a0-9f3b",
         .backend = .codex,
         .verifier_backend = .agy,
+        .verifier_override_present = true,
         .model = "model \"quoted\"",
+        .output_mode = .quiet,
         .yolo = true,
         .cwd = "/work/tree",
         .objective = "line one\nline \"two\" \\ end",
@@ -277,6 +288,8 @@ test "store creates and round-trips every state field with atomic overwrite" {
     try std.testing.expectEqual(state.status, loaded.value.status);
     try std.testing.expectEqual(state.backend, loaded.value.backend);
     try std.testing.expectEqual(state.verifier_backend, loaded.value.verifier_backend);
+    try std.testing.expectEqual(state.verifier_override_present, loaded.value.verifier_override_present);
+    try std.testing.expectEqual(state.output_mode, loaded.value.output_mode);
     try std.testing.expectEqual(state.verify_enabled, loaded.value.verify_enabled);
     try std.testing.expectEqualStrings(state.model.?, loaded.value.model.?);
     try std.testing.expectEqual(state.yolo, loaded.value.yolo);
@@ -307,6 +320,33 @@ test "store creates and round-trips every state field with atomic overwrite" {
     try std.testing.expectEqual(@as(u64, 300), reloaded.value.updated_at_ms);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "6722c1a0-9f3b/state.json.tmp", .{}));
+}
+
+test "store reads legacy version one snapshots with historical shared execution fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try Store.init(std.testing.allocator, std.testing.io, root);
+    defer store.deinit();
+    try tmp.dir.createDir(std.testing.io, "legacy-0001", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "legacy-0001/state.json",
+        .data = "{\"id\":\"legacy-0001\",\"status\":\"paused\",\"backend\":\"codex\",\"verifier_backend\":\"agy\",\"model\":\"shared-model\",\"cwd\":\"/old/tree\",\"objective\":\"saved objective\",\"started_at_ms\":1,\"updated_at_ms\":2,\"extra_args\":[\"shared-arg\"]}",
+    });
+    var legacy = try store.loadState("legacy-0001");
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(u32, 1), legacy.value.schema_version);
+    try std.testing.expectEqual(options.BackendKind.agy, legacy.value.verifier_backend.?);
+    try std.testing.expectEqualStrings("shared-model", legacy.value.model.?);
+    try std.testing.expectEqualStrings("shared-arg", legacy.value.extra_args[0]);
+    try std.testing.expect(legacy.value.verify_enabled);
+    try std.testing.expectEqual(@as(u32, 0), legacy.value.turns_completed);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "legacy-0001/state.json",
+        .data = "{\"schema_version\":99,\"id\":\"legacy-0001\",\"backend\":\"codex\",\"cwd\":\"/\",\"objective\":\"x\",\"started_at_ms\":1,\"updated_at_ms\":2}",
+    });
+    try std.testing.expectError(error.UnsupportedStateVersion, store.loadState("legacy-0001"));
 }
 
 test "turn log appends worker and verifier records and latest id sorts lexically" {
@@ -358,4 +398,95 @@ test "loop IDs use sortable timestamp and random suffix" {
     try std.testing.expect(std.mem.indexOfScalar(u8, first, '-') != null);
     try std.testing.expect(validLoopId(first));
     try std.testing.expect(validLoopId(second));
+}
+
+test "failed candidate saves leave durable snapshot readable and release allocations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    const initial: LoopState = .{
+        .schema_version = 2,
+        .id = "durable-0001",
+        .backend = .codex,
+        .verifier_override_present = true,
+        .model = "saved-model",
+        .cwd = "/saved/work",
+        .objective = "original objective",
+        .worker_session_id = "saved-session",
+        .turns_completed = 5,
+        .tokens_used = 500,
+        .started_at_ms = 1,
+        .updated_at_ms = 2,
+        .extra_args = &.{ "--saved", "arg" },
+    };
+    try store.createLoop(initial);
+    var candidate = initial;
+    candidate.objective = "candidate objective";
+    var succeeded = false;
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_store: Store = .{ .allocator = failing.allocator(), .io = std.testing.io, .root = root };
+        if (failing_store.saveState(candidate)) |_| {
+            succeeded = true;
+            try store.saveState(initial);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        var durable = try store.loadState(initial.id);
+        defer durable.deinit();
+        try std.testing.expectEqualStrings(initial.objective, durable.value.objective);
+        try std.testing.expectEqualStrings(initial.worker_session_id.?, durable.value.worker_session_id.?);
+        try std.testing.expectEqual(initial.turns_completed, durable.value.turns_completed);
+        if (succeeded and !failing.has_induced_failure) break;
+    }
+    try std.testing.expect(succeeded);
+    // Force failure opening the candidate file after reading the durable state.
+    try tmp.dir.createDir(std.testing.io, "durable-0001/state.json.tmp", .default_dir);
+    if (store.saveState(candidate)) |_| return error.ExpectedCandidateSaveFailure else |_| {}
+    var durable = try store.loadState(initial.id);
+    defer durable.deinit();
+    try std.testing.expectEqualStrings(initial.objective, durable.value.objective);
+    try std.testing.expectEqualStrings(initial.model.?, durable.value.model.?);
+    try std.testing.expect(durable.value.verifier_override_present);
+    try std.testing.expectEqual(initial.tokens_used, durable.value.tokens_used);
+    try std.testing.expectEqualStrings(initial.extra_args[1], durable.value.extra_args[1]);
+}
+
+test "load snapshot releases all partial parsed allocations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    try store.createLoop(.{
+        .id = "owned-0001",
+        .backend = .droid,
+        .model = "owned-model",
+        .cwd = "/work",
+        .objective = "multiline\nobjective",
+        .started_at_ms = 1,
+        .updated_at_ms = 2,
+        .extra_args = &.{ "one", "two" },
+    });
+    var succeeded = false;
+    for (0..128) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_store: Store = .{ .allocator = failing.allocator(), .io = std.testing.io, .root = root };
+        if (failing_store.loadState("owned-0001")) |parsed| {
+            var owned = parsed;
+            try std.testing.expectEqualStrings("owned-model", owned.value.model.?);
+            owned.deinit();
+            succeeded = true;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (succeeded and !failing.has_induced_failure) break;
+    }
+    try std.testing.expect(succeeded);
 }

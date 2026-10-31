@@ -90,12 +90,15 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     defer allocator.free(id);
     const now = nowMilliseconds(services);
     const state: store_mod.LoopState = .{
+        .schema_version = 2,
         .id = id,
         .status = .active,
         .backend = run_options.backend,
         .verifier_backend = run_options.verifier,
+        .verifier_override_present = run_options.verifier_explicit,
         .verify_enabled = run_options.verify_enabled,
         .model = run_options.model,
+        .output_mode = run_options.output_mode,
         .yolo = run_options.yolo,
         .cwd = cwd,
         .objective = run_options.prompt,
@@ -127,6 +130,9 @@ pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !E
         }
     }
     state.status = .active;
+    // Upgrade only on resume, when state is already being changed and saved.
+    // Listing and inspection leave legacy files byte-for-byte untouched.
+    if (state.schema_version < 2) state.schema_version = 2;
     if (objective) |new_objective| {
         state.objective = new_objective;
         state.blocked_strikes = 0;
@@ -134,20 +140,52 @@ pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !E
     }
     state.updated_at_ms = nowMilliseconds(services);
     try services.store.saveState(state);
-    const run_options: options.RunOptions = .{
+    const run_options = runOptionsFromState(state);
+    return runExisting(services, run_options, id);
+}
+
+fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
+    return .{
         .backend = state.backend,
         .verifier = state.verifier_backend,
+        .verifier_explicit = state.verifier_override_present or state.verifier_backend != null,
         .verify_enabled = state.verify_enabled,
         .model = state.model,
         .yolo = state.yolo,
         .max_turns = state.max_turns,
         .token_budget = state.token_budget,
         .timeout_seconds = state.timeout_seconds,
-        .output_mode = .live,
+        .output_mode = state.output_mode,
         .prompt = state.objective,
         .extra_backend_args = state.extra_args,
     };
-    return runExisting(services, run_options, id);
+}
+
+test "resume options come only from captured snapshot, including legacy shared verifier settings" {
+    const state: store_mod.LoopState = .{
+        .schema_version = 1,
+        .id = "legacy-0001",
+        .backend = .codex,
+        .verifier_backend = .agy,
+        .model = "captured-model",
+        .cwd = "/saved/project",
+        .objective = "captured objective",
+        .started_at_ms = 1,
+        .updated_at_ms = 2,
+        .max_turns = 7,
+        .token_budget = 900,
+        .timeout_seconds = 60,
+        .extra_args = &.{ "--legacy", "value" },
+    };
+    const options_from_state = runOptionsFromState(state);
+    try std.testing.expectEqual(options.BackendKind.codex, options_from_state.backend);
+    try std.testing.expectEqual(options.BackendKind.agy, options_from_state.verifier.?);
+    try std.testing.expectEqualStrings("captured-model", options_from_state.model.?);
+    try std.testing.expectEqualStrings("captured objective", options_from_state.prompt);
+    try std.testing.expectEqual(@as(u32, 7), options_from_state.max_turns.?);
+    try std.testing.expectEqual(@as(u64, 900), options_from_state.token_budget.?);
+    try std.testing.expectEqual(@as(u64, 60), options_from_state.timeout_seconds.?);
+    try std.testing.expectEqualStrings("--legacy", options_from_state.extra_backend_args[0]);
 }
 
 fn runExisting(services: Services, run_options: options.RunOptions, id: []const u8) !ExitCode {
@@ -1201,4 +1239,80 @@ fn expectFakeCall(call: *const FakeCall, expected_backend: backend.BackendKind, 
     try std.testing.expectEqual(expected_backend == .agy, call.is_verifier);
     try std.testing.expectEqual(expected_resume, !call.session_id_absent);
     try std.testing.expect(std.mem.indexOf(u8, call.prompt, expected_prompt_fragment) != null);
+}
+
+test "captured inputs survive deletion and legacy resume preserves shared execution choices" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "task.md", .data = "  captured\nmultiline objective\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".matcha.json", .data = "{\"schema_version\":1,\"loop\":{\"prompt_file\":\"task.md\"}}" });
+    const objective = try tmp.dir.readFileAlloc(std.testing.io, "task.md", allocator, .limited(1024));
+    defer allocator.free(objective);
+    const prompt_path = try std.fs.path.join(allocator, &.{ root, "task.md" });
+    defer allocator.free(prompt_path);
+    const config_path = try std.fs.path.join(allocator, &.{ root, ".matcha.json" });
+    defer allocator.free(config_path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_interrupted, .worker_complete, .verifier_pass } };
+    defer fake.deinit(allocator);
+    const services: Services = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+    };
+    try std.testing.expectEqual(ExitCode.failure, try run(services, .{
+        .backend = .codex,
+        .verifier = .agy,
+        .model = "captured-model",
+        .yolo = true,
+        .output_mode = .quiet,
+        .max_turns = 12,
+        .token_budget = 10000,
+        .prompt = objective,
+        .prompt_file = prompt_path,
+        .config_path = config_path,
+        .extra_backend_args = &.{"--captured-arg"},
+    }));
+    const id = (try store.resolveLatestLoopId()).?;
+    defer allocator.free(id);
+    var paused = try store.loadState(id);
+    defer paused.deinit();
+    try std.testing.expectEqual(@as(u32, 2), paused.value.schema_version);
+    try std.testing.expectEqual(store_mod.LoopStatus.paused, paused.value.status);
+    // Simulate a historical saved loop, with a different verifier but shared model/args.
+    var legacy = paused.value;
+    legacy.schema_version = 1;
+    legacy.turns_completed = 4;
+    legacy.tokens_used = 123;
+    try store.saveState(legacy);
+    try tmp.dir.deleteFile(std.testing.io, "task.md");
+    try tmp.dir.deleteFile(std.testing.io, ".matcha.json");
+    try std.testing.expectEqual(ExitCode.ok, try resumeLoop(services, id, null));
+    var completed = try store.loadState(id);
+    defer completed.deinit();
+    try std.testing.expectEqual(@as(u32, 2), completed.value.schema_version);
+    try std.testing.expectEqualStrings(objective, completed.value.objective);
+    try std.testing.expectEqualStrings(paused.value.cwd, completed.value.cwd);
+    try std.testing.expectEqualStrings("captured-model", completed.value.model.?);
+    try std.testing.expectEqual(options.OutputMode.quiet, completed.value.output_mode);
+    try std.testing.expectEqualStrings("--captured-arg", completed.value.extra_args[0]);
+    try std.testing.expect(completed.value.yolo);
+    try std.testing.expectEqual(@as(u32, 12), completed.value.max_turns.?);
+    try std.testing.expectEqual(@as(u64, 10000), completed.value.token_budget.?);
+    try std.testing.expectEqual(@as(u32, 6), completed.value.turns_completed);
+    try std.testing.expectEqual(@as(u64, 143), completed.value.tokens_used);
+    try std.testing.expectEqualStrings("worker-session", completed.value.worker_session_id.?);
+    try expectFakeCall(&fake.calls.items[1], .codex, true, "captured\nmultiline objective");
+    try expectFakeCall(&fake.calls.items[2], .agy, false, "captured\nmultiline objective");
 }

@@ -141,6 +141,25 @@ fn runLoopCommand(
     parent_environment: *const std.process.Environ.Map,
     runner_override: ?loop_backend.BackendRunner,
 ) !ExitCode {
+    return runLoopCommandWithInputs(io, args, stdout, stderr, store_root, parent_environment, runner_override, null);
+}
+
+const LoopInputs = struct {
+    user_path: ?[]const u8 = null,
+    project_path: []const u8,
+    stdin_bytes: []const u8 = "",
+};
+
+fn runLoopCommandWithInputs(
+    io: std.Io,
+    args: []const []const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    store_root: ?[]const u8,
+    parent_environment: *const std.process.Environ.Map,
+    runner_override: ?loop_backend.BackendRunner,
+    inputs: ?LoopInputs,
+) !ExitCode {
     const command = switch (loop_options.parseLoopCommand(std.heap.page_allocator, args, true, "")) {
         .ok => |parsed| parsed,
         .err => |cli_error| {
@@ -150,7 +169,7 @@ fn runLoopCommand(
         },
     };
     defer switch (command) {
-        .run => |run_options| std.heap.page_allocator.free(run_options.prompt),
+        .run => |run_options| if (run_options.prompt.len > 0) std.heap.page_allocator.free(run_options.prompt),
         else => {},
     };
     switch (command) {
@@ -170,24 +189,33 @@ fn runLoopCommand(
 
     switch (command) {
         .run => |run_options| {
-            var effective_options = run_options;
-            var prompt_file_contents: ?[]const u8 = null;
-            defer if (prompt_file_contents) |contents| std.heap.page_allocator.free(contents);
-            if (run_options.prompt_file) |prompt_path| {
-                prompt_file_contents = std.Io.Dir.cwd().readFileAlloc(io, prompt_path, std.heap.page_allocator, .limited(1024 * 1024)) catch |err| {
-                    try stderr.print("Cannot read prompt file {s}: {s}\n", .{ prompt_path, @errorName(err) });
-                    return .usage;
+            const user_path = if (inputs == null) try loop_config.configPathAlloc(std.heap.page_allocator) else null;
+            defer if (user_path) |v| std.heap.page_allocator.free(v);
+            var resolved = loop_config.resolve(std.heap.page_allocator, io, run_options, if (inputs) |v| v.user_path else user_path, run_options.config_path orelse (if (inputs) |v| v.project_path else ".matcha.json"), stderr) catch return .failure;
+            defer resolved.deinit();
+            var effective_options = resolved.run;
+            const a = resolved.arena.allocator();
+            if (!run_options.prompt_explicit and run_options.prompt_file == null and (inputs != null or !(std.Io.File.stdin().isTty(io) catch true))) {
+                var buffer: [4096]u8 = undefined;
+                var reader = std.Io.File.stdin().reader(io, &buffer);
+                const bytes = if (inputs) |v| v.stdin_bytes else reader.interface.allocRemaining(a, .limited(1024 * 1024)) catch |err| {
+                    try stderr.print("Cannot read prompt stdin (maximum 1 MiB): {s}\n", .{@errorName(err)});
+                    return .failure;
                 };
-                if (std.mem.trim(u8, prompt_file_contents.?, " \t\r\n").len == 0) {
-                    try stderr.print("Prompt file is empty or blank: {s}\n", .{prompt_path});
-                    return .usage;
-                }
-                effective_options.prompt = prompt_file_contents.?;
+                if (std.mem.trim(u8, bytes, " \t\r\n").len != 0) effective_options.prompt = bytes;
             }
-            if (store_root == null) applyLoopConfig(io, &effective_options, stderr) catch return .failure;
-            defer if (run_options.model == null) {
-                if (effective_options.model) |model| std.heap.page_allocator.free(model);
-            };
+            if (!run_options.prompt_explicit and effective_options.prompt.len == 0) {
+                if (effective_options.prompt_file) |prompt_path| {
+                    effective_options.prompt = std.Io.Dir.cwd().readFileAlloc(io, prompt_path, a, .limited(1024 * 1024)) catch |err| {
+                        try stderr.print("Cannot read prompt file {s} (maximum 1 MiB): {s}\n", .{ prompt_path, @errorName(err) });
+                        return .failure;
+                    };
+                }
+            }
+            if (std.mem.trim(u8, effective_options.prompt, " \t\r\n").len == 0) {
+                try writeCliError(stderr, .missing_prompt);
+                return .usage;
+            }
             var real_runner: loop_backend.RealBackendRunner = .{};
             const services: loop_runtime.Services = .{
                 .allocator = std.heap.page_allocator,
@@ -263,20 +291,6 @@ fn runLoopCommand(
     }
 }
 
-fn applyLoopConfig(io: std.Io, options: *loop_options.RunOptions, stderr: *std.Io.Writer) !void {
-    var parsed = loop_config.load(std.heap.page_allocator, io) catch |err| {
-        if (err == error.FileNotFound) return;
-        try stderr.print("Cannot read matcha loop config: {s}\n", .{@errorName(err)});
-        return error.InvalidLoopConfig;
-    };
-    defer parsed.deinit();
-    if (!options.backend_explicit) options.backend = parsed.value.backend;
-    if (options.model == null) {
-        if (parsed.value.model) |model| options.model = try std.heap.page_allocator.dupe(u8, model);
-    }
-    if (!options.turn_limit_explicit) options.max_turns = parsed.value.max_turns;
-}
-
 fn runLoopConfig(io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
     var config: loop_config.Config = .{};
     var parsed: ?std.json.Parsed(loop_config.Config) = loop_config.load(std.heap.page_allocator, io) catch |err| blk: {
@@ -286,8 +300,8 @@ fn runLoopConfig(io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !Ex
         }
         break :blk null;
     };
+    defer if (parsed) |*value| value.deinit();
     if (parsed) |*value| {
-        defer value.deinit();
         config = value.value;
         if (config.model) |model| {
             // Clear the borrowed JSON slice before transferring ownership so
@@ -612,7 +626,13 @@ fn writeLoopShow(store: *const loop_store.Store, id: []const u8, stdout: *std.Io
     if (state.token_budget) |value| try stdout.print("{d}", .{value}) else try stdout.writeAll("unlimited");
     try stdout.writeAll(", timeout=");
     if (state.timeout_seconds) |value| try stdout.print("{d}s", .{value}) else try stdout.writeAll("unlimited");
-    try stdout.print("\nSession: {s}\nWorking directory: {s}\nObjective:\n{s}\n", .{ state.worker_session_id orelse "none", state.cwd, state.objective });
+    try stdout.print("\nModel: {s}\nYolo: {s}\nSession: {s}\nWorking directory: {s}\nObjective:\n{s}\n", .{
+        state.model orelse "backend default",
+        if (state.yolo) "enabled" else "disabled",
+        state.worker_session_id orelse "none",
+        state.cwd,
+        state.objective,
+    });
     const history = store.readRecentTurnLog(id, 5) catch |err| switch (err) {
         error.FileNotFound => "",
         else => return reportLoopStoreError(err, id, stderr),
@@ -674,6 +694,9 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\Run options --model, -b, --max-turns, and --unlimited override saved defaults.
         \\Prompt may come from positional text, --prompt-file, or piped stdin. Options work before or after text.
         \\Options include --yolo, --verifier, --no-verify, --token-budget, --timeout, --quiet, and --json.
+        \\--config <path> selects a project config instead of launch-directory .matcha.json.
+        \\Precedence: CLI > project > user defaults. Prompt: explicit > pipe > configured file.
+        \\Prompt files and stdin are limited to 1 MiB; file paths in configs are source-relative.
         \\Use matcha loop --help for this help.
         \\
     );
@@ -2614,4 +2637,66 @@ test "loop resume CLI reports a missing ID without an internal error" {
     try std.testing.expectEqual(ExitCode.failure, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Loop not found:") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Internal error:") == null);
+}
+
+test "configured CLI captures winning prompt and callback writes preserve resolved settings" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const project = try std.fmt.allocPrint(a, "{s}/selected.json", .{root});
+    defer a.free(project);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected.json", .data = "{\"schema_version\":1,\"loop\":{\"backend\":\"droid\",\"model\":\"captured-model\",\"max_turns\":7,\"prompt_file\":\"task.md\",\"verify_enabled\":false,\"yolo\":true,\"output_mode\":\"quiet\"}}" });
+    const file_prompt = "  first page\n\nsecond page\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "task.md", .data = file_prompt });
+    var store = try loop_store.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+    defer a.free(cwd);
+    const cases = [_]struct { args: []const []const u8, stdin: []const u8, expected: []const u8 }{
+        .{ .args = &.{}, .stdin = " \n", .expected = file_prompt },
+        .{ .args = &.{ "explicit", "--max-turns", "5" }, .stdin = "ignored pipe", .expected = "explicit" },
+        .{ .args = &.{}, .stdin = "  pipe\nmultiline\n", .expected = "  pipe\nmultiline\n" },
+    };
+    for (cases, 0..) |case, index| {
+        if (index == 1) try tmp.dir.deleteFile(std.testing.io, "task.md");
+        var fake = ResumeCliFake{ .allocator = a, .store = &store };
+        defer fake.deinit();
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        var err: std.Io.Writer.Allocating = .init(a);
+        defer err.deinit();
+        const code = try runLoopCommandWithInputs(std.testing.io, case.args, &out.writer, &err.writer, root, &env, fake.runner(), .{ .project_path = project, .stdin_bytes = case.stdin });
+        try std.testing.expectEqual(ExitCode.ok, code);
+        const id = (try store.resolveLatestLoopId()).?;
+        defer a.free(id);
+        // IDs contain randomness; locate the state for this objective rather than relying on sort order.
+        const ids = try store.listLoopIds();
+        defer {
+            for (ids) |v| a.free(v);
+            a.free(ids);
+        }
+        var found = false;
+        for (ids) |candidate| {
+            var state = try store.loadState(candidate);
+            defer state.deinit();
+            if (!std.mem.eql(u8, state.value.objective, case.expected)) continue;
+            found = true;
+            try std.testing.expectEqualStrings(cwd, state.value.cwd);
+            try std.testing.expectEqualStrings("captured-model", state.value.model.?);
+            try std.testing.expectEqual(loop_options.BackendKind.droid, state.value.backend);
+            try std.testing.expectEqual(@as(u32, if (index == 1) 5 else 7), state.value.max_turns.?);
+            try std.testing.expectEqual(ExitCode.ok, try updateLoop(&store, candidate, .{ .status = .complete, .summary = "callback" }, &out.writer, &err.writer));
+            var after = try store.loadState(candidate);
+            defer after.deinit();
+            try std.testing.expectEqualStrings(case.expected, after.value.objective);
+            try std.testing.expectEqualStrings(state.value.model.?, after.value.model.?);
+            try std.testing.expectEqual(state.value.output_mode, after.value.output_mode);
+            try std.testing.expectEqual(state.value.max_turns, after.value.max_turns);
+        }
+        try std.testing.expect(found);
+    }
 }
