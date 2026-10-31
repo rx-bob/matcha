@@ -19,6 +19,7 @@ pub const Services = struct {
     stderr: ?*std.Io.Writer = null,
     clock: ?Clock = null,
     sleeper: ?Sleeper = null,
+    log_fault: ?loop_log.Pair.Fault = null,
 };
 
 pub const Clock = struct {
@@ -155,6 +156,7 @@ pub fn resumeLoopWithPolicy(services: Services, id: []const u8, objective: ?[]co
     }
     preflightRoles(services, state) catch return .failure;
     state.status = .active;
+    state.last_audit_failure = null;
     // Upgrade only on resume, when state is already being changed and saved.
     // Listing and inspection leave legacy files byte-for-byte untouched.
     if (state.schema_version < 2) state.schema_version = 2;
@@ -264,27 +266,79 @@ test "resume options come only from captured snapshot, including legacy shared v
 
 fn runExisting(services: Services, run_options: options.RunOptions, id: []const u8, is_resume: bool) !ExitCode {
     const allocator = services.allocator;
-    var log_pair: ?loop_log.Pair = if (run_options.log_dir) |directory| try loop_log.open(allocator, services.io, directory, id) else null;
-    errdefer if (log_pair) |*pair| pair.deinit(services.io);
+    var open_failure: ?loop_log.OpenFailure = null;
+    defer if (open_failure) |failure| failure.deinit(allocator);
+    var log_pair: ?loop_log.Pair = if (run_options.log_dir) |directory|
+        loop_log.openWithReport(allocator, services.io, directory, id, services.log_fault, &open_failure) catch |err| {
+            if (open_failure) |failure| return auditStop(services, id, failure.path, failure.operation, failure.cause);
+            return auditStop(services, id, directory, "open log pair", err);
+        }
+    else
+        null;
+    defer if (log_pair) |*pair| pair.deinit(services.io);
     if (log_pair) |*pair| {
         var snapshot = try services.store.loadState(id);
         defer snapshot.deinit();
         snapshot.value.last_invocation_id = pair.invocation_id;
         try services.store.saveState(snapshot.value);
-        try pair.record(services.io, id, if (is_resume) "resume" else "start", "invocation started");
+        pair.record(services.io, id, if (is_resume) "resume" else "start", "invocation started") catch |err| return auditStopPair(services, id, run_options.log_dir.?, pair, err);
         if (services.stderr) |stderr| {
             try stderr.print("Loop logs: {s}/{s}.log and {s}/{s}.jsonl\n", .{ run_options.log_dir.?, pair.invocation_id, run_options.log_dir.?, pair.invocation_id });
             try stderr.flush();
         }
     }
-    const exit_code = try runExistingBody(services, run_options, id, &log_pair);
+    const exit_code = runExistingBody(services, run_options, id, &log_pair) catch |err| {
+        if (log_pair) |*pair| {
+            if (pair.failure != null) return auditStopPair(services, id, run_options.log_dir.?, pair, err);
+        }
+        return err;
+    };
     if (log_pair) |*pair| {
         var final_state = try services.store.loadState(id);
         defer final_state.deinit();
-        try pair.record(services.io, id, "final", @tagName(final_state.value.status));
-        pair.deinit(services.io);
+        pair.record(services.io, id, "final", @tagName(final_state.value.status)) catch |err| return auditStopPair(services, id, run_options.log_dir.?, pair, err);
+        pair.sync(services.io, .final_sync) catch |err| return auditStopPair(services, id, run_options.log_dir.?, pair, err);
     }
     return exit_code;
+}
+
+fn auditStopPair(services: Services, id: []const u8, directory: []const u8, pair: *loop_log.Pair, err: anyerror) !ExitCode {
+    if (pair.failure) |failure| {
+        const path = try std.fmt.allocPrint(services.allocator, "{s}/{s}{s}", .{ directory, pair.invocation_id, failure.path });
+        defer services.allocator.free(path);
+        return auditStop(services, id, path, failure.operation, failure.cause);
+    }
+    return auditStop(services, id, directory, "logging", err);
+}
+
+fn auditStop(services: Services, id: []const u8, path: []const u8, operation: []const u8, cause: anyerror) !ExitCode {
+    if (services.stderr) |writer| {
+        try writer.print("Audit logging failed: {s} ({s}: {s}).\n", .{ path, operation, @errorName(cause) });
+        try writer.flush();
+    }
+    var loaded = services.store.loadState(id) catch |err| {
+        if (services.stderr) |writer| try writer.print("Cannot save resumable loop {s}: {s}\n", .{ id, @errorName(err) });
+        return .failure;
+    };
+    defer loaded.deinit();
+    var state = loaded.value;
+    state.status = .paused;
+    state.updated_at_ms = nowMilliseconds(services);
+    const diagnostic = try std.fmt.allocPrint(services.allocator, "{s} ({s}: {s})", .{ path, operation, @errorName(cause) });
+    defer services.allocator.free(diagnostic);
+    state.last_audit_failure = diagnostic;
+    services.store.saveState(state) catch |err| {
+        if (services.stderr) |writer| {
+            try writer.print("Cannot save resumable loop {s}: {s}\n", .{ id, @errorName(err) });
+            try writer.flush();
+        }
+        return .failure;
+    };
+    if (services.stderr) |writer| {
+        try writer.print("Resume: matcha loop resume {s}\n", .{id});
+        try writer.flush();
+    }
+    return .failure;
 }
 
 fn runExistingBody(services: Services, run_options: options.RunOptions, id: []const u8, log_pair: *?loop_log.Pair) !ExitCode {
@@ -410,6 +464,9 @@ fn runExistingBody(services: Services, run_options: options.RunOptions, id: []co
             request.on_session_id = PersistSessionContext.persist;
         }
         const retry_result = runWithRetries(services, request, if (log_pair.*) |*pair| pair else null, log_context) catch |err| {
+            if (log_pair.*) |*pair| {
+                if (pair.failure != null) return error.AuditLogFailure;
+            }
             if (signalWasCaught()) return pauseLoop(services, &presenter, id, "Loop paused by SIGINT or SIGTERM.");
             if (is_budget_wrapup) {
                 var limited = current;
@@ -440,6 +497,7 @@ fn runExistingBody(services: Services, run_options: options.RunOptions, id: []co
             defer allocator.free(totals);
             try pair.recordContext(services.io, id, log_context, "tokens", totals);
             try pair.recordContext(services.io, id, log_context, "turn_end", @tagName(after_turn.status));
+            try pair.sync(services.io, .turn_sync);
         }
         after_turn.updated_at_ms = nowMilliseconds(services);
         if (role == .worker) after_turn.objective_update_pending = false;
@@ -794,6 +852,105 @@ test "worker continuation, independent verifier rejection, repair, and pass" {
     const log = try store.readRecentTurnLog(final_id.?, 5);
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, log, "\"role\""));
+}
+
+test "final audit failure pauses completed snapshot and prevents success" {
+    const Fault = struct {
+        fn check(_: *anyopaque, phase: loop_log.Pair.FaultPhase) anyerror!void {
+            if (phase == .final_sync) return error.InjectedFinalSyncFailure;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    const log_dir = try std.fmt.allocPrint(allocator, "{s}/logs", .{root});
+    defer allocator.free(log_dir);
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/loops", .{root});
+    defer allocator.free(store_dir);
+    var store = try store_mod.Store.init(allocator, std.testing.io, store_dir);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{.worker_complete} };
+    defer fake.deinit(allocator);
+    var marker: u8 = 0;
+    const result = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+        .stderr = &diagnostics.writer,
+        .log_fault = .{ .context = &marker, .check = Fault.check },
+    }, .{ .backend = .codex, .verify_enabled = false, .prompt = "complete", .log_dir = log_dir });
+    try std.testing.expectEqual(ExitCode.failure, result);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+    const id = (try store.resolveLatestLoopId()).?;
+    defer allocator.free(id);
+    var state = try store.loadState(id);
+    defer state.deinit();
+    try std.testing.expectEqual(store_mod.LoopStatus.paused, state.value.status);
+    try std.testing.expectEqualStrings("Ready for verification.", state.value.completion_summary.?);
+    try std.testing.expect(std.mem.indexOf(u8, state.value.last_audit_failure.?, "sync") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "Resume: matcha loop resume") != null);
+}
+
+test "open and turn audit faults prevent backend retry and verifier launch" {
+    const Fault = struct {
+        phase: loop_log.Pair.FaultPhase,
+        fn check(context: *anyopaque, phase: loop_log.Pair.FaultPhase) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.phase == phase) return error.InjectedAuditFailure;
+        }
+    };
+    const allocator = std.testing.allocator;
+    for ([_]loop_log.Pair.FaultPhase{ .first_open, .second_open, .turn_sync }) |phase| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer allocator.free(root);
+        const store_dir = try std.fmt.allocPrint(allocator, "{s}/loops", .{root});
+        defer allocator.free(store_dir);
+        const log_dir = try std.fmt.allocPrint(allocator, "{s}/logs", .{root});
+        defer allocator.free(log_dir);
+        var store = try store_mod.Store.init(allocator, std.testing.io, store_dir);
+        defer store.deinit();
+        var environment = std.process.Environ.Map.init(allocator);
+        defer environment.deinit();
+        var output = std.Io.Writer.Allocating.init(allocator);
+        defer output.deinit();
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        var fake = FakeRunner{ .store = &store, .script = &.{ .worker_complete, .verifier_pass } };
+        defer fake.deinit(allocator);
+        var fault = Fault{ .phase = phase };
+        const result = try run(.{
+            .allocator = allocator,
+            .io = std.testing.io,
+            .store = &store,
+            .parent_environment = &environment,
+            .runner = fake.runner(),
+            .stdout = &output.writer,
+            .stderr = &diagnostics.writer,
+            .log_fault = .{ .context = &fault, .check = Fault.check },
+        }, .{ .backend = .codex, .prompt = "complete", .log_dir = log_dir });
+        try std.testing.expectEqual(ExitCode.failure, result);
+        try std.testing.expectEqual(@as(usize, if (phase == .turn_sync) 1 else 0), fake.calls.items.len);
+        const id = (try store.resolveLatestLoopId()).?;
+        defer allocator.free(id);
+        var state = try store.loadState(id);
+        defer state.deinit();
+        try std.testing.expectEqual(store_mod.LoopStatus.paused, state.value.status);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "Audit logging failed:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "Resume: matcha loop resume") != null);
+    }
 }
 
 test "no-verify completes immediately after worker update" {
@@ -1156,7 +1313,11 @@ test "interrupted turn pauses and prints both resume commands" {
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(root);
-    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/loops", .{root});
+    defer allocator.free(store_dir);
+    const log_dir = try std.fmt.allocPrint(allocator, "{s}/logs", .{root});
+    defer allocator.free(log_dir);
+    var store = try store_mod.Store.init(allocator, std.testing.io, store_dir);
     defer store.deinit();
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
@@ -1174,7 +1335,7 @@ test "interrupted turn pauses and prints both resume commands" {
         .runner = fake.runner(),
         .stdout = &output.writer,
         .sleeper = sleeper.sleeper(),
-    }, .{ .backend = .droid, .verify_enabled = false, .prompt = "Handle an interrupt." });
+    }, .{ .backend = .droid, .verify_enabled = false, .prompt = "Handle an interrupt.", .log_dir = log_dir });
     try std.testing.expectEqual(ExitCode.failure, exit_code);
     try std.testing.expectEqual(@as(usize, 0), sleeper.delays.items.len);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "Loop paused by SIGINT or SIGTERM.") != null);
@@ -1185,6 +1346,21 @@ test "interrupted turn pauses and prints both resume commands" {
     var state = try store.loadState(id.?);
     defer state.deinit();
     try std.testing.expectEqual(store_mod.LoopStatus.paused, state.value.status);
+    const event_path = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonl", .{ log_dir, state.value.last_invocation_id.? });
+    defer allocator.free(event_path);
+    const events = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, event_path, allocator, .unlimited);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"kind\":\"final\"") != null);
+}
+
+test "signal guard records interrupt and terminate without child" {
+    var guard = SignalGuard.install();
+    defer guard.deinit();
+    loopSignalHandler(.INT);
+    try std.testing.expect(signalWasCaught());
+    caught_signal.store(0, .release);
+    loopSignalHandler(.TERM);
+    try std.testing.expect(signalWasCaught());
 }
 
 fn expectBudgetRun(

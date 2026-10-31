@@ -160,6 +160,11 @@ fn spawnCandidate(request: TurnRequest, argv: []const []const u8) !std.process.C
 }
 
 const stderr_tail_capacity = 8 * 1024;
+extern "c" fn kill(pid: std.posix.pid_t, signal_number: c_int) c_int;
+
+fn stopChild(id: std.process.Child.Id) void {
+    _ = kill(@intCast(id), @intCast(@intFromEnum(std.posix.SIG.KILL)));
+}
 
 /// Spawn a backend, stream its stdout events, drain stderr concurrently, and return after wait.
 pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
@@ -181,7 +186,7 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     };
     defer child.kill(request.io);
 
-    const child_id = child.id;
+    const child_id = child.id orelse return error.MissingChildId;
     if (request.on_child_id) |callback| callback(request.child_context, child_id);
     defer if (request.on_child_id) |callback| callback(request.child_context, null);
 
@@ -189,7 +194,7 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     const stdout_file = child.stdout orelse return error.MissingChildStdout;
     const stderr_file = child.stderr orelse return error.MissingChildStderr;
 
-    var stderr_drain = StderrDrain.init(request.io, stderr_file, request.log_pair, request.loop_id, request.log_context);
+    var stderr_drain = StderrDrain.init(request.io, stderr_file, request.log_pair, request.loop_id, request.log_context, child_id);
     var stderr_thread = try std.Thread.spawn(.{}, StderrDrain.run, .{&stderr_drain});
     var stdin_write = StdinWrite.init(request.io, stdin_file, request.prompt);
     var stdin_thread = std.Thread.spawn(.{}, StdinWrite.run, .{&stdin_write}) catch |err| {
@@ -204,10 +209,14 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     defer accumulator.deinit(request.allocator);
     var callback_state = StreamCallbackState{
         .request = request,
+        .child_id = child_id,
     };
     var stdout_buffer: [8192]u8 = undefined;
     var stdout_reader = stdout_file.readerStreaming(request.io, &stdout_buffer);
-    const stream_result = stream.readStreamRaw(request.allocator, &stdout_reader.interface, request.backend, &accumulator, &callback_state, StreamCallbackState.handle, @ptrCast(@constCast(&request)), if (request.log_pair != null) rawStdout else null);
+    const stream_result = stream.readStreamRaw(request.allocator, &stdout_reader.interface, request.backend, &accumulator, &callback_state, StreamCallbackState.handle, &callback_state, if (request.log_pair != null) rawStdout else null);
+
+    if (stream_result) |_| {} else |_| stopChild(child_id);
+    if (callback_state.callback_error != null) stopChild(child_id);
 
     stdin_thread.join();
     stderr_thread.join();
@@ -219,6 +228,7 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
 
     try stream_result;
     if (callback_state.callback_error) |err| return err;
+    if (stderr_drain.log_error) |err| return err;
     if (stdin_write.write_error) return error.ChildStdinWriteFailed;
     if (stderr_drain.read_error) return error.ChildStderrReadFailed;
 
@@ -255,13 +265,19 @@ fn writePromptFile(request: TurnRequest) !void {
 
 const StreamCallbackState = struct {
     request: TurnRequest,
+    child_id: std.process.Child.Id,
     callback_error: ?anyerror = null,
+
+    fn failed(self: *StreamCallbackState, err: anyerror) void {
+        self.callback_error = err;
+        stopChild(self.child_id);
+    }
 
     fn handle(context: ?*anyopaque, event: stream.NormalizedEvent) void {
         const self: *StreamCallbackState = @ptrCast(@alignCast(context.?));
         if (event == .session_id and self.request.on_session_id != null and self.callback_error == null) {
             self.request.on_session_id.?(self.request.session_context, event.session_id) catch |err| {
-                self.callback_error = err;
+                self.failed(err);
             };
         }
         if (self.request.event_handler) |handler| handler(self.request.event_context, event);
@@ -271,7 +287,7 @@ const StreamCallbackState = struct {
                 .assistant_text => |value| .{ "assistant", value },
                 .tool_call => |tool| blk: {
                     pair.recordContext(self.request.io, self.request.loop_id, self.request.log_context, "tool", tool.name) catch |err| {
-                        self.callback_error = err;
+                        self.failed(err);
                     };
                     break :blk .{ "tool_detail", tool.detail };
                 },
@@ -280,22 +296,27 @@ const StreamCallbackState = struct {
                     var buffer: [80]u8 = undefined;
                     const value = std.fmt.bufPrint(&buffer, "input={d} output={d} total={d}", .{ usage.input_tokens, usage.output_tokens, usage.total_tokens }) catch break :blk .{ "usage", "usage" };
                     pair.recordContext(self.request.io, self.request.loop_id, self.request.log_context, "usage", value) catch |err| {
-                        self.callback_error = err;
+                        self.failed(err);
                     };
                     return;
                 },
                 .ignored => return,
             };
             pair.recordContext(self.request.io, self.request.loop_id, self.request.log_context, kind, payload) catch |err| {
-                self.callback_error = err;
+                self.failed(err);
             };
         }
     }
 };
 
 fn rawStdout(context: ?*anyopaque, bytes: []const u8) anyerror!void {
-    const request: *const TurnRequest = @ptrCast(@alignCast(context.?));
-    if (request.log_pair) |pair| try pair.rawContext(request.io, request.loop_id, request.log_context, "stdout", bytes);
+    const state: *StreamCallbackState = @ptrCast(@alignCast(context.?));
+    const request = state.request;
+    if (state.callback_error) |err| return err;
+    if (request.log_pair) |pair| pair.rawContext(request.io, request.loop_id, request.log_context, "stdout", bytes) catch |err| {
+        state.failed(err);
+        return err;
+    };
 }
 
 const StdinWrite = struct {
@@ -323,12 +344,14 @@ const StderrDrain = struct {
     start: usize = 0,
     len: usize = 0,
     read_error: bool = false,
+    log_error: ?anyerror = null,
     log_pair: ?*loop_log.Pair,
     loop_id: []const u8,
     log_context: loop_log.Pair.Context,
+    child_id: std.process.Child.Id,
 
-    fn init(io: std.Io, file: std.Io.File, log_pair: ?*loop_log.Pair, loop_id: []const u8, log_context: loop_log.Pair.Context) StderrDrain {
-        return .{ .io = io, .file = file, .log_pair = log_pair, .loop_id = loop_id, .log_context = log_context };
+    fn init(io: std.Io, file: std.Io.File, log_pair: ?*loop_log.Pair, loop_id: []const u8, log_context: loop_log.Pair.Context, child_id: std.process.Child.Id) StderrDrain {
+        return .{ .io = io, .file = file, .log_pair = log_pair, .loop_id = loop_id, .log_context = log_context, .child_id = child_id };
     }
 
     fn run(self: *StderrDrain) void {
@@ -343,12 +366,14 @@ const StderrDrain = struct {
             };
             if (count == 0) break;
             if (self.log_pair) |pair| {
-                pair.rawContext(self.io, self.loop_id, self.log_context, "stderr", buffer[0..count]) catch {
-                    self.read_error = true;
+                pair.rawContext(self.io, self.loop_id, self.log_context, "stderr", buffer[0..count]) catch |err| {
+                    self.log_error = err;
+                    stopChild(self.child_id);
                     break;
                 };
-                pair.stderr(self.io, self.loop_id, self.log_context, buffer[0..count]) catch {
-                    self.read_error = true;
+                pair.stderr(self.io, self.loop_id, self.log_context, buffer[0..count]) catch |err| {
+                    self.log_error = err;
+                    stopChild(self.child_id);
                     break;
                 };
             }
@@ -875,6 +900,49 @@ test "real runner streams events, captures early session, stdin, stderr, and exi
     defer success.deinit();
     try std.testing.expectEqual(@as(i32, 0), success.exit_code);
     try std.testing.expect(!success.was_interrupted);
+}
+
+test "audit stream failure kills child before blocked stdin and stderr joins" {
+    const Fault = struct {
+        phase: loop_log.Pair.FaultPhase,
+        fn check(context: *anyopaque, phase: loop_log.Pair.FaultPhase) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.phase == phase) return error.InjectedStreamFailure;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const loop_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(loop_dir);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("PATH", "/bin:/usr/bin");
+    const prompt = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(prompt);
+    @memset(prompt, 'p');
+    for ([_]loop_log.Pair.FaultPhase{ .stdout_write, .stderr_write }) |phase| {
+        var fault = Fault{ .phase = phase };
+        var pair = try loop_log.openWithFault(allocator, std.testing.io, loop_dir, "stream-fault", .{ .context = &fault, .check = Fault.check });
+        defer pair.deinit(std.testing.io);
+        const script = if (phase == .stdout_write)
+            "i=0; while [ $i -lt 100000 ]; do printf x; i=$((i+1)); done; cat >/dev/null"
+        else
+            "i=0; while [ $i -lt 100000 ]; do printf x >&2; i=$((i+1)); done; cat >/dev/null";
+        const argv = [_][]const u8{ "/bin/sh", "-c", script };
+        try std.testing.expectError(error.AuditLogFailure, executeTurn(.{
+            .allocator = allocator,
+            .io = std.testing.io,
+            .backend = .codex,
+            .argv = &argv,
+            .environ_map = &environ,
+            .loop_id = "stream-fault",
+            .loop_dir = loop_dir,
+            .prompt = prompt,
+            .log_pair = &pair,
+        }));
+        try std.testing.expectEqual(error.InjectedStreamFailure, pair.failure.?.cause);
+    }
 }
 
 test "real runner diagnoses a missing backend executable" {
