@@ -28,14 +28,15 @@ pub const Catalog = struct {
     }
 };
 
-pub fn load(allocator: std.mem.Allocator, io: std.Io, backend: options.BackendKind) !Catalog {
+pub fn load(allocator: std.mem.Allocator, io: std.Io, backend: options.BackendKind, backend_bin: ?[]const u8) !Catalog {
     var catalog: Catalog = .{ .allocator = allocator };
     errdefer catalog.deinit();
 
+    const executable = backend_bin orelse @tagName(backend);
     const argv: []const []const u8 = switch (backend) {
-        .codex => &.{ "codex", "debug", "models" },
-        .droid => &.{ "droid", "exec", "--help" },
-        .agy => &.{ "agy", "models" },
+        .codex => &.{ executable, "debug", "models" },
+        .droid => &.{ executable, "exec", "--help" },
+        .agy => &.{ executable, "models" },
     };
     const result = std.process.run(allocator, io, .{
         .argv = argv,
@@ -136,4 +137,43 @@ test "codex model parsing releases partial allocations" {
         if (saw_success) break;
     }
     try std.testing.expect(saw_success);
+}
+
+test "custom executable model discovery preserves literal path and adapter arguments" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const filename = "discovery helper; literal 'quote' $dollar";
+    {
+        const file = try tmp.dir.createFile(io, filename, .{ .permissions = .executable_file });
+        defer file.close(io);
+        try file.writeStreamingAll(io,
+            \\#!/bin/sh
+            \\if [ "$#" = 2 ] && [ "$1" = debug ] && [ "$2" = models ]; then
+            \\  printf '%s\n' '{"models":[{"slug":"custom-codex","display_name":"Custom Codex"}]}'
+            \\elif [ "$#" = 2 ] && [ "$1" = exec ] && [ "$2" = --help ]; then
+            \\  printf 'Available Models:\n  custom-droid  Custom Droid\n'
+            \\elif [ "$#" = 1 ] && [ "$1" = models ]; then
+            \\  printf 'custom-agy\tCustom Agy\n'
+            \\else
+            \\  exit 4
+            \\fi
+            \\
+        );
+    }
+    const executable = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, filename });
+    defer allocator.free(executable);
+    const cases = [_]struct { backend: options.BackendKind, expected: []const u8 }{
+        .{ .backend = .codex, .expected = "custom-codex" },
+        .{ .backend = .droid, .expected = "custom-droid" },
+        .{ .backend = .agy, .expected = "custom-agy" },
+    };
+    for (cases) |case| {
+        var catalog = try load(allocator, io, case.backend, executable);
+        defer catalog.deinit();
+        try std.testing.expectEqual(@as(usize, 1), catalog.items.items.len);
+        try std.testing.expectEqualStrings(case.expected, catalog.items.items[0].id);
+    }
 }

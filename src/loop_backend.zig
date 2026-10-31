@@ -64,26 +64,60 @@ pub const RealBackendRunner = struct {
     }
 };
 
+/// Zig's spawn searches the parent PATH even with an explicit child environment.
+/// Try literal path candidates so the actual child PATH determines selection.
+fn spawnSelected(request: TurnRequest) !std.process.Child {
+    const command = request.argv[0];
+    if (std.mem.indexOfScalar(u8, command, '/') != null) return spawnCandidate(request, request.argv);
+    const argv = try request.allocator.dupe([]const u8, request.argv);
+    defer request.allocator.free(argv);
+    const child_path = request.environ_map.get("PATH") orelse "/usr/local/bin:/bin:/usr/bin";
+    var entries = std.mem.splitScalar(u8, child_path, ':');
+    var denied = false;
+    while (entries.next()) |entry| {
+        const candidate = try std.fmt.allocPrint(request.allocator, "{s}/{s}", .{ if (entry.len == 0) "." else entry, command });
+        defer request.allocator.free(candidate);
+        argv[0] = candidate;
+        return spawnCandidate(request, argv) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue,
+            error.AccessDenied => {
+                denied = true;
+                continue;
+            },
+            else => return err,
+        };
+    }
+    return if (denied) error.AccessDenied else error.FileNotFound;
+}
+
+fn spawnCandidate(request: TurnRequest, argv: []const []const u8) !std.process.Child {
+    return std.process.spawn(request.io, .{
+        .argv = argv,
+        .cwd = request.cwd,
+        .environ_map = request.environ_map,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+}
+
 const stderr_tail_capacity = 8 * 1024;
 
 /// Spawn a backend, stream its stdout events, drain stderr concurrently, and return after wait.
 pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     try writePromptFile(request);
 
-    var child = std.process.spawn(request.io, .{
-        .argv = request.argv,
-        .cwd = request.cwd,
-        .environ_map = request.environ_map,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    }) catch |err| {
+    var child = spawnSelected(request) catch |err| {
         if (err == error.FileNotFound) {
             if (request.diagnostics) |diagnostics| {
-                try diagnostics.print("required backend CLI '{s}' was not found on PATH\n", .{@tagName(request.backend)});
+                try diagnostics.print("Backend executable '{s}' was not found (using child PATH)\n", .{request.argv[0]});
                 try diagnostics.flush();
             }
             return error.BackendNotFound;
+        }
+        if (request.diagnostics) |diagnostics| {
+            try diagnostics.print("Cannot launch backend executable '{s}': {s}\n", .{ request.argv[0], @errorName(err) });
+            try diagnostics.flush();
         }
         return err;
     };
@@ -273,6 +307,7 @@ pub const ChildEnvironment = struct {
 
 pub const BackendOptions = struct {
     backend: BackendKind,
+    backend_bin: ?[]const u8 = null,
     model: ?[]const u8 = null,
     yolo: bool = false,
     extra_args: []const []const u8 = &.{},
@@ -299,7 +334,7 @@ pub fn buildArgv(
 }
 
 fn buildCodex(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u8, session_id: ?[]const u8) !void {
-    try builder.add("codex");
+    try builder.add(config.backend_bin orelse "codex");
     try builder.add("exec");
     if (config.yolo) {
         try builder.add("--dangerously-bypass-approvals-and-sandbox");
@@ -336,7 +371,7 @@ fn hasSandboxOverride(args: []const []const u8) bool {
 }
 
 fn buildDroid(builder: *ArgvBuilder, config: BackendOptions, session_id: ?[]const u8, prompt_file: []const u8) !void {
-    try builder.add("droid");
+    try builder.add(config.backend_bin orelse "droid");
     try builder.add("exec");
     try builder.add(if (config.yolo) "--skip-permissions-unsafe" else "--auto");
     if (!config.yolo) try builder.add("high");
@@ -356,7 +391,7 @@ fn buildDroid(builder: *ArgvBuilder, config: BackendOptions, session_id: ?[]cons
 }
 
 fn buildAgy(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u8, session_id: ?[]const u8) !void {
-    try builder.add("agy");
+    try builder.add(config.backend_bin orelse "agy");
     try builder.add("-p");
     if (config.yolo) {
         try builder.add("--dangerously-skip-permissions");
@@ -413,12 +448,30 @@ fn buildChildEnvironmentWithBinaryDir(
 }
 
 /// Human-readable attach command for a native interactive backend session.
-pub fn formatNativeResumeCommand(allocator: std.mem.Allocator, backend: BackendKind, session_id: []const u8) ![]u8 {
-    return switch (backend) {
-        .codex => std.fmt.allocPrint(allocator, "codex resume {s}", .{session_id}),
-        .droid => std.fmt.allocPrint(allocator, "droid -r {s}", .{session_id}),
-        .agy => std.fmt.allocPrint(allocator, "agy --conversation {s}", .{session_id}),
+pub fn formatNativeResumeCommand(allocator: std.mem.Allocator, backend: BackendKind, backend_bin: ?[]const u8, session_id: []const u8) ![]u8 {
+    const command = try quoteShellWord(allocator, backend_bin orelse @tagName(backend));
+    defer allocator.free(command);
+    const session = try quoteShellWord(allocator, session_id);
+    defer allocator.free(session);
+    const attach = switch (backend) {
+        .codex => "resume",
+        .droid => "-r",
+        .agy => "--conversation",
     };
+    return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ command, attach, session });
+}
+
+fn quoteShellWord(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-";
+    if (value.len > 0 and std.mem.indexOfNone(u8, value, safe) == null) return allocator.dupe(u8, value);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '\'');
+    for (value) |byte| {
+        if (byte == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, byte);
+    }
+    try out.append(allocator, '\'');
+    return out.toOwnedSlice(allocator);
 }
 
 const ArgvBuilder = struct {
@@ -522,7 +575,7 @@ test "native resume command uses backend attach syntax" {
     };
     const backends = [_]BackendKind{ .codex, .droid, .agy };
     for (backends, 0..) |backend, i| {
-        const command = try formatNativeResumeCommand(allocator, backend, "s-1");
+        const command = try formatNativeResumeCommand(allocator, backend, null, "s-1");
         defer allocator.free(command);
         try std.testing.expectEqualStrings(expected[i], command);
     }
@@ -640,7 +693,7 @@ test "real runner diagnoses a missing backend executable" {
     };
     var runner_impl: RealBackendRunner = .{};
     try std.testing.expectError(error.BackendNotFound, runner_impl.runner().runTurn(request));
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "agy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), argv[0]) != null);
 }
 
 const RunnerEventCapture = struct {
@@ -679,4 +732,106 @@ const RunnerCallbackCapture = struct {
 fn expectArgv(actual: *const Argv, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, actual.items.len);
     for (expected, actual.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "custom executable changes only argv zero for every adapter and session form" {
+    const a = std.testing.allocator;
+    const bins = [_][]const u8{ "custom-wrapper", "./relative-wrapper", "/tmp/path with spaces/agent" };
+    for ([_]BackendKind{ .codex, .droid, .agy }) |backend| {
+        for ([_]?[]const u8{ null, "saved-session" }) |session| {
+            var standard = try buildArgv(a, .{ .backend = backend }, "/loops/id", session, "/loops/id/prompt.md");
+            defer standard.deinit();
+            for (bins) |bin| {
+                var custom = try buildArgv(a, .{ .backend = backend, .backend_bin = bin }, "/loops/id", session, "/loops/id/prompt.md");
+                defer custom.deinit();
+                try std.testing.expectEqualStrings(bin, custom.items[0]);
+                try std.testing.expectEqual(standard.items.len, custom.items.len);
+                for (standard.items[1..], custom.items[1..]) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+            }
+        }
+    }
+}
+
+test "native attach quotes executable and session as single literal shell words" {
+    const a = std.testing.allocator;
+    const command = try formatNativeResumeCommand(a, .codex, "/tmp/agent's $(literal)", "session; echo unsafe");
+    defer a.free(command);
+    try std.testing.expectEqualStrings("'/tmp/agent'\\''s $(literal)' resume 'session; echo unsafe'", command);
+}
+
+test "custom wrapper launches literally through effective child PATH and reports permission errors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    defer a.free(cwd);
+    const dir = try std.fs.path.resolve(a, &.{ cwd, ".zig-cache/tmp", &tmp.sub_path });
+    defer a.free(dir);
+    const filename = "custom wrapper $(literal)";
+    {
+        const file = try tmp.dir.createFile(io, filename, .{ .permissions = .executable_file });
+        defer file.close(io);
+        try file.writeStreamingAll(io,
+            \\#!/bin/sh
+            \\cat >/dev/null
+            \\printf '%s\n' "$0" "$@" > "$RECORD_PATH"
+            \\printf '{"type":"item.completed","item":{"type":"agent_message","text":"custom wrapper ran"}}\n'
+            \\printf '{"type":"turn.completed"}\n'
+        );
+    }
+    const binary = try std.fs.path.join(a, &.{ dir, filename });
+    defer a.free(binary);
+    const record = try std.fs.path.join(a, &.{ dir, "record" });
+    defer a.free(record);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const search_path = try std.fmt.allocPrint(a, "{s}:/bin:/usr/bin", .{dir});
+    defer a.free(search_path);
+    try env.put("PATH", search_path);
+    try env.put("RECORD_PATH", record);
+    var diag: std.Io.Writer.Allocating = .init(a);
+    defer diag.deinit();
+    for ([_][]const u8{ filename, binary }) |selection| {
+        var argv = try buildArgv(a, .{ .backend = .codex, .backend_bin = selection }, dir, null, "prompt.md");
+        defer argv.deinit();
+        var result = try executeTurn(.{ .allocator = a, .io = io, .backend = .codex, .argv = argv.items, .environ_map = &env, .loop_id = "fixture", .loop_dir = dir, .prompt = "literal prompt", .diagnostics = &diag.writer });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i32, 0), result.exit_code);
+        try std.testing.expectEqualStrings("custom wrapper ran", result.last_assistant_text.?);
+        const recorded = try std.Io.Dir.cwd().readFileAlloc(io, record, a, .limited(4096));
+        defer a.free(recorded);
+        try std.testing.expect(std.mem.startsWith(u8, recorded, binary));
+        try std.testing.expect(std.mem.indexOf(u8, recorded, "\nexec\n") != null);
+    }
+    // Resolve relative child PATH entries after changing to the saved worker cwd.
+    try tmp.dir.createDir(io, "saved-cwd", .default_dir);
+    const saved_cwd = try std.fs.path.join(a, &.{ dir, "saved-cwd" });
+    defer a.free(saved_cwd);
+    try env.put("PATH", "..:/bin:/usr/bin");
+    var relative_argv = try buildArgv(a, .{ .backend = .codex, .backend_bin = filename }, dir, "saved-session", "prompt.md");
+    defer relative_argv.deinit();
+    const relative_request: TurnRequest = .{ .allocator = a, .io = io, .backend = .codex, .argv = relative_argv.items, .environ_map = &env, .loop_id = "fixture", .loop_dir = dir, .prompt = "resumed prompt", .cwd = .{ .path = saved_cwd }, .diagnostics = &diag.writer };
+    var relative_result = try executeTurn(relative_request);
+    defer relative_result.deinit();
+    try std.testing.expectEqual(@as(i32, 0), relative_result.exit_code);
+    const relative_record = try std.Io.Dir.cwd().readFileAlloc(io, record, a, .limited(4096));
+    defer a.free(relative_record);
+    const relative_prefix = try std.fmt.allocPrint(a, "../{s}\n", .{filename});
+    defer a.free(relative_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, relative_record, relative_prefix));
+    try std.testing.expect(std.mem.indexOf(u8, relative_record, "\nresume\n--json\nsaved-session\n") != null);
+    // A changed PATH must be consulted on the next invocation, with no cached fallback.
+    try env.put("PATH", "/bin:/usr/bin");
+    try std.testing.expectError(error.BackendNotFound, executeTurn(relative_request));
+    try tmp.dir.writeFile(io, .{ .sub_path = "not executable", .data = "#!/bin/sh\nexit 0\n" });
+    const denied = try std.fs.path.join(a, &.{ dir, "not executable" });
+    defer a.free(denied);
+    const denied_argv = [_][]const u8{denied};
+    try std.testing.expectError(error.AccessDenied, executeTurn(.{ .allocator = a, .io = io, .backend = .codex, .argv = &denied_argv, .environ_map = &env, .loop_id = "fixture", .loop_dir = dir, .prompt = "prompt", .diagnostics = &diag.writer }));
+    try std.testing.expect(std.mem.indexOf(u8, diag.written(), denied) != null);
+    // Parent PATH contains sh, but child PATH deliberately does not. Never fall back.
+    try env.put("PATH", dir);
+    const missing_argv = [_][]const u8{"sh"};
+    try std.testing.expectError(error.BackendNotFound, executeTurn(.{ .allocator = a, .io = io, .backend = .codex, .argv = &missing_argv, .environ_map = &env, .loop_id = "fixture", .loop_dir = dir, .prompt = "prompt", .diagnostics = &diag.writer }));
 }

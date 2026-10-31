@@ -94,6 +94,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         .id = id,
         .status = .active,
         .backend = run_options.backend,
+        .backend_bin = run_options.backend_bin,
         .verifier_backend = run_options.verifier,
         .verifier_override_present = run_options.verifier_explicit,
         .verify_enabled = run_options.verify_enabled,
@@ -147,6 +148,7 @@ pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !E
 fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
     return .{
         .backend = state.backend,
+        .backend_bin = state.backend_bin,
         .verifier = state.verifier_backend,
         .verifier_explicit = state.verifier_override_present or state.verifier_backend != null,
         .verify_enabled = state.verify_enabled,
@@ -278,6 +280,7 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
         defer allocator.free(prompt_file);
         var argv = try backend.buildArgv(allocator, .{
             .backend = turn_backend,
+            .backend_bin = if (turn_backend == current.backend) current.backend_bin else null,
             .model = current.model,
             .yolo = current.yolo,
             .extra_args = current.extra_args,
@@ -497,7 +500,7 @@ fn pauseLoop(services: Services, presenter: *stream.Presenter, id: []const u8, r
     defer outcome.deinit();
     try outcome.writer.print("{s}. {s}", .{ reason, resume_hint });
     if (state.worker_session_id) |session_id| {
-        const native = try backend.formatNativeResumeCommand(services.allocator, state.backend, session_id);
+        const native = try backend.formatNativeResumeCommand(services.allocator, state.backend, state.backend_bin, session_id);
         defer services.allocator.free(native);
         try services.stdout.print("Attach: {s}\n", .{native});
         try outcome.writer.print(". Attach: {s}", .{native});
@@ -1120,6 +1123,7 @@ const FakeClock = struct {
 };
 
 const FakeCall = struct {
+    executable: []u8,
     backend: backend.BackendKind,
     is_verifier: bool,
     session_id_absent: bool,
@@ -1127,6 +1131,7 @@ const FakeCall = struct {
 
     fn deinit(self: *FakeCall, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
+        allocator.free(self.executable);
     }
 };
 
@@ -1159,14 +1164,19 @@ const FakeRunner = struct {
             .droid => argvHas(request.argv, "-s"),
             .agy => argvHas(request.argv, "--conversation"),
         };
-        try self.calls.append(self.store.allocator, .{
-            .backend = request.backend,
-            .is_verifier = is_verifier,
-            .session_id_absent = !has_session_flag,
-            .prompt = try self.store.allocator.dupe(u8, request.prompt),
-        });
-        const call_index = self.calls.items.len - 1;
-        errdefer self.calls.items[call_index].deinit(self.store.allocator);
+        {
+            const executable = try self.store.allocator.dupe(u8, request.argv[0]);
+            errdefer self.store.allocator.free(executable);
+            const prompt = try self.store.allocator.dupe(u8, request.prompt);
+            errdefer self.store.allocator.free(prompt);
+            try self.calls.append(self.store.allocator, .{
+                .executable = executable,
+                .backend = request.backend,
+                .is_verifier = is_verifier,
+                .session_id_absent = !has_session_flag,
+                .prompt = prompt,
+            });
+        }
 
         if (!is_verifier and request.on_session_id != null) {
             const state_parsed = try self.store.loadState(request.loop_id);
@@ -1274,6 +1284,7 @@ test "captured inputs survive deletion and legacy resume preserves shared execut
     try std.testing.expectEqual(ExitCode.failure, try run(services, .{
         .backend = .codex,
         .verifier = .agy,
+        .backend_bin = "/captured/tool with spaces",
         .model = "captured-model",
         .yolo = true,
         .output_mode = .quiet,
@@ -1305,6 +1316,9 @@ test "captured inputs survive deletion and legacy resume preserves shared execut
     try std.testing.expectEqualStrings(objective, completed.value.objective);
     try std.testing.expectEqualStrings(paused.value.cwd, completed.value.cwd);
     try std.testing.expectEqualStrings("captured-model", completed.value.model.?);
+    try std.testing.expectEqualStrings("/captured/tool with spaces", completed.value.backend_bin.?);
+    try std.testing.expectEqualStrings("/captured/tool with spaces", fake.calls.items[1].executable);
+    try std.testing.expectEqualStrings("agy", fake.calls.items[2].executable);
     try std.testing.expectEqual(options.OutputMode.quiet, completed.value.output_mode);
     try std.testing.expectEqualStrings("--captured-arg", completed.value.extra_args[0]);
     try std.testing.expect(completed.value.yolo);
@@ -1315,4 +1329,38 @@ test "captured inputs survive deletion and legacy resume preserves shared execut
     try std.testing.expectEqualStrings("worker-session", completed.value.worker_session_id.?);
     try expectFakeCall(&fake.calls.items[1], .codex, true, "captured\nmultiline objective");
     try expectFakeCall(&fake.calls.items[2], .agy, false, "captured\nmultiline objective");
+}
+
+test "custom executable survives retries continuation and resume with role isolation" {
+    const a = std.testing.allocator;
+    for ([_]options.BackendKind{ .codex, .droid, .agy }) |kind| {
+        for ([_]bool{ false, true }) |different_verifier| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+            defer a.free(root);
+            var store = try store_mod.Store.init(a, std.testing.io, root);
+            defer store.deinit();
+            var env = std.process.Environ.Map.init(a);
+            defer env.deinit();
+            var output: std.Io.Writer.Allocating = .init(a);
+            defer output.deinit();
+            var fake = FakeRunner{ .store = &store, .script = &.{ .worker_retry_fail, .worker_progress, .worker_interrupted, .worker_complete, .verifier_pass } };
+            defer fake.deinit(a);
+            var sleeper = FakeSleeper{ .allocator = a };
+            defer sleeper.deinit();
+            const verifier: options.BackendKind = if (!different_verifier) kind else if (kind == .codex) .agy else .codex;
+            const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &output.writer, .sleeper = sleeper.sleeper() };
+            try std.testing.expectEqual(ExitCode.failure, try run(services, .{ .backend = kind, .backend_bin = "/custom/tool with spaces", .verifier = verifier, .prompt = "task", .output_mode = .quiet }));
+            const id = (try store.resolveLatestLoopId()).?;
+            defer a.free(id);
+            try std.testing.expectEqual(ExitCode.ok, try resumeLoop(services, id, null));
+            try std.testing.expectEqual(@as(usize, 5), fake.calls.items.len);
+            for (fake.calls.items[0..4]) |call| try std.testing.expectEqualStrings("/custom/tool with spaces", call.executable);
+            try std.testing.expectEqualStrings(if (different_verifier) @tagName(verifier) else "/custom/tool with spaces", fake.calls.items[4].executable);
+            var state = try store.loadState(id);
+            defer state.deinit();
+            try std.testing.expectEqualStrings("/custom/tool with spaces", state.value.backend_bin.?);
+        }
+    }
 }

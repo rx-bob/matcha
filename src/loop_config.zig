@@ -5,6 +5,7 @@ const path = @import("path.zig");
 pub const Config = struct {
     schema_version: u32 = 1,
     backend: options.BackendKind = .codex,
+    backend_bin: ?[]const u8 = null,
     model: ?[]const u8 = null,
     max_turns: ?u32 = null,
     prompt_file: ?[]const u8 = null,
@@ -39,6 +40,7 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, cli: options.RunOptions
     if (user_path) |source| try applyLayer(a, io, &settings, source, false, false, diagnostic, &verifier_present);
     try applyLayer(a, io, &settings, project_path, true, cli.config_path != null, diagnostic, &verifier_present);
     result.run.backend = if (cli.backend_explicit) cli.backend else settings.backend;
+    result.run.backend_bin = if (cli.backend_bin) |v| try resolveExecutablePath(a, io, ".", v) else settings.backend_bin;
     result.run.model = cli.model orelse settings.model;
     result.run.max_turns = if (cli.turn_limit_explicit) cli.max_turns else settings.max_turns;
     result.run.verifier_explicit = cli.verifier_explicit or verifier_present;
@@ -70,13 +72,13 @@ fn applyLayer(a: std.mem.Allocator, io: std.Io, settings: *Config, source: []con
         try diagnostic.print("Invalid config {s}: {s}\n", .{ source, @errorName(err) });
         return err;
     };
-    applyObject(a, settings, root, source, project, diagnostic, verifier_present) catch |err| {
+    applyObject(a, settings, root, source, project, diagnostic, verifier_present, io) catch |err| {
         try diagnostic.print("Invalid config {s}: {s}\n", .{ source, @errorName(err) });
         return err;
     };
 }
 
-fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, source: []const u8, project: bool, diagnostic: *std.Io.Writer, verifier_present: *bool) !void {
+fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, source: []const u8, project: bool, diagnostic: *std.Io.Writer, verifier_present: *bool, io: std.Io) !void {
     if (root != .object) return error.InvalidConfigObject;
     if (root.object.get("schema_version")) |version| {
         if (version != .integer or version.integer != 1) return error.UnsupportedSchemaVersion;
@@ -106,7 +108,7 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
                 return error.InvalidFieldType;
             }
         }
-        if (std.mem.eql(u8, key, "model") or std.mem.eql(u8, key, "prompt_file")) {
+        if (std.mem.eql(u8, key, "model") or std.mem.eql(u8, key, "prompt_file") or std.mem.eql(u8, key, "backend_bin")) {
             if (raw != .string and raw != .null) return error.InvalidFieldType;
         }
         if (std.mem.eql(u8, key, "extra_backend_args")) {
@@ -134,6 +136,14 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
             try diagnostic.print("Config {s}: unknown loop field {s}\n", .{ source, key });
             return error.UnknownField;
         }
+        if (std.mem.eql(u8, key, "backend_bin")) {
+            if (settings.backend_bin) |binary_value| {
+                settings.backend_bin = resolveExecutablePath(a, io, std.fs.path.dirname(source) orelse ".", binary_value) catch |err| {
+                    try diagnostic.print("Config {s}, field backend_bin: {s}\n", .{ source, @errorName(err) });
+                    return err;
+                };
+            }
+        }
         if (std.mem.eql(u8, key, "prompt_file")) {
             if (settings.prompt_file) |file| settings.prompt_file = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(source) orelse ".", file });
         }
@@ -141,6 +151,19 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
         if (std.mem.eql(u8, key, "token_budget") and settings.token_budget == 0) return error.InvalidLimit;
         if (std.mem.eql(u8, key, "timeout_seconds") and settings.timeout_seconds == 0) return error.InvalidLimit;
     }
+}
+
+/// Bare names remain late-bound to the invocation PATH. Paths capture their source base.
+pub fn resolveExecutablePath(a: std.mem.Allocator, io: std.Io, base: []const u8, value: []const u8) ![]const u8 {
+    if (value.len == 0 or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidExecutable;
+    const path_bearing = std.mem.indexOfScalar(u8, value, '/') != null or
+        (@import("builtin").os.tag == .windows and std.mem.indexOfScalar(u8, value, '\\') != null);
+    if (path_bearing) {
+        const cwd = try std.process.currentPathAlloc(io, a);
+        defer a.free(cwd);
+        return std.fs.path.resolve(a, &.{ cwd, base, value });
+    }
+    return a.dupe(u8, value);
 }
 
 pub fn configPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
@@ -345,7 +368,7 @@ test "resolved layer ownership cleans all partial allocation failures" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user.json", .data = "{\"model\":\"user\",\"prompt_file\":\"user.md\",\"extra_backend_args\":[\"--one\",\"two\"]}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user.json", .data = "{\"model\":\"user\",\"backend_bin\":\"./user tool\",\"prompt_file\":\"user.md\",\"extra_backend_args\":[\"--one\",\"two\"]}" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = "{\"schema_version\":1,\"loop\":{\"model\":\"project\",\"prompt_file\":\"project.md\",\"extra_backend_args\":[\"replacement\"]}}" });
     const user = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/user.json", .{tmp.sub_path});
     defer a.free(user);
@@ -407,4 +430,39 @@ test "interactive save preserves absence of verifier override" {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, source, a, .limited(4096));
     defer a.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "verifier") == null);
+}
+
+test "backend executable resolution preserves source base and bare names" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const user = try std.fs.path.join(a, &.{ root, "user.json" });
+    defer a.free(user);
+    const project = try std.fs.path.join(a, &.{ root, "project.json" });
+    defer a.free(project);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user.json", .data = "{\"backend_bin\":\"./tools/worker with spaces\"}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = "{\"schema_version\":1,\"loop\":{\"model\":\"project-model\"}}" });
+    var diag: std.Io.Writer.Allocating = .init(a);
+    defer diag.deinit();
+    var inherited = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "x" }, user, project, &diag.writer);
+    defer inherited.deinit();
+    const expected = try resolveExecutablePath(a, std.testing.io, root, "./tools/worker with spaces");
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, inherited.run.backend_bin.?);
+    for ([_][]const u8{ "worker-name", "./worker with spaces" }) |binary| {
+        var cli = try resolve(a, std.testing.io, .{ .backend = .codex, .backend_bin = binary, .prompt = "x" }, user, project, &diag.writer);
+        defer cli.deinit();
+        const resolved = try resolveExecutablePath(a, std.testing.io, ".", binary);
+        defer a.free(resolved);
+        try std.testing.expectEqualStrings(resolved, cli.run.backend_bin.?);
+        if (std.mem.startsWith(u8, binary, "./")) try std.testing.expect(std.fs.path.isAbsolute(cli.run.backend_bin.?)) else try std.testing.expectEqualStrings(binary, cli.run.backend_bin.?);
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = "{\"schema_version\":1,\"loop\":{\"backend_bin\":null}}" });
+    var cleared = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "x" }, user, project, &diag.writer);
+    defer cleared.deinit();
+    try std.testing.expect(cleared.run.backend_bin == null);
+    try std.testing.expectError(error.InvalidExecutable, resolveExecutablePath(a, std.testing.io, ".", ""));
+    try std.testing.expectError(error.InvalidExecutable, resolveExecutablePath(a, std.testing.io, ".", "bad\x00name"));
 }

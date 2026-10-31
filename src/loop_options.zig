@@ -7,6 +7,7 @@ pub const LoopStatus = enum { complete, blocked };
 
 pub const RunOptions = struct {
     backend: BackendKind,
+    backend_bin: ?[]const u8 = null,
     backend_explicit: bool = false,
     verifier: ?BackendKind = null,
     verifier_explicit: bool = false,
@@ -70,6 +71,7 @@ fn parseBackend(value: []const u8) ?BackendKind {
 fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty: bool, stdin_bytes: []const u8) LoopCommandResult {
     var backend: BackendKind = .codex;
     var backend_explicit = false;
+    var backend_bin: ?[]const u8 = null;
     var verifier: ?BackendKind = null;
     var no_verify = false;
     var model: ?[]const u8 = null;
@@ -97,7 +99,14 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
             extra_args = args[i + 1 ..];
             break;
         }
-        if (std.mem.eql(u8, arg, "--config")) {
+        if (std.mem.eql(u8, arg, "--backend-bin")) {
+            i += 1;
+            backend_bin = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+            if (backend_bin.?.len == 0) return .{ .err = .{ .missing_value = arg } };
+        } else if (std.mem.startsWith(u8, arg, "--backend-bin=")) {
+            backend_bin = arg["--backend-bin=".len..];
+            if (backend_bin.?.len == 0) return .{ .err = .{ .missing_value = "--backend-bin" } };
+        } else if (std.mem.eql(u8, arg, "--config")) {
             i += 1;
             config_path = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
         } else if (std.mem.startsWith(u8, arg, "--config=")) {
@@ -190,6 +199,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     return .{ .ok = .{ .run = .{
         .backend = backend,
         .backend_explicit = backend_explicit,
+        .backend_bin = backend_bin,
         .verifier = verifier,
         .verifier_explicit = verifier != null,
         .verify_enabled = !no_verify,
@@ -418,4 +428,15 @@ test "loop subcommands validate update and verify combinations" {
         .ok => |c| c == .verify,
         else => false,
     });
+}
+
+test "backend binary is one argument in both option forms" {
+    for ([_][]const []const u8{ &.{ "task", "--backend-bin", "/tool with spaces" }, &.{ "--backend-bin=/tool with spaces", "task" } }) |args| {
+        const parsed = parseLoopCommand(std.testing.allocator, args, true, "");
+        const run_options = parsed.ok.run;
+        defer std.testing.allocator.free(run_options.prompt);
+        try std.testing.expectEqualStrings("/tool with spaces", run_options.backend_bin.?);
+    }
+    try std.testing.expect(parseLoopCommand(std.testing.allocator, &.{"--backend-bin="}, true, "") == .err);
+    try std.testing.expect(parseLoopCommand(std.testing.allocator, &.{"--backend-bin"}, true, "") == .err);
 }

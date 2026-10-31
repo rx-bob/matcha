@@ -337,7 +337,16 @@ fn runLoopConfig(io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !Ex
         config.model = null;
     }
 
-    var catalog = try loop_models.load(std.heap.page_allocator, io, config.backend);
+    var discovery_binary: ?[]const u8 = null;
+    defer if (discovery_binary) |v| std.heap.page_allocator.free(v);
+    if (config.backend == previous_backend) {
+        if (config.backend_bin) |v| {
+            const source = try loop_config.configPathAlloc(std.heap.page_allocator);
+            defer std.heap.page_allocator.free(source);
+            discovery_binary = try loop_config.resolveExecutablePath(std.heap.page_allocator, io, std.fs.path.dirname(source) orelse ".", v);
+        }
+    }
+    var catalog = try loop_models.load(std.heap.page_allocator, io, config.backend, discovery_binary);
     defer catalog.deinit();
     var model_choices: std.ArrayList(ConfigModelChoice) = .empty;
     defer {
@@ -626,6 +635,7 @@ fn writeLoopShow(store: *const loop_store.Store, id: []const u8, stdout: *std.Io
     if (state.token_budget) |value| try stdout.print("{d}", .{value}) else try stdout.writeAll("unlimited");
     try stdout.writeAll(", timeout=");
     if (state.timeout_seconds) |value| try stdout.print("{d}s", .{value}) else try stdout.writeAll("unlimited");
+    try stdout.print("\nExecutable: {s}", .{state.backend_bin orelse @tagName(state.backend)});
     try stdout.print("\nModel: {s}\nYolo: {s}\nSession: {s}\nWorking directory: {s}\nObjective:\n{s}\n", .{
         state.model orelse "backend default",
         if (state.yolo) "enabled" else "disabled",
@@ -694,6 +704,7 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\Run options --model, -b, --max-turns, and --unlimited override saved defaults.
         \\Prompt may come from positional text, --prompt-file, or piped stdin. Options work before or after text.
         \\Options include --yolo, --verifier, --no-verify, --token-budget, --timeout, --quiet, and --json.
+        \\--backend-bin <executable> selects one executable; arguments belong after --.
         \\--config <path> selects a project config instead of launch-directory .matcha.json.
         \\Precedence: CLI > project > user defaults. Prompt: explicit > pipe > configured file.
         \\Prompt files and stdin are limited to 1 MiB; file paths in configs are source-relative.
@@ -2534,6 +2545,7 @@ const ResumeCliFake = struct {
         var state = loaded.value;
         state.status = .complete;
         state.completion_summary = "CLI fake completed.";
+        try std.testing.expectEqualStrings(state.backend_bin orelse @tagName(state.backend), request.argv[0]);
         try self.store.saveState(state);
         return .{
             .allocator = self.allocator,
@@ -2647,7 +2659,7 @@ test "configured CLI captures winning prompt and callback writes preserve resolv
     defer a.free(root);
     const project = try std.fmt.allocPrint(a, "{s}/selected.json", .{root});
     defer a.free(project);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected.json", .data = "{\"schema_version\":1,\"loop\":{\"backend\":\"droid\",\"model\":\"captured-model\",\"max_turns\":7,\"prompt_file\":\"task.md\",\"verify_enabled\":false,\"yolo\":true,\"output_mode\":\"quiet\"}}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected.json", .data = "{\"schema_version\":1,\"loop\":{\"backend\":\"droid\",\"backend_bin\":\"./custom worker\",\"model\":\"captured-model\",\"max_turns\":7,\"prompt_file\":\"task.md\",\"verify_enabled\":false,\"yolo\":true,\"output_mode\":\"quiet\"}}" });
     const file_prompt = "  first page\n\nsecond page\n";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "task.md", .data = file_prompt });
     var store = try loop_store.Store.init(a, std.testing.io, root);
@@ -2687,6 +2699,9 @@ test "configured CLI captures winning prompt and callback writes preserve resolv
             found = true;
             try std.testing.expectEqualStrings(cwd, state.value.cwd);
             try std.testing.expectEqualStrings("captured-model", state.value.model.?);
+            const expected_binary = try loop_config.resolveExecutablePath(a, std.testing.io, root, "./custom worker");
+            defer a.free(expected_binary);
+            try std.testing.expectEqualStrings(expected_binary, state.value.backend_bin.?);
             try std.testing.expectEqual(loop_options.BackendKind.droid, state.value.backend);
             try std.testing.expectEqual(@as(u32, if (index == 1) 5 else 7), state.value.max_turns.?);
             try std.testing.expectEqual(ExitCode.ok, try updateLoop(&store, candidate, .{ .status = .complete, .summary = "callback" }, &out.writer, &err.writer));

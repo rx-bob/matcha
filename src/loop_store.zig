@@ -11,6 +11,7 @@ pub const LoopState = struct {
     id: []const u8,
     status: LoopStatus = .active,
     backend: options.BackendKind,
+    backend_bin: ?[]const u8 = null,
     verifier_backend: ?options.BackendKind = null,
     verifier_override_present: bool = false,
     verify_enabled: bool = true,
@@ -262,6 +263,7 @@ test "store creates and round-trips every state field with atomic overwrite" {
         .backend = .codex,
         .verifier_backend = .agy,
         .verifier_override_present = true,
+        .backend_bin = "/tools/my backend",
         .model = "model \"quoted\"",
         .output_mode = .quiet,
         .yolo = true,
@@ -287,6 +289,7 @@ test "store creates and round-trips every state field with atomic overwrite" {
     try std.testing.expectEqual(state.schema_version, loaded.value.schema_version);
     try std.testing.expectEqual(state.status, loaded.value.status);
     try std.testing.expectEqual(state.backend, loaded.value.backend);
+    try std.testing.expectEqualStrings(state.backend_bin.?, loaded.value.backend_bin.?);
     try std.testing.expectEqual(state.verifier_backend, loaded.value.verifier_backend);
     try std.testing.expectEqual(state.verifier_override_present, loaded.value.verifier_override_present);
     try std.testing.expectEqual(state.output_mode, loaded.value.output_mode);

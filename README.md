@@ -112,7 +112,7 @@ retain the flat JSON format at `$XDG_CONFIG_HOME/matcha/loop.json` (otherwise
 `~/.config/matcha/loop.json`). Interactive `matcha loop config` edits that user
 file and preserves other supported settings.
 
-Supported loop fields are `backend`, `model`, `max_turns`, `prompt_file`,
+Supported loop fields are `backend`, `backend_bin`, `model`, `max_turns`, `prompt_file`,
 `verifier` (backend name), `verify_enabled`, `yolo`, `token_budget`,
 `timeout_seconds`, `output_mode` (`live`, `quiet`, `json`), and
 `extra_backend_args`. Unknown fields, invalid types, unsupported versions, and
@@ -134,3 +134,21 @@ Resume uses those saved values even if source files change or disappear. Legacy
 snapshots retain their shared worker/verifier model and arguments; inspection
 never rewrites them. Ambient shell environment remains inherited. Callback
 updates preserve captured settings, and saves replace state atomically.
+
+### Custom loop executables
+
+`matcha loop --backend-bin '/opt/agent builds/codex-dev' "fix the build"`
+selects an executable for the chosen backend. The project/user setting is
+`backend_bin`; `null` clears an inherited selection. Standard `codex`, `droid`,
+and `agy` names remain the defaults. The value is one executable, never a shell
+command; pass extra arguments after `--`.
+
+Bare names resolve on the effective child PATH at invocation time. Values with
+a path separator resolve relative to their config file, or the launch directory
+for CLI values. Snapshots retain that selection across retries and resume.
+A verifier using the worker's backend shares its selected executable; a different
+backend uses its own standard executable. Native session attach hints quote the
+selected executable, and interactive model discovery uses it when retaining the
+saved backend selection. Executable versions and wrappers must support the
+existing backend adapter's flags and protocol; Matcha does not install or probe
+agent builds by running trial tasks.
