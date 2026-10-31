@@ -36,6 +36,7 @@ pub const RunOptions = struct {
     extra_args_explicit: bool = false,
     prompt_file: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    log_dir: ?[]const u8 = null,
     extra_backend_args: []const []const u8 = &.{},
 };
 
@@ -110,6 +111,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     var positional = false;
     var prompt_file: ?[]const u8 = null;
     var config_path: ?[]const u8 = null;
+    var log_dir: ?[]const u8 = null;
     var extra_args_explicit = false;
     var extra_args: []const []const u8 = &.{};
 
@@ -155,6 +157,12 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         } else if (std.mem.startsWith(u8, arg, "--config=")) {
             config_path = arg["--config=".len..];
             if (config_path.?.len == 0) return .{ .err = .{ .missing_value = "--config" } };
+        } else if (std.mem.eql(u8, arg, "--log-dir")) {
+            i += 1;
+            log_dir = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+        } else if (std.mem.startsWith(u8, arg, "--log-dir=")) {
+            log_dir = arg["--log-dir=".len..];
+            if (log_dir.?.len == 0) return .{ .err = .{ .missing_value = "--log-dir" } };
         } else if (std.mem.eql(u8, arg, "--prompt-file")) {
             i += 1;
             prompt_file = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
@@ -272,6 +280,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         .extra_args_explicit = extra_args_explicit,
         .prompt_file = prompt_file,
         .config_path = config_path,
+        .log_dir = log_dir,
         .extra_backend_args = extra_args,
     } } };
 }

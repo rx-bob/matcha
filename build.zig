@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
 
     const leak_sensitive_test_roots = .{
         "src/loop_backend.zig",
+        "src/loop_log.zig",
         "src/loop_stream.zig",
         "src/loop_store.zig",
         "src/loop_options.zig",

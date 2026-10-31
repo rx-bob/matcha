@@ -17,6 +17,7 @@ pub const Config = struct {
     token_budget: ?u64 = null,
     timeout_seconds: ?u64 = null,
     output_mode: options.OutputMode = .live,
+    log_dir: ?[]const u8 = null,
     extra_backend_args: []const []const u8 = &.{},
 };
 
@@ -71,11 +72,13 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, cli: options.RunOptions
     result.run.token_budget = cli.token_budget orelse settings.token_budget;
     result.run.timeout_seconds = cli.timeout_seconds orelse settings.timeout_seconds;
     result.run.output_mode = if (cli.output_mode != .live) cli.output_mode else settings.output_mode;
+    result.run.log_dir = cli.log_dir orelse settings.log_dir;
     result.run.extra_backend_args = if (cli.extra_args_explicit) cli.extra_backend_args else settings.extra_backend_args;
     result.run.prompt_file = cli.prompt_file orelse settings.prompt_file;
     result.run.prompt = try a.dupe(u8, result.run.prompt);
     if (result.run.model) |v| result.run.model = try a.dupe(u8, v);
     if (result.run.prompt_file) |v| result.run.prompt_file = try a.dupe(u8, v);
+    if (result.run.log_dir) |v| result.run.log_dir = try std.fs.path.resolve(a, &.{ ".", v });
     if (result.run.config_path) |v| result.run.config_path = try a.dupe(u8, v);
     const args = try a.alloc([]const u8, result.run.extra_backend_args.len);
     for (result.run.extra_backend_args, 0..) |v, i| args[i] = try a.dupe(u8, v);
@@ -158,7 +161,7 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
                 return error.InvalidFieldType;
             }
         }
-        if (std.mem.eql(u8, key, "model") or std.mem.eql(u8, key, "prompt_file") or std.mem.eql(u8, key, "backend_bin")) {
+        if (std.mem.eql(u8, key, "model") or std.mem.eql(u8, key, "prompt_file") or std.mem.eql(u8, key, "backend_bin") or std.mem.eql(u8, key, "log_dir")) {
             if (raw != .string and raw != .null) return error.InvalidFieldType;
         }
         if (std.mem.eql(u8, key, "extra_backend_args")) {
@@ -196,6 +199,9 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
         }
         if (resolve_paths and std.mem.eql(u8, key, "prompt_file")) {
             if (settings.prompt_file) |file| settings.prompt_file = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(source) orelse ".", file });
+        }
+        if (resolve_paths and std.mem.eql(u8, key, "log_dir")) {
+            if (settings.log_dir) |directory| settings.log_dir = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(source) orelse ".", directory });
         }
         if (std.mem.eql(u8, key, "max_turns") and settings.max_turns == 0) return error.InvalidLimit;
         if (std.mem.eql(u8, key, "token_budget") and settings.token_budget == 0) return error.InvalidLimit;

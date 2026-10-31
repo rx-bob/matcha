@@ -1,6 +1,7 @@
 const std = @import("std");
 const backend = @import("loop_backend.zig");
 const options = @import("loop_options.zig");
+const loop_log = @import("loop_log.zig");
 const prompts = @import("loop_prompts.zig");
 const store_mod = @import("loop_store.zig");
 const stream = @import("loop_stream.zig");
@@ -102,6 +103,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         .verify_enabled = run_options.verify_enabled,
         .model = run_options.model,
         .output_mode = run_options.output_mode,
+        .log_dir = run_options.log_dir,
         .yolo = run_options.yolo,
         .sandbox = run_options.sandbox,
         .policy_validation_enabled = true,
@@ -182,6 +184,7 @@ fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
         .token_budget = state.token_budget,
         .timeout_seconds = state.timeout_seconds,
         .output_mode = state.output_mode,
+        .log_dir = state.log_dir,
         .prompt = state.objective,
         .extra_backend_args = state.extra_args,
     };
@@ -261,6 +264,19 @@ test "resume options come only from captured snapshot, including legacy shared v
 
 fn runExisting(services: Services, run_options: options.RunOptions, id: []const u8) !ExitCode {
     const allocator = services.allocator;
+    var log_pair: ?loop_log.Pair = if (run_options.log_dir) |directory| try loop_log.open(allocator, services.io, directory, id) else null;
+    defer if (log_pair) |*pair| pair.deinit(services.io);
+    if (log_pair) |*pair| {
+        var snapshot = try services.store.loadState(id);
+        defer snapshot.deinit();
+        snapshot.value.last_invocation_id = pair.invocation_id;
+        try services.store.saveState(snapshot.value);
+        try pair.record(services.io, id, "start", "invocation started");
+        if (services.stderr) |stderr| {
+            try stderr.print("Loop logs: {s}/{s}.log and {s}/{s}.jsonl\n", .{ run_options.log_dir.?, pair.invocation_id, run_options.log_dir.?, pair.invocation_id });
+            try stderr.flush();
+        }
+    }
     var signal_guard = SignalGuard.install();
     defer signal_guard.deinit();
     var initial_state = try services.store.loadState(id);
