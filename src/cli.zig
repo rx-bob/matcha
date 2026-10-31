@@ -81,7 +81,7 @@ fn runArgsWithLoopStoreRoot(
     return runArgsRuntime(args, io, stdout, stderr, store_root, &environment, null);
 }
 
-fn runArgsRuntime(
+pub fn runArgsRuntime(
     args: []const []const u8,
     io: std.Io,
     stdout: *std.Io.Writer,
@@ -144,13 +144,13 @@ fn runLoopCommand(
     return runLoopCommandWithInputs(io, args, stdout, stderr, store_root, parent_environment, runner_override, null);
 }
 
-const LoopInputs = struct {
+pub const LoopInputs = struct {
     user_path: ?[]const u8 = null,
     project_path: []const u8,
     stdin_bytes: []const u8 = "",
 };
 
-fn runLoopCommandWithInputs(
+pub fn runLoopCommandWithInputs(
     io: std.Io,
     args: []const []const u8,
     stdout: *std.Io.Writer,

@@ -85,11 +85,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_markdown_tests = b.addRunArtifact(markdown_tests);
 
+    const workflow_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli_workflow_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{"offline project config drives real worker verifier logs and durable resume repairs"},
+    });
+    const run_workflow_tests = b.addRunArtifact(workflow_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_module_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_ownership_tests.step);
     test_step.dependOn(&run_markdown_tests.step);
+    test_step.dependOn(&run_workflow_tests.step);
 
     const leak_sensitive_test_roots = .{
         "src/loop_backend.zig",
