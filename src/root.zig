@@ -10,6 +10,12 @@ pub const serve_catalog = @import("serve_catalog.zig");
 pub const serve_routes = @import("serve_routes.zig");
 pub const serve = @import("serve.zig");
 pub const serve_test = @import("serve_test.zig");
+pub const loop = @import("loop.zig");
+pub const loop_backend = @import("loop_backend.zig");
+pub const loop_options = @import("loop_options.zig");
+pub const loop_prompts = @import("loop_prompts.zig");
+pub const loop_store = @import("loop_store.zig");
+pub const loop_stream = @import("loop_stream.zig");
 
 pub const version = cli.version;
 

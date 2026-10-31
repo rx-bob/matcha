@@ -27,6 +27,7 @@ pub const LoopState = struct {
     last_blocker_summary: ?[]const u8 = null,
     last_verifier_feedback: ?[]const u8 = null,
     completion_summary: ?[]const u8 = null,
+    objective_update_pending: bool = false,
     extra_args: []const []const u8 = &.{},
 };
 

@@ -14,7 +14,9 @@ pub const Services = struct {
     parent_environment: *const std.process.Environ.Map,
     runner: backend.BackendRunner,
     stdout: *std.Io.Writer,
+    stderr: ?*std.Io.Writer = null,
     clock: ?Clock = null,
+    sleeper: ?Sleeper = null,
 };
 
 pub const Clock = struct {
@@ -25,6 +27,59 @@ pub const Clock = struct {
         return self.nowMillisecondsFn(self.context);
     }
 };
+
+pub const Sleeper = struct {
+    context: *anyopaque,
+    sleepFn: *const fn (context: *anyopaque, io: std.Io, milliseconds: u64) anyerror!void,
+
+    fn sleep(self: Sleeper, io: std.Io, milliseconds: u64) anyerror!void {
+        return self.sleepFn(self.context, io, milliseconds);
+    }
+};
+
+var active_child_pid: std.atomic.Value(std.posix.pid_t) = .init(-1);
+var caught_signal: std.atomic.Value(c_int) = .init(0);
+extern "c" fn kill(pid: std.posix.pid_t, signal_number: c_int) c_int;
+
+fn loopSignalHandler(signal: std.posix.SIG) callconv(.c) void {
+    caught_signal.store(@intCast(@intFromEnum(signal)), .release);
+    const pid = active_child_pid.load(.acquire);
+    if (pid > 0) _ = kill(pid, @intCast(@intFromEnum(signal)));
+}
+
+const SignalGuard = struct {
+    old_interrupt: std.posix.Sigaction,
+    old_terminate: std.posix.Sigaction,
+
+    fn install() SignalGuard {
+        caught_signal.store(0, .release);
+        active_child_pid.store(-1, .release);
+        const handler: std.posix.Sigaction = .{
+            .handler = .{ .handler = loopSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_interrupt: std.posix.Sigaction = undefined;
+        var old_terminate: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.INT, &handler, &old_interrupt);
+        std.posix.sigaction(std.posix.SIG.TERM, &handler, &old_terminate);
+        return .{ .old_interrupt = old_interrupt, .old_terminate = old_terminate };
+    }
+
+    fn deinit(self: *SignalGuard) void {
+        active_child_pid.store(-1, .release);
+        std.posix.sigaction(std.posix.SIG.INT, &self.old_interrupt, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &self.old_terminate, null);
+    }
+};
+
+fn childIdChanged(_: ?*anyopaque, child_id: ?std.process.Child.Id) void {
+    if (child_id) |pid| active_child_pid.store(@intCast(pid), .release) else active_child_pid.store(-1, .release);
+}
+
+fn signalWasCaught() bool {
+    return caught_signal.load(.acquire) != 0;
+}
 
 pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     const allocator = services.allocator;
@@ -52,6 +107,52 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     };
     try services.store.createLoop(state);
 
+    return runExisting(services, run_options, id);
+}
+
+pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !ExitCode {
+    const allocator = services.allocator;
+    var loaded = try services.store.loadState(id);
+    defer loaded.deinit();
+    var state = loaded.value;
+    if (state.status == .complete or state.status == .blocked) return error.LoopCannotResume;
+
+    const cwd = try std.process.currentPathAlloc(services.io, allocator);
+    defer allocator.free(cwd);
+    if (!std.mem.eql(u8, cwd, state.cwd)) {
+        if (services.stderr) |stderr| {
+            try stderr.print("Warning: resuming loop {s} from {s}; backend will restore saved working directory {s}.\n", .{ id, cwd, state.cwd });
+            try stderr.flush();
+        }
+    }
+    state.status = .active;
+    if (objective) |new_objective| {
+        state.objective = new_objective;
+        state.blocked_strikes = 0;
+        state.objective_update_pending = true;
+    }
+    state.updated_at_ms = nowMilliseconds(services);
+    try services.store.saveState(state);
+    const run_options: options.RunOptions = .{
+        .backend = state.backend,
+        .verifier = state.verifier_backend,
+        .verify_enabled = state.verify_enabled,
+        .model = state.model,
+        .yolo = state.yolo,
+        .max_turns = state.max_turns,
+        .token_budget = state.token_budget,
+        .timeout_seconds = state.timeout_seconds,
+        .output_mode = .live,
+        .prompt = state.objective,
+        .extra_backend_args = state.extra_args,
+    };
+    return runExisting(services, run_options, id);
+}
+
+fn runExisting(services: Services, run_options: options.RunOptions, id: []const u8) !ExitCode {
+    const allocator = services.allocator;
+    var signal_guard = SignalGuard.install();
+    defer signal_guard.deinit();
     var presenter = stream.Presenter.init(allocator, services.stdout, run_options.output_mode, id, run_options.backend);
     defer presenter.deinit();
     try presenter.loopStarted();
@@ -89,6 +190,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
             var limited = current;
             return finishBudgetLimited(services, &presenter, &limited, .wrapup_recorded);
         }
+        if (signalWasCaught()) return pauseLoop(services, &presenter, id, "Loop paused by SIGINT or SIGTERM.");
         const budget_reason = if (current.status == .active and current.turns_completed > 0)
             reachedBudget(services, current)
         else
@@ -108,6 +210,8 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
 
         const prompt_kind: prompts.PromptKind = if (role == .verifier)
             .verifier
+        else if (current.objective_update_pending)
+            .objective_updated
         else if (is_budget_wrapup)
             .budget_limit
         else if (current.turns_completed == 0)
@@ -154,12 +258,16 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
             .cwd = .{ .path = current.cwd },
             .event_context = &presenter,
             .event_handler = stream.Presenter.eventHandler,
+            .child_context = null,
+            .on_child_id = childIdChanged,
+            .diagnostics = services.stderr,
         };
         if (role == .worker) {
             request.session_context = &persist_context;
             request.on_session_id = PersistSessionContext.persist;
         }
-        var result = services.runner.runTurn(request) catch |err| {
+        const retry_result = runWithRetries(services, request) catch |err| {
+            if (signalWasCaught()) return pauseLoop(services, &presenter, id, "Loop paused by SIGINT or SIGTERM.");
             if (is_budget_wrapup) {
                 var limited = current;
                 return finishBudgetLimited(services, &presenter, &limited, .wrapup_failed);
@@ -168,6 +276,10 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
             try services.stdout.flush();
             return .failure;
         };
+        if (retry_result.interrupted and retry_result.result == null) {
+            return pauseLoop(services, &presenter, id, "Loop paused by SIGINT or SIGTERM during retry backoff.");
+        }
+        var result = retry_result.result.?;
         defer result.deinit();
         try presenter.checkError();
         const elapsed_ms = nowMilliseconds(services) -| started_ms;
@@ -180,6 +292,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         after_turn.turns_completed +|= 1;
         after_turn.tokens_used +|= result.tokens_used;
         after_turn.updated_at_ms = nowMilliseconds(services);
+        if (role == .worker) after_turn.objective_update_pending = false;
 
         if (role == .worker and after_turn.status == .active) {
             if (after_turn.blocked_strikes == blocked_strikes_before) {
@@ -195,13 +308,15 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         }
 
         const verifier_exited_without_verdict = role == .verifier and after_turn.status == .verifying and result.exit_code != 0 and !result.was_interrupted;
-        if ((result.exit_code != 0 or result.was_interrupted) and !verifier_exited_without_verdict) {
+        const interrupted = retry_result.interrupted or result.was_interrupted;
+        if ((result.exit_code != 0 or interrupted or retry_result.exhausted) and !verifier_exited_without_verdict) {
             const summary = if (after_turn.status == .blocked)
                 after_turn.last_blocker_summary orelse "Loop reached the blocker limit."
             else if (result.stderr_tail.len > 0)
                 result.stderr_tail
             else
                 "backend exited unsuccessfully";
+            if (interrupted or retry_result.exhausted) after_turn.status = .paused;
             try services.store.appendTurnLog(id, .{
                 .turn = turn_number,
                 .role = role,
@@ -215,6 +330,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
             try services.store.saveState(after_turn);
             if (after_turn.status != previous_status) try presenter.statusChanged(previous_status, after_turn.status);
             try presenter.turnCompleted(after_turn.status, result.tokens_used, elapsed_ms);
+            if (interrupted or retry_result.exhausted) return pauseLoop(services, &presenter, id, summary);
             if (is_budget_wrapup and role == .worker and after_turn.status != .blocked) {
                 return finishBudgetLimited(services, &presenter, &after_turn, .wrapup_failed);
             }
@@ -270,6 +386,92 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     }
 }
 
+const RetryRun = struct {
+    result: ?backend.TurnExecutionResult = null,
+    exhausted: bool = false,
+    interrupted: bool = false,
+};
+
+fn runWithRetries(services: Services, request: backend.TurnRequest) !RetryRun {
+    const delays_ms = [_]u64{ 5000, 15000, 45000 };
+    var retry_index: usize = 0;
+    while (true) {
+        if (signalWasCaught()) return .{ .interrupted = true };
+        var result = try services.runner.runTurn(request);
+        if (result.exit_code == 0 and !result.was_interrupted) return .{ .result = result };
+        if (result.was_interrupted or signalWasCaught()) return .{ .result = result, .interrupted = true };
+        if (retry_index == delays_ms.len) return .{ .result = result, .exhausted = true };
+
+        result.deinit();
+        const delay_ms = delays_ms[retry_index];
+        retry_index += 1;
+        if (services.sleeper) |sleeper| {
+            sleeper.sleep(services.io, delay_ms) catch |err| {
+                if (signalWasCaught()) return .{ .interrupted = true };
+                return err;
+            };
+        } else {
+            const duration: std.Io.Clock.Duration = .{
+                .raw = .{ .nanoseconds = @as(i96, @intCast(delay_ms)) * std.time.ns_per_ms },
+                .clock = .awake,
+            };
+            duration.sleep(services.io) catch |err| {
+                if (signalWasCaught()) return .{ .interrupted = true };
+                return err;
+            };
+        }
+        if (signalWasCaught()) return .{ .interrupted = true };
+    }
+}
+
+fn pauseLoop(services: Services, presenter: *stream.Presenter, id: []const u8, reason: []const u8) !ExitCode {
+    var parsed = try services.store.loadState(id);
+    defer parsed.deinit();
+    var state = parsed.value;
+    if (state.status == .complete) {
+        try presenter.loopFinished(state.status, state.turns_completed, state.tokens_used, state.completion_summary orelse "Loop completed.");
+        return .ok;
+    }
+    const previous = state.status;
+    state.status = .paused;
+    state.updated_at_ms = nowMilliseconds(services);
+    try services.store.saveState(state);
+    if (previous != .paused) try presenter.statusChanged(previous, .paused);
+
+    const resume_hint = try std.fmt.allocPrint(services.allocator, "Resume: matcha loop resume {s}", .{id});
+    defer services.allocator.free(resume_hint);
+    try services.stdout.writeAll(reason);
+    try services.stdout.writeByte('\n');
+    try services.stdout.print("{s}\n", .{resume_hint});
+    var outcome = std.Io.Writer.Allocating.init(services.allocator);
+    defer outcome.deinit();
+    try outcome.writer.print("{s}. {s}", .{ reason, resume_hint });
+    if (state.worker_session_id) |session_id| {
+        const native = try backend.formatNativeResumeCommand(services.allocator, state.backend, session_id);
+        defer services.allocator.free(native);
+        try services.stdout.print("Attach: {s}\n", .{native});
+        try outcome.writer.print(". Attach: {s}", .{native});
+    }
+    try services.stdout.flush();
+    try presenter.loopFinished(.paused, state.turns_completed, state.tokens_used, outcome.written());
+    return .failure;
+}
+
+fn nowMilliseconds(services: Services) u64 {
+    if (services.clock) |clock| return clock.nowMilliseconds();
+    return @intCast(@max(0, std.Io.Clock.real.now(services.io).toMilliseconds()));
+}
+
+fn reachedBudget(services: Services, state: store_mod.LoopState) ?BudgetReason {
+    if (state.max_turns) |limit| if (state.turns_completed >= limit) return .max_turns;
+    if (state.token_budget) |limit| if (state.tokens_used >= limit) return .token_budget;
+    if (state.timeout_seconds) |limit| {
+        const elapsed_ms = nowMilliseconds(services) -| state.started_at_ms;
+        if (elapsed_ms / 1000 >= limit) return .timeout;
+    }
+    return null;
+}
+
 fn promptContext(services: Services, state: store_mod.LoopState, turn_number: u32) prompts.PromptContext {
     const current_ms = nowMilliseconds(services);
     return .{
@@ -288,23 +490,8 @@ fn promptContext(services: Services, state: store_mod.LoopState, turn_number: u3
     };
 }
 
-fn nowMilliseconds(services: Services) u64 {
-    if (services.clock) |clock| return clock.nowMilliseconds();
-    return @intCast(@max(0, std.Io.Clock.real.now(services.io).toMilliseconds()));
-}
-
 const BudgetReason = enum { max_turns, token_budget, timeout };
 const BudgetFinish = enum { wrapup_recorded, wrapup_failed, unverified_completion };
-
-fn reachedBudget(services: Services, state: store_mod.LoopState) ?BudgetReason {
-    if (state.max_turns) |limit| if (state.turns_completed >= limit) return .max_turns;
-    if (state.token_budget) |limit| if (state.tokens_used >= limit) return .token_budget;
-    if (state.timeout_seconds) |limit| {
-        const elapsed_ms = nowMilliseconds(services) -| state.started_at_ms;
-        if (elapsed_ms / 1000 >= limit) return .timeout;
-    }
-    return null;
-}
 
 fn finishBudgetLimited(
     services: Services,
@@ -700,6 +887,113 @@ test "budget wrap-up cannot claim unverified completion when verification is dis
     try std.testing.expectEqual(store_mod.LoopStatus.budget_limited, state.value.status);
 }
 
+test "transient backend failure recovers on retry after injectable backoff" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var sleeper = FakeSleeper{ .allocator = allocator };
+    defer sleeper.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_retry_fail, .worker_progress, .worker_complete } };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+        .sleeper = sleeper.sleeper(),
+    }, .{ .backend = .codex, .verify_enabled = false, .prompt = "Recover from a transient error." });
+    try std.testing.expectEqual(ExitCode.ok, exit_code);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), sleeper.delays.items.len);
+    try std.testing.expectEqual(@as(u64, 5000), sleeper.delays.items[0]);
+}
+
+test "three retry delays run before exhausted backend turn pauses with diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var sleeper = FakeSleeper{ .allocator = allocator };
+    defer sleeper.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_retry_fail, .worker_retry_fail, .worker_retry_fail, .worker_retry_fail } };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+        .sleeper = sleeper.sleeper(),
+    }, .{ .backend = .codex, .verify_enabled = false, .prompt = "Recover from a transient error." });
+    try std.testing.expectEqual(ExitCode.failure, exit_code);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls.items.len);
+    try std.testing.expectEqualSlices(u64, &.{ 5000, 15000, 45000 }, sleeper.delays.items);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "matcha loop resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "codex resume worker-session") != null);
+    const id = try store.resolveLatestLoopId();
+    defer allocator.free(id.?);
+    var state = try store.loadState(id.?);
+    defer state.deinit();
+    try std.testing.expectEqual(store_mod.LoopStatus.paused, state.value.status);
+    const log = try store.readRecentTurnLog(id.?, 1);
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "transient backend outage") != null);
+}
+
+test "interrupted turn pauses and prints both resume commands" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    var store = try store_mod.Store.init(allocator, std.testing.io, root);
+    defer store.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var sleeper = FakeSleeper{ .allocator = allocator };
+    defer sleeper.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{.worker_interrupted} };
+    defer fake.deinit(allocator);
+    const exit_code = try run(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .store = &store,
+        .parent_environment = &environment,
+        .runner = fake.runner(),
+        .stdout = &output.writer,
+        .sleeper = sleeper.sleeper(),
+    }, .{ .backend = .droid, .verify_enabled = false, .prompt = "Handle an interrupt." });
+    try std.testing.expectEqual(ExitCode.failure, exit_code);
+    try std.testing.expectEqual(@as(usize, 0), sleeper.delays.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "matcha loop resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "droid -r worker-session") != null);
+    const id = try store.resolveLatestLoopId();
+    defer allocator.free(id.?);
+    var state = try store.loadState(id.?);
+    defer state.deinit();
+    try std.testing.expectEqual(store_mod.LoopStatus.paused, state.value.status);
+}
+
 fn expectBudgetRun(
     store: *store_mod.Store,
     fake: *const FakeRunner,
@@ -728,7 +1022,25 @@ fn expectBudgetRun(
     try std.testing.expectEqual(expected_tokens, state.value.tokens_used);
 }
 
-const FakeStep = enum { worker_progress, worker_complete, verifier_reject, verifier_no_verdict, worker_repaired, verifier_pass, worker_blocked, worker_budget_wrapup };
+const FakeStep = enum { worker_progress, worker_complete, verifier_reject, verifier_no_verdict, worker_repaired, verifier_pass, worker_blocked, worker_budget_wrapup, worker_retry_fail, worker_interrupted };
+
+const FakeSleeper = struct {
+    allocator: std.mem.Allocator,
+    delays: std.ArrayList(u64) = .empty,
+
+    fn sleeper(self: *FakeSleeper) Sleeper {
+        return .{ .context = @ptrCast(self), .sleepFn = FakeSleeper.sleep };
+    }
+
+    fn deinit(self: *FakeSleeper) void {
+        self.delays.deinit(self.allocator);
+    }
+
+    fn sleep(context: *anyopaque, _: std.Io, milliseconds: u64) anyerror!void {
+        const self: *FakeSleeper = @ptrCast(@alignCast(context));
+        try self.delays.append(self.allocator, milliseconds);
+    }
+};
 
 const FakeClock = struct {
     now_ms: u64,
@@ -799,6 +1111,18 @@ const FakeRunner = struct {
             if (!has_existing_session) try request.on_session_id.?(request.session_context, "worker-session");
         }
 
+        if (step == .worker_retry_fail or step == .worker_interrupted) {
+            return .{
+                .allocator = self.store.allocator,
+                .exit_code = if (step == .worker_interrupted) -1 else 7,
+                .session_id = try self.store.allocator.dupe(u8, "worker-session"),
+                .tokens_used = 0,
+                .last_assistant_text = null,
+                .stderr_tail = try self.store.allocator.dupe(u8, if (step == .worker_interrupted) "" else "transient backend outage"),
+                .was_interrupted = step == .worker_interrupted,
+            };
+        }
+
         var loaded = try self.store.loadState(request.loop_id);
         defer loaded.deinit();
         var state = loaded.value;
@@ -824,6 +1148,7 @@ const FakeRunner = struct {
                 state.status = if (state.blocked_strikes >= 3) .blocked else .active;
             },
             .worker_budget_wrapup => {},
+            .worker_retry_fail, .worker_interrupted => unreachable,
         }
         try self.store.saveState(state);
         if (self.clock) |clock| clock.now_ms +|= self.advance_clock_ms;

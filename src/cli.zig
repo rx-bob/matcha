@@ -11,6 +11,8 @@ const serve_options = @import("serve_options.zig");
 const serve = @import("serve.zig");
 const loop_options = @import("loop_options.zig");
 const loop_store = @import("loop_store.zig");
+const loop_runtime = @import("loop.zig");
+const loop_backend = @import("loop_backend.zig");
 
 pub const version = "0.1.0";
 
@@ -39,7 +41,7 @@ pub fn run(init: std.process.Init) !void {
     var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
 
-    const exit_code = runArgs(args, init.io, stdout, stderr) catch |err| blk: {
+    const exit_code = runArgsRuntime(args, init.io, stdout, stderr, null, init.environ_map, null) catch |err| blk: {
         try stderr.print("Internal error: {s}\n", .{@errorName(err)});
         break :blk ExitCode.failure;
     };
@@ -52,7 +54,10 @@ pub fn run(init: std.process.Init) !void {
 }
 
 pub fn runArgs(args: []const []const u8, io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
-    return runArgsWithLoopStoreRoot(args, io, stdout, stderr, null);
+    var environment = std.process.Environ.Map.init(std.heap.page_allocator);
+    defer environment.deinit();
+    if (std.c.getenv("PATH")) |path_value| try environment.put("PATH", std.mem.span(path_value));
+    return runArgsRuntime(args, io, stdout, stderr, null, &environment, null);
 }
 
 fn runArgsWithLoopStoreRoot(
@@ -61,6 +66,21 @@ fn runArgsWithLoopStoreRoot(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     store_root: ?[]const u8,
+) !ExitCode {
+    var environment = std.process.Environ.Map.init(std.heap.page_allocator);
+    defer environment.deinit();
+    if (std.c.getenv("PATH")) |path_value| try environment.put("PATH", std.mem.span(path_value));
+    return runArgsRuntime(args, io, stdout, stderr, store_root, &environment, null);
+}
+
+fn runArgsRuntime(
+    args: []const []const u8,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    store_root: ?[]const u8,
+    parent_environment: *const std.process.Environ.Map,
+    runner_override: ?loop_backend.BackendRunner,
 ) !ExitCode {
     const command = if (args.len > 0) args[0] else "";
 
@@ -95,7 +115,7 @@ fn runArgsWithLoopStoreRoot(
     }
 
     if (std.mem.eql(u8, command, "loop")) {
-        return runLoopCommand(io, args[1..], stdout, stderr, store_root);
+        return runLoopCommand(io, args[1..], stdout, stderr, store_root, parent_environment, runner_override);
     }
 
     try writeHelp(stdout);
@@ -110,6 +130,8 @@ fn runLoopCommand(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     store_root: ?[]const u8,
+    parent_environment: *const std.process.Environ.Map,
+    runner_override: ?loop_backend.BackendRunner,
 ) !ExitCode {
     const command = switch (loop_options.parseLoopCommand(std.heap.page_allocator, args, true, "")) {
         .ok => |parsed| parsed,
@@ -124,15 +146,6 @@ fn runLoopCommand(
             try writeLoopHelp(stdout);
             return .ok;
         },
-        .run => {
-            std.heap.page_allocator.free(command.run.prompt);
-            try stderr.writeAll("matcha loop run is not available yet\n");
-            return .failure;
-        },
-        .@"resume" => {
-            try stderr.writeAll("matcha loop resume is not available yet\n");
-            return .failure;
-        },
         else => {},
     }
 
@@ -143,6 +156,56 @@ fn runLoopCommand(
     defer store.deinit();
 
     switch (command) {
+        .run => |run_options| {
+            defer std.heap.page_allocator.free(run_options.prompt);
+            var real_runner: loop_backend.RealBackendRunner = .{};
+            const services: loop_runtime.Services = .{
+                .allocator = std.heap.page_allocator,
+                .io = io,
+                .store = &store,
+                .parent_environment = parent_environment,
+                .runner = runner_override orelse real_runner.runner(),
+                .stdout = stdout,
+                .stderr = stderr,
+            };
+            return switch (try loop_runtime.run(services, run_options)) {
+                .ok => .ok,
+                .failure => .failure,
+            };
+        },
+        .@"resume" => |resume_options| {
+            var id: ?[]const u8 = resume_options.id;
+            var owned_id: ?[]const u8 = null;
+            defer if (owned_id) |value| std.heap.page_allocator.free(value);
+            if (resume_options.last) {
+                owned_id = try store.resolveLatestLoopId();
+                id = owned_id;
+            }
+            const resolved_id = id orelse {
+                try stderr.writeAll("No loop to resume; create one with matcha loop or pass an id.\n");
+                return .usage;
+            };
+            var real_runner: loop_backend.RealBackendRunner = .{};
+            const services: loop_runtime.Services = .{
+                .allocator = std.heap.page_allocator,
+                .io = io,
+                .store = &store,
+                .parent_environment = parent_environment,
+                .runner = runner_override orelse real_runner.runner(),
+                .stdout = stdout,
+                .stderr = stderr,
+            };
+            return switch (loop_runtime.resumeLoop(services, resolved_id, resume_options.objective) catch |err| {
+                if (err == error.LoopCannotResume) {
+                    try stderr.print("Cannot resume loop {s} from its current status\n", .{resolved_id});
+                    return .failure;
+                }
+                return err;
+            }) {
+                .ok => .ok,
+                .failure => .failure,
+            };
+        },
         .list => return writeLoopList(&store, stdout, stderr),
         .show => |options| {
             const id = resolveLoopId(options.id, io) orelse {
@@ -323,6 +386,7 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\Usage:
         \\  matcha loop -b <codex|droid|agy> <prompt> [options]
+        \\  matcha loop resume [<id>|--last] [--objective <new objective>]
         \\  matcha loop list
         \\  matcha loop show [<id>]
         \\  matcha loop update [<id>] --status <complete|blocked> [--summary <text>]
@@ -869,6 +933,7 @@ pub fn writeUsageGuide(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha plan read path/to/plan.json          Print Markdown to stdout
         \\  matcha plan read path/to/plan.html          Read a matcha-generated plan HTML back as Markdown
         \\  matcha loop --help                         Run or inspect a persistent loop
+        \\  matcha loop resume --last                  Resume the most recent paused loop
         \\
         \\Defaults:
         \\  matcha plan reads sample_plan.json and writes dist/plan.html.
@@ -888,6 +953,8 @@ pub fn writeUsageGuide(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  5. Do not put Markdown fences or commentary in the JSON input file.
         \\  6. To read an existing plan as Markdown, run `matcha plan read <path>`.
         \\  7. No --output option exists for plan read; redirect stdout (`> plan.md`) or pipe it.
+        \\  8. Resume a paused autonomous loop with `matcha loop resume [<id>|--last]`; use
+        \\     `--objective "..."` to replace its objective when resuming.
         \\
         \\Reading plans as Markdown:
         \\  Use `matcha plan read` when you need to consume an existing plan without parsing JSON or
@@ -2099,4 +2166,84 @@ test "loop CLI help, list, show, update, and verify callbacks" {
     try std.testing.expectEqual(loop_store.LoopStatus.active, rejected.value.status);
     try std.testing.expectEqual(@as(u8, 0), rejected.value.blocked_strikes);
     try std.testing.expectEqualStrings("missing edge test", rejected.value.last_verifier_feedback.?);
+}
+
+const ResumeCliFake = struct {
+    allocator: std.mem.Allocator,
+    store: *loop_store.Store,
+    prompt: ?[]u8 = null,
+    resumed: bool = false,
+
+    fn runner(self: *ResumeCliFake) loop_backend.BackendRunner {
+        return .{ .context = @ptrCast(self), .runTurnFn = ResumeCliFake.runTurn };
+    }
+
+    fn deinit(self: *ResumeCliFake) void {
+        if (self.prompt) |value| self.allocator.free(value);
+    }
+
+    fn runTurn(context: *anyopaque, request: loop_backend.TurnRequest) anyerror!loop_backend.TurnExecutionResult {
+        const self: *ResumeCliFake = @ptrCast(@alignCast(context));
+        self.prompt = try self.allocator.dupe(u8, request.prompt);
+        for (request.argv) |arg| if (std.mem.eql(u8, arg, "resume")) {
+            self.resumed = true;
+        };
+        var loaded = try self.store.loadState(request.loop_id);
+        defer loaded.deinit();
+        var state = loaded.value;
+        state.status = .complete;
+        state.completion_summary = "CLI fake completed.";
+        try self.store.saveState(state);
+        return .{
+            .allocator = self.allocator,
+            .exit_code = 0,
+            .session_id = try self.allocator.dupe(u8, "saved-session"),
+            .tokens_used = 1,
+            .last_assistant_text = try self.allocator.dupe(u8, "complete"),
+            .stderr_tail = try self.allocator.dupe(u8, ""),
+            .was_interrupted = false,
+        };
+    }
+};
+
+test "loop resume CLI accepts last and injects the changed objective" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(store_root);
+    var store = try loop_store.Store.init(allocator, std.testing.io, store_root);
+    defer store.deinit();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const state: loop_store.LoopState = .{
+        .id = "6722c1a0-0002",
+        .status = .paused,
+        .backend = .codex,
+        .cwd = cwd,
+        .objective = "old objective",
+        .worker_session_id = "saved-session",
+        .started_at_ms = 100,
+        .updated_at_ms = 100,
+        .blocked_strikes = 2,
+    };
+    try store.createLoop(state);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var fake = ResumeCliFake{ .allocator = allocator, .store = &store };
+    defer fake.deinit();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    const code = try runArgsRuntime(&.{ "loop", "resume", "--last", "--objective", "updated objective" }, std.testing.io, &stdout, &stderr, store_root, &env, fake.runner());
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(fake.resumed);
+    try std.testing.expect(std.mem.indexOf(u8, fake.prompt.?, "updated objective") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.prompt.?, "objective was updated by the user") != null);
+    var after = try store.loadState(state.id);
+    defer after.deinit();
+    try std.testing.expectEqualStrings("updated objective", after.value.objective);
+    try std.testing.expectEqual(@as(u8, 0), after.value.blocked_strikes);
+    try std.testing.expect(!after.value.objective_update_pending);
 }
