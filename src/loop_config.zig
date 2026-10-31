@@ -489,6 +489,35 @@ test "dotenv keeps literal values and reports malformed source lines" {
     try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "unterminated") == null);
 }
 
+test "README project loop example resolves through real config path" {
+    const readme = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(readme);
+    const heading = std.mem.indexOf(u8, readme, "### Persistent loops") orelse return error.MissingDocumentation;
+    const open_fence = std.mem.indexOfPos(u8, readme, heading, "```json\n") orelse return error.MissingDocumentation;
+    const json_start = open_fence + "```json\n".len;
+    const json_end = std.mem.indexOfPos(u8, readme, json_start, "\n```") orelse return error.MissingDocumentation;
+    const example = readme[json_start..json_end];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = example });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".matcha.env", .data = "LANGUAGE=en\n" });
+    const project = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/project.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(project);
+    var buffer: [1024]u8 = undefined;
+    var diagnostic: std.Io.Writer = .fixed(&buffer);
+    var resolved = try resolve(std.testing.allocator, std.testing.io, .{ .backend = .codex, .prompt = "" }, null, project, &diagnostic);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(?u32, 50), resolved.run.max_turns);
+    try std.testing.expectEqualStrings("en", resolved.run.env[0].value);
+    try std.testing.expectEqualStrings("/opt/toolchains/current", resolved.run.env[1].value);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.run.prompt_file.?, "/prompts/task.md"));
+    try std.testing.expect(std.mem.endsWith(u8, resolved.run.path_prepend[0], "/tools/bin"));
+    try std.testing.expect(std.mem.endsWith(u8, resolved.run.log_dir.?, "/build/agent-logs"));
+    try std.testing.expect(resolved.run.verifier_options.args_explicit);
+    try std.testing.expectEqual(@as(usize, 0), resolved.run.verifier_options.args.len);
+}
+
 test "config and cli environment layers flatten with source-relative path prefixes" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

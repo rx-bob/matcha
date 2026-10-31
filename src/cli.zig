@@ -690,7 +690,7 @@ fn oneLineObjective(allocator: std.mem.Allocator, text: []const u8) ![]const u8 
 }
 
 fn writeLoopUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.writeAll("Usage: matcha loop [options] | resume | list | show | update | verify | help\n");
+    try writer.writeAll("Usage: matcha loop [prompt] [options] | resume | config | list | show | update | verify | help\n");
 }
 
 pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -698,6 +698,7 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\matcha loop
         \\
         \\Usage:
+        \\  matcha loop [options]                  Run from configured prompt or piped stdin
         \\  matcha loop [options] <prompt> [options]
         \\  matcha loop --prompt-file <path> [options]
         \\  matcha loop config
@@ -709,27 +710,32 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\Loop callbacks accept MATCHA_LOOP_ID when <id> is omitted.
         \\The default backend is codex; use -b to select droid or agy.
-        \\Use matcha loop config to set default harness, model, and turn limit.
-        \\Run options --model, -b, --max-turns, and --unlimited override saved defaults.
+        \\Use matcha loop config to edit user backend, model, and turn defaults.
+        \\Run options --model, -b, --max-turns, and --unlimited override config defaults.
         \\Prompt may come from positional text, --prompt-file, or piped stdin. Options work before or after text.
         \\Options include --yolo, --verifier, --no-verify, --token-budget, --timeout, --quiet, and --json.
         \\Verifier overrides: --verifier-model <model>, --verifier-bin <executable>,
         \\  repeatable --verifier-arg=<argument>. Empty model/bin selects native default.
         \\Arguments after -- belong only to the worker in new loops.
+        \\Same-backend verifier inherits omitted model, effort, and executable;
+        \\  different-backend verifier uses native defaults. Verifier args stay separate.
         \\Execution overrides on run and resume: --env KEY=VALUE, --env-file <path>,
         \\  --path-prepend <dir>, --backend-bin <executable>, --verifier-bin <executable>,
         \\  --model <id>, --verifier-model <id>, --reasoning-effort <level>,
         \\  --verifier-reasoning-effort <level>, --sandbox <policy>, --yolo, --log-dir <dir>.
         \\Env values are literal; env files use KEY=VALUE lines and are flattened into snapshots.
-        \\Configured PATH prefixes follow Matcha's callback binary directory.
-        \\Resume uses saved settings plus explicit overrides; --config and new prompts are run-only.
+        \\Configured PATH prefixes follow Matcha's callback binary directory in order.
+        \\Resume uses saved settings and current ambient env; listed execution overrides persist.
+        \\Backend identities cannot change on resume; --config, prompts, and verifier args are run-only.
+        \\--log-dir creates fresh .log/.jsonl audit files for each invocation and resume.
+        \\Audit logs preserve raw backend output; logging failures stop the loop.
         \\--sandbox <workspace-write|danger-full-access|backend-default> selects isolation.
         \\Codex supports the first two; backend-default resets to native policy for all backends.
         \\Read-only cannot support loop callbacks. Sandbox never implies --yolo approval bypass.
         \\--sandbox and --yolo conflict in one layer; either replaces an inherited policy.
         \\--backend-bin <executable> selects one executable; arguments belong after --.
         \\--config <path> selects a project config instead of launch-directory .matcha.json.
-        \\Precedence: CLI > project > user defaults. Prompt: explicit > pipe > configured file.
+        \\Precedence: CLI > project > user defaults > built-ins. Prompt: explicit > pipe > configured file.
         \\Prompt files and stdin are limited to 1 MiB; file paths in configs are source-relative.
         \\Use matcha loop --help for this help.
         \\
@@ -2491,6 +2497,9 @@ test "loop CLI help, list, show, update, and verify callbacks" {
     var code = try runArgsWithLoopStoreRoot(&.{ "loop", "--help" }, std.testing.io, &stdout, &stderr, store_root);
     try std.testing.expectEqual(ExitCode.ok, code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], "matcha loop") != null);
+    for ([_][]const u8{ "piped stdin", "--prompt-file", "--verifier-arg", "--reasoning-effort", "--env-file", "--path-prepend", "--log-dir", "--sandbox", "--yolo", "current ambient env", "logging failures" }) |fragment| {
+        try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], fragment) != null);
+    }
 
     stdout = .fixed(&stdout_buffer);
     stderr = .fixed(&stderr_buffer);

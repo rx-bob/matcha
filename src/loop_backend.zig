@@ -442,8 +442,8 @@ pub const BackendOptions = struct {
     extra_args: []const []const u8 = &.{},
 };
 
-/// Capability evidence and the callback restriction are recorded in
-/// LOOP_SANDBOX_CAPABILITIES.md. No vendor discovery runs during execution.
+/// Capability evidence and callback restriction: LOOP_SANDBOX_CAPABILITIES.md.
+/// No vendor discovery runs during execution.
 pub fn validatePolicy(config: BackendOptions, diagnostic: ?*std.Io.Writer) !void {
     if (config.model) |model| {
         if (std.mem.indexOfScalar(u8, model, 0) != null) return error.InvalidModel;

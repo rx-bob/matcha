@@ -87,10 +87,11 @@ pub fn build(b: *std.Build) void {
 
     const workflow_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("cli_workflow_test.zig"),
+            .root_source_file = b.path("tests/cli_workflow_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{.{ .name = "matcha", .module = matcha_module }},
         }),
         .filters = &.{"offline project config drives real worker verifier logs and durable resume repairs"},
     });
