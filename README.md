@@ -97,140 +97,132 @@ To make the compiled CLI available as `matcha`, install it into `~/.local/bin` a
 task install
 ```
 
-### Project loop configuration
+### Persistent loops
 
-New loops read `.matcha.json` only in the launch directory. `--config PATH`
-(or `--config=PATH`) replaces that selection; an explicit file must exist.
-Project files use this envelope:
-
-```json
-{"schema_version":1,"loop":{"backend":"codex","model":null,"max_turns":10,"prompt_file":"prompts/task.md","verify_enabled":true}}
-```
-
-Settings resolve as CLI > project > user defaults > built-ins. User defaults
-retain the flat JSON format at `$XDG_CONFIG_HOME/matcha/loop.json` (otherwise
-`~/.config/matcha/loop.json`). Interactive `matcha loop config` edits that user
-file and preserves other supported settings.
-
-Supported loop fields are `backend`, `backend_bin`, `model`, `max_turns`, `prompt_file`,
-`verifier` (object; legacy backend names remain accepted), `verify_enabled`, `yolo`, `sandbox`, `token_budget`,
-`timeout_seconds`, `output_mode` (`live`, `quiet`, `json`), and
-`extra_backend_args`. Unknown fields, invalid types, unsupported versions, and
-nonpositive configured limits fail before execution. Omitted fields inherit;
-`null` clears model, prompt file, verifier override, or a limit. Null limits
-mean unlimited. Booleans apply even when false; arrays replace, including `[]`.
-CLI `--unlimited` overrides inherited turn limits. Future map fields should merge
-by key; no map settings are exposed yet.
-
-Explicit positional text or `--prompt-file` wins over nonblank piped stdin,
-which wins over configured `prompt_file`. Explicit forms cannot be combined.
-Only the winning prompt file is read, at most 1 MiB; stdin has the same bound.
-Blank stdin permits configured-file fallback. Blank explicit input fails.
-Config file paths are relative to their defining config directory; CLI paths
-use the launch directory. Selecting a config elsewhere does not change worker cwd.
-
-Snapshots capture objective text, execution settings, budgets, and launch cwd.
-Resume uses those saved values even if source files change or disappear. Legacy
-snapshots retain their shared worker/verifier model and arguments; inspection
-never rewrites them. Ambient shell environment remains inherited. Callback
-updates preserve captured settings, and saves replace state atomically.
-
-### Custom loop executables
-
-`matcha loop --backend-bin '/opt/agent builds/codex-dev' "fix the build"`
-selects an executable for the chosen backend. The project/user setting is
-`backend_bin`; `null` clears an inherited selection. Standard `codex`, `droid`,
-and `agy` names remain the defaults. The value is one executable, never a shell
-command; pass extra arguments after `--`.
-
-Bare names resolve on the effective child PATH at invocation time. Values with
-a path separator resolve relative to their config file, or the launch directory
-for CLI values. Snapshots retain that selection across retries and resume.
-An omitted verifier executable inherits the worker selection only when both
-roles use the same backend; a different backend uses its own standard executable. Native session attach hints quote the
-selected executable, and interactive model discovery uses it when retaining the
-saved backend selection. Executable versions and wrappers must support the
-existing backend adapter's flags and protocol; Matcha does not install or probe
-agent builds by running trial tasks.
-
-
-### Verifier overrides
-
-New loops keep worker arguments after `--` separate from verifier arguments.
-Use repeatable `--verifier-arg=VALUE` to supply verifier arguments literally,
-including values beginning with `-`. CLI verifier arguments replace the configured
-array. `--verifier-model MODEL` and `--verifier-bin EXECUTABLE` override the other
-role settings. Empty equals forms (`--verifier-model=` / `--verifier-bin=`)
-explicitly select the backend's native model/default executable. Explicit verifier
-CLI options conflict with `--no-verify`.
+From a project directory, run `matcha loop` with `.matcha.json` and a prompt file.
+Matcha checks only the launch directory; it never searches parents. `--config PATH`
+selects a replacement project file, which must exist. The worker still runs in
+the launch directory. User defaults remain flat JSON at
+`$XDG_CONFIG_HOME/matcha/loop.json` or `~/.config/matcha/loop.json`;
+`matcha loop config` edits that user file while preserving other fields.
 
 ```json
 {
   "schema_version": 1,
   "loop": {
     "backend": "codex",
-    "model": "worker-model",
-    "verifier": {
-      "backend": "agy",
-      "model": null,
-      "backend_bin": "./tools/verifier",
-      "args": ["--example", "literal value"]
-    }
+    "prompt_file": "prompts/task.md",
+    "max_turns": 50,
+    "env_files": [".matcha.env"],
+    "env": { "TOOLCHAIN_HOME": "/opt/toolchains/current" },
+    "path_prepend": ["tools/bin"],
+    "log_dir": "build/agent-logs",
+    "verifier": { "backend": "codex", "args": [] }
   }
 }
 ```
 
-Verifier objects merge by field across config layers. Omitted model and executable
-inherit worker choices for the same backend, and use native defaults for a
-different backend. Explicit `null` selects native defaults and retains that
-choice when worker settings change. Arrays replace; `args: []` clears inherited
-verifier arguments. `verifier: null` resets the entire verifier configuration.
-Verifier paths resolve relative to the defining config; CLI paths use launch cwd.
-`reasoning_effort` is reserved: non-null values are rejected until reasoning
-controls are implemented.
+Create `prompts/task.md` and `.matcha.env` beside this config before running it.
+The resolver test checks this exact JSON example.
+Other `loop` fields: `backend_bin`, `model`, `reasoning_effort`, `verify_enabled`,
+`sandbox`, `yolo`, `token_budget`, `timeout_seconds`, `output_mode` (`live`, `quiet`,
+`json`), and `extra_backend_args`. `verifier` accepts `backend`, `backend_bin`,
+`model`, `reasoning_effort`, and `args`; legacy string backend names still work.
+Unknown fields, wrong types, unsupported schema versions, and invalid limits fail
+before execution. Limits must be positive; `null` clears nullable values, including
+`max_turns` (unlimited), model, reasoning, prompt file, and log directory.
 
-Both enabled roles undergo executable checks before the first worker starts and
-before resume changes state. Disabled verification skips verifier checks. Roles
-share environment, permission policy, cwd, and loop callback identity; verifier
-sessions remain fresh. Live and JSON turn status identify the executing backend
-and model. New snapshots retain override presence and isolated arguments; older
-snapshots keep their historical shared model and arguments across resume and
-callback updates.
+CLI values override project values, which override user defaults, which override
+built-ins. Omitted fields inherit; explicit booleans apply even when false. Maps
+merge by key; arrays replace, including `[]`. `--unlimited` clears inherited turn
+limits. Relative paths from a config file use that file's directory; CLI paths
+use the invocation directory. This includes prompt, env, PATH, log, and executable
+paths. Bare executable names resolve through the effective child `PATH`.
 
+Prompt order: positional text or `--prompt-file` > nonblank piped stdin > configured
+`prompt_file`. Positional text and `--prompt-file` conflict. A blank pipe permits
+config fallback; a bad explicit file fails. Prompt files and stdin are capped at
+1 MiB. Flags work before or after positional text; `--` sends following arguments
+only to the worker. `@task.md` is literal prompt text.
 
-### Loop sandbox policy
-
-`--sandbox workspace-write` and `--sandbox danger-full-access` select Codex
-filesystem isolation independently of approval bypass. `danger-full-access`
-does not add `--yolo` or change approval flags. Droid and Agy have no verified
-equivalent independent controls and reject those policies. Read-only is rejected
-for all supervised loops because worker/verifier callbacks must write loop state;
-Matcha does not silently add writable exceptions.
-
-`--sandbox backend-default` resets to native policy without injecting sandbox,
-autonomy, or approval options. Native settings must still permit callbacks. With
-no structured policy, existing adapter defaults and `--yolo` behavior are retained.
-See [versioned capability evidence](LOOP_SANDBOX_CAPABILITIES.md) for inspected
-local versions, argument placement, and the per-backend table.
-
-Project/user JSON supports `"sandbox": "workspace-write"` (or another named
-policy). `sandbox: null` is an explicit backend-default reset. A layer cannot
-contain both `sandbox` and `yolo` keys. Higher-layer sandbox clears inherited
-yolo; higher-layer `yolo: true` clears inherited sandbox. `yolo: false` alone
-clears inherited bypass without changing an inherited sandbox selection.
-
-Policies apply to worker and enabled verifier. Unsupported combinations and
-known conflicting native permission flags fail before either executable is
-probed or launched. Native passthrough remains supported without structured
-policy; Matcha does not implement a general vendor argument parser.
+Use `--max-turns N` or `--unlimited`, `--token-budget N`, and `--timeout 45m`
+to bound a run. `--quiet` and `--json` change terminal output, not audit logs.
 
 ```sh
-matcha loop "fix the build" --sandbox workspace-write
-matcha loop resume --last --sandbox workspace-write
-matcha loop resume --last --sandbox backend-default
+matcha loop
+matcha loop --config ./config/automation.json
+matcha loop "fix the build" --max-turns 5
+matcha loop --prompt-file ./task.md --env TOOLCHAIN_HOME=/opt/toolchains/current --path-prepend ./tools/bin --log-dir ./logs
+matcha loop resume --last --env TOOLCHAIN_HOME=/opt/toolchains/new --log-dir ./recovery-logs
 ```
 
-Resume validates the candidate policy before atomically replacing saved settings;
-a failed downgrade leaves prior state intact. Old snapshots retain historical
-policy and passthrough behavior until an explicit resume policy is selected.
-Help and `loop show` distinguish sandbox choice from the explicit yolo bypass.
+`--env KEY=VALUE` and `--env-file PATH` repeat. Env files accept `KEY=VALUE`, blank
+lines, whole-line `#` comments, optional `export`, and matching outer quotes.
+Values remain literal: no shell expansion or command execution. In each layer,
+env files load in order, then direct `env`/`--env` values win; higher layers win
+by key. Configured `path_prepend` and repeated `--path-prepend` replace inherited
+lists. Child PATH order is Matcha's executable directory, configured prefixes in
+their given order, then inherited PATH. Both roles receive the same environment.
+
+### Backend and verifier controls
+
+Default backend is `codex`; `-b`/`--backend` selects `droid` or `agy`.
+`--backend-bin` selects one executable, not a shell command. Custom executables
+must support that backend adapter's flags and stream protocol. `--model` and
+`--reasoning-effort` control the worker. An enabled verifier uses the worker
+backend by default; `--verifier` selects another. For the same backend, omitted
+verifier model, effort, and executable inherit worker values. For a different
+backend, omitted values use its native defaults. Explicit `null` in verifier JSON
+or empty `--verifier-model=`/`--verifier-bin=` selects native defaults. Verifier
+objects merge by field; `verifier: null` clears the override. `--no-verify`
+conflicts with explicit verifier controls.
+
+`verifier.args` or repeated `--verifier-arg=VALUE` supply independent verifier
+arguments; CLI values replace the config array. Arguments after `--` are worker
+only. Both roles use the same sandbox policy. Unsupported structured policies,
+unrecognized effort names, and conflicting native flags fail before either role
+starts. Matcha accepts the common effort names `low`, `medium`, `high`, `xhigh`,
+and `max`; the selected model may accept only a subset and reject a turn after
+launch. No model name is assumed by Matcha.
+
+| Backend | Structured sandbox | Reasoning flag | Explicit approval bypass |
+| --- | --- | --- | --- |
+| Codex | `workspace-write`, `danger-full-access`, `backend-default` | `-c model_reasoning_effort=...` | `--yolo` |
+| Droid | `backend-default` only | `--reasoning-effort` | `--yolo` |
+| Agy | `backend-default` only | `--effort` | `--yolo` |
+
+`--sandbox` selects isolation without bypassing approvals; `--yolo` explicitly
+bypasses them. They conflict in one layer, while a higher-layer choice replaces
+an inherited choice. `--sandbox backend-default` (or JSON `sandbox: null`) resets
+to native policy. `read-only` cannot support state-writing callbacks and is
+rejected for every backend. Droid/Agy have no verified independent equivalent of
+Codex's two structured modes. See [local CLI evidence](LOOP_SANDBOX_CAPABILITIES.md).
+
+### Resume and logs
+
+New loops save objective, resolved settings, cwd, and explicit environment
+overrides. Resume does not reread config, prompt files, or env files. It inherits
+the **current** ambient shell environment, then reapplies saved overrides and
+PATH prefixes. Saved backend identities cannot change. Legacy snapshots keep
+their historical shared model and argument behavior.
+
+`matcha loop resume [ID|--last]` accepts `--objective`, repeatable `--env` and
+`--env-file`, repeatable `--path-prepend`, `--backend-bin`, `--verifier-bin`,
+`--model`, `--verifier-model`, `--reasoning-effort`,
+`--verifier-reasoning-effort`, `--sandbox`, `--yolo`, and `--log-dir`.
+`--config`, new prompt sources, backend changes, and new verifier args are
+run-only. Resume validates a candidate before atomically saving it; accepted
+overrides become the base for later resumes. A failed candidate leaves prior
+state intact. `--sandbox backend-default` resets saved policy.
+
+Logging is opt-in with config `log_dir` or `--log-dir`. Each initial run or resume
+creates a fresh timestamped `.log`/`.jsonl` pair with loop and invocation IDs;
+retries stay in that pair. The readable log records lifecycle, role/attempt,
+assistant and tool activity, token summaries, and full stderr. The JSONL records
+lifecycle context and base64-encoded raw backend stdout/stderr bytes, including
+events hidden by terminal quiet/JSON output. Raw output can contain secrets.
+Configured environment values are also saved in loop state; protect both files
+accordingly. `turns.jsonl` in the loop store remains a compact state-history
+summary, not the raw audit stream. Requested logging is mandatory: a write or
+flush failure stops execution. A paused loop can resume with `--log-dir` pointing
+to a working directory.
