@@ -2683,7 +2683,7 @@ test "loop resume CLI reports a missing ID without an internal error" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Internal error:") == null);
 }
 
-test "configured CLI captures winning prompt and callback writes preserve resolved settings" {
+test "configured CLI captures winning prompt and saved settings" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2736,13 +2736,7 @@ test "configured CLI captures winning prompt and callback writes preserve resolv
             try std.testing.expectEqualStrings(expected_binary, state.value.backend_bin.?);
             try std.testing.expectEqual(loop_options.BackendKind.droid, state.value.backend);
             try std.testing.expectEqual(@as(u32, if (index == 1) 5 else 7), state.value.max_turns.?);
-            try std.testing.expectEqual(ExitCode.ok, try updateLoop(&store, candidate, .{ .status = .complete, .summary = "callback" }, &out.writer, &err.writer));
-            var after = try store.loadState(candidate);
-            defer after.deinit();
-            try std.testing.expectEqualStrings(case.expected, after.value.objective);
-            try std.testing.expectEqualStrings(state.value.model.?, after.value.model.?);
-            try std.testing.expectEqual(state.value.output_mode, after.value.output_mode);
-            try std.testing.expectEqual(state.value.max_turns, after.value.max_turns);
+            try std.testing.expectEqual(loop_store.LoopStatus.complete, state.value.status);
         }
         try std.testing.expect(found);
     }

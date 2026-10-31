@@ -7,6 +7,29 @@ const ExitCode = cli.ExitCode;
 const runArgsRuntime = cli.runArgsRuntime;
 const runLoopCommandWithInputs = cli.runLoopCommandWithInputs;
 
+test "loop help documents project configuration and resume controls" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try cli.writeLoopHelp(&output.writer);
+    const help = output.written();
+    for ([_][]const u8{
+        "piped stdin",
+        "--prompt-file",
+        "--config",
+        "--verifier-arg",
+        "--reasoning-effort",
+        "--env-file",
+        "--path-prepend",
+        "--log-dir",
+        "--sandbox",
+        "--yolo",
+        "current ambient env",
+        "logging failures",
+    }) |fragment| {
+        try std.testing.expect(std.mem.indexOf(u8, help, fragment) != null);
+    }
+}
+
 const ProjectWorkflowRunner = struct {
     store: *loop_store.Store,
     project: []const u8,
@@ -18,6 +41,7 @@ const ProjectWorkflowRunner = struct {
     new_toolchain: []const u8,
     calls: usize = 0,
     preflights: usize = 0,
+    failed_initial_attempt: bool = false,
     real: loop_backend.RealBackendRunner = .{},
 
     fn runner(self: *ProjectWorkflowRunner) loop_backend.BackendRunner {
@@ -33,6 +57,8 @@ const ProjectWorkflowRunner = struct {
     fn runTurn(context: *anyopaque, request: loop_backend.TurnRequest) !loop_backend.TurnExecutionResult {
         const self: *ProjectWorkflowRunner = @ptrCast(@alignCast(context));
         const call = self.calls;
+        const retry_fail = call == 0 and !self.failed_initial_attempt;
+        try std.testing.expectEqual(@as(u32, if (retry_fail) 1 else if (call == 0) 2 else 1), request.log_context.attempt.?);
         const verifying = call == 1 or call == 6;
         const repaired = call >= 4;
         try std.testing.expectEqualStrings(self.project, request.cwd.path);
@@ -54,10 +80,16 @@ const ProjectWorkflowRunner = struct {
         const call_text = try std.fmt.allocPrint(request.allocator, "{d}", .{call});
         defer request.allocator.free(call_text);
         try env.put("FIXTURE_CALL", call_text);
+        try env.put("FIXTURE_RETRY_FAIL", if (retry_fail) "1" else "0");
         var actual = request;
         actual.environ_map = &env;
         var result = try self.real.runner().runTurn(actual);
         errdefer result.deinit();
+        if (retry_fail) {
+            try std.testing.expectEqual(@as(i32, 23), result.exit_code);
+            self.failed_initial_attempt = true;
+            return result;
+        }
         try std.testing.expectEqual(@as(i32, 0), result.exit_code);
         if (call == 0 or call == 5) {
             try std.testing.expectEqual(ExitCode.ok, try runArgsRuntime(&.{ "loop", "update", request.loop_id, "--status", "complete", "--summary", "fixture ready" }, request.io, request.diagnostics.?, request.diagnostics.?, self.store.root, request.environ_map, null));
@@ -111,6 +143,7 @@ fn writeExecutable(dir: std.Io.Dir, io: std.Io, name: []const u8, role: []const 
         std.testing.allocator,
         "#!/bin/sh\n" ++
             "{{ printf 'cwd=%s\\n' \"$PWD\"; printf 'token=%s\\n' \"$FIXTURE_TOKEN\"; printf 'ambient=%s\\n' \"$UNRELATED_AMBIENT\"; printf 'tool=%s\\n' \"$(toolchain-probe)\"; for arg do printf 'arg=%s\\n' \"$arg\"; done; }} > \"$FIXTURE_RECORD/{s}-$FIXTURE_CALL\"\n" ++
+            "if [ \"$FIXTURE_RETRY_FAIL\" = 1 ]; then printf 'transient fixture stderr\\n' >&2; exit 23; fi\n" ++
             "printf '{{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}}\\n'\n" ++
             "printf '{{\"type\":\"fixture.unknown\",\"value\":7}}\\n'\n" ++
             "printf '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":2,\"output_tokens\":1}}}}\\n'\n" ++
@@ -225,6 +258,8 @@ test "offline project config drives real worker verifier logs and durable resume
     defer a.free(first_log);
     try std.testing.expect(try hasRawPayload(a, first_events, "stdout", "fixture.unknown"));
     try std.testing.expect(try hasRawPayload(a, first_events, "stderr", "fixture stderr"));
+    try std.testing.expect(try hasRawPayload(a, first_events, "stderr", "transient fixture stderr"));
+    try std.testing.expect(std.mem.indexOf(u8, first_events, "\"attempt\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_log, "fixture stderr") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_events, "\"role\":\"verifier\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_events, "\"kind\":\"status\"") != null);

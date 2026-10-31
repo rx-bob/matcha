@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const regular_test_gate = b.addOptions();
+    regular_test_gate.addOption(bool, "enabled", false);
+    matcha_module.addOptions("cli_test_gate", regular_test_gate);
 
     const exe = b.addExecutable(.{
         .name = "matcha",
@@ -60,6 +63,30 @@ pub fn build(b: *std.Build) void {
     });
     const run_module_tests = b.addRunArtifact(module_tests);
 
+    const cli_loop_gate = b.addOptions();
+    cli_loop_gate.addOption(bool, "enabled", true);
+    const cli_loop_module = b.createModule(.{
+        .root_source_file = b.path("root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_loop_module.addOptions("cli_test_gate", cli_loop_gate);
+    const cli_loop_tests = b.addTest(.{
+        .root_module = cli_loop_module,
+        .filters = &.{
+            "CLI loop declarations are included when enabled",
+            "loop CLI",
+            "loop resume CLI",
+            "configured CLI captures winning prompt",
+            "CLI verifier overrides",
+            "unavailable verifier",
+            "CLI resume sandbox",
+            "CLI rejects unsupported enabled verifier policy",
+        },
+    });
+    const run_cli_loop_tests = b.addRunArtifact(cli_loop_tests);
+
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
@@ -93,12 +120,16 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{.{ .name = "matcha", .module = matcha_module }},
         }),
-        .filters = &.{"offline project config drives real worker verifier logs and durable resume repairs"},
+        .filters = &.{
+            "offline project config drives real worker verifier logs and durable resume repairs",
+            "loop help documents project configuration and resume controls",
+        },
     });
     const run_workflow_tests = b.addRunArtifact(workflow_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_module_tests.step);
+    test_step.dependOn(&run_cli_loop_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_ownership_tests.step);
     test_step.dependOn(&run_markdown_tests.step);

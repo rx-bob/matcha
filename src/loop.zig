@@ -2051,6 +2051,46 @@ test "unsupported verifier policy prevents all preflight and worker calls unless
     }
 }
 
+test "unsupported worker and verifier efforts reject before any backend starts" {
+    const a = std.testing.allocator;
+    for ([_]options.BackendKind{ .codex, .droid, .agy }) |kind| {
+        for ([_]bool{ false, true }) |invalid_verifier| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+            defer a.free(root);
+            var store = try store_mod.Store.init(a, std.testing.io, root);
+            defer store.deinit();
+            var env = std.process.Environ.Map.init(a);
+            defer env.deinit();
+            var diagnostic: std.Io.Writer.Allocating = .init(a);
+            defer diagnostic.deinit();
+            var fake = FakeRunner{ .store = &store, .script = &.{} };
+            defer fake.deinit(a);
+            const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &env, .runner = fake.runner(), .stdout = &diagnostic.writer, .stderr = &diagnostic.writer };
+            const verifier_settings: options.VerifierOptions = .{ .reasoning_effort = "unsupported", .reasoning_explicit = true };
+            const result = try run(services, .{
+                .backend = kind,
+                .verifier = kind,
+                .verifier_options = if (invalid_verifier) verifier_settings else .{},
+                .reasoning_effort = if (invalid_verifier) null else "unsupported",
+                .prompt = "task",
+                .output_mode = .quiet,
+            });
+            try std.testing.expectEqual(ExitCode.failure, result);
+            try std.testing.expectEqual(@as(usize, 0), fake.preflight_calls.items.len);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "Unsupported reasoning effort") != null);
+            const ids = try store.listLoopIds();
+            defer {
+                for (ids) |id| a.free(id);
+                a.free(ids);
+            }
+            try std.testing.expectEqual(@as(usize, 0), ids.len);
+        }
+    }
+}
+
 test "resume sandbox candidate downgrades captured yolo and rejects invalid candidate without a write" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |unsupported_verifier| {

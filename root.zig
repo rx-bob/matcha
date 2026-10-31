@@ -21,3 +21,9 @@ pub const version = root.version;
 test "loop runtime declarations are included" {
     std.testing.refAllDecls(@import("src/loop.zig"));
 }
+
+test "CLI loop declarations are included when enabled" {
+    if (@import("cli_test_gate").enabled) {
+        std.testing.refAllDecls(@import("src/cli.zig"));
+    }
+}
