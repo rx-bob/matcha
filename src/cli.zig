@@ -171,6 +171,19 @@ fn runLoopCommand(
     switch (command) {
         .run => |run_options| {
             var effective_options = run_options;
+            var prompt_file_contents: ?[]const u8 = null;
+            defer if (prompt_file_contents) |contents| std.heap.page_allocator.free(contents);
+            if (run_options.prompt_file) |prompt_path| {
+                prompt_file_contents = std.Io.Dir.cwd().readFileAlloc(io, prompt_path, std.heap.page_allocator, .limited(1024 * 1024)) catch |err| {
+                    try stderr.print("Cannot read prompt file {s}: {s}\n", .{ prompt_path, @errorName(err) });
+                    return .usage;
+                };
+                if (std.mem.trim(u8, prompt_file_contents.?, " \t\r\n").len == 0) {
+                    try stderr.print("Prompt file is empty or blank: {s}\n", .{prompt_path});
+                    return .usage;
+                }
+                effective_options.prompt = prompt_file_contents.?;
+            }
             if (store_root == null) applyLoopConfig(io, &effective_options, stderr) catch return .failure;
             defer if (run_options.model == null) {
                 if (effective_options.model) |model| std.heap.page_allocator.free(model);
@@ -646,7 +659,8 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\matcha loop
         \\
         \\Usage:
-        \\  matcha loop [-b <codex|droid|agy>] <prompt> [options]
+        \\  matcha loop [options] <prompt> [options]
+        \\  matcha loop --prompt-file <path> [options]
         \\  matcha loop config
         \\  matcha loop resume [<id>|--last] [--objective <new objective>]
         \\  matcha loop list
@@ -658,6 +672,8 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\The default backend is codex; use -b to select droid or agy.
         \\Use matcha loop config to set default harness, model, and turn limit.
         \\Run options --model, -b, --max-turns, and --unlimited override saved defaults.
+        \\Prompt may come from positional text, --prompt-file, or piped stdin. Options work before or after text.
+        \\Options include --yolo, --verifier, --no-verify, --token-budget, --timeout, --quiet, and --json.
         \\Use matcha loop --help for this help.
         \\
     );

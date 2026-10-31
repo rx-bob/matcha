@@ -18,6 +18,7 @@ pub const RunOptions = struct {
     timeout_seconds: ?u64 = null,
     output_mode: OutputMode = .live,
     prompt: []const u8,
+    prompt_file: ?[]const u8 = null,
     extra_backend_args: []const []const u8 = &.{},
 };
 
@@ -79,6 +80,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     var prompt_parts: std.ArrayList([]const u8) = .empty;
     defer prompt_parts.deinit(allocator);
     var positional = false;
+    var prompt_file: ?[]const u8 = null;
     var extra_args: []const []const u8 = &.{};
 
     var i: usize = 0;
@@ -88,11 +90,13 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
             extra_args = args[i + 1 ..];
             break;
         }
-        if (positional) {
-            prompt_parts.append(allocator, arg) catch return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--backend")) {
+        if (std.mem.eql(u8, arg, "--prompt-file")) {
+            i += 1;
+            prompt_file = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
+        } else if (std.mem.startsWith(u8, arg, "--prompt-file=")) {
+            prompt_file = arg["--prompt-file=".len..];
+            if (prompt_file.?.len == 0) return .{ .err = .{ .missing_value = "--prompt-file" } };
+        } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--backend")) {
             i += 1;
             const value = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
             backend = parseBackend(value) orelse return .{ .err = .{ .unknown_backend = value } };
@@ -160,14 +164,15 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     if (no_verify and verifier != null) return .{ .err = .{ .invalid_loop_arguments = "--verifier cannot be combined with --no-verify" } };
     if (quiet_set and json_set) return .{ .err = .{ .invalid_loop_arguments = "--quiet cannot be combined with --json" } };
 
-    var prompt: []const u8 = undefined;
+    if (prompt_parts.items.len > 0 and prompt_file != null) return .{ .err = .{ .invalid_loop_arguments = "positional prompt and --prompt-file cannot be combined" } };
+    var prompt: []const u8 = "";
     if (prompt_parts.items.len > 0) {
         prompt = std.mem.join(allocator, " ", prompt_parts.items) catch return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
-    } else if (!stdin_is_tty and stdin_bytes.len > 0) {
+    } else if (prompt_file == null and !stdin_is_tty and stdin_bytes.len > 0) {
         const trimmed = std.mem.trim(u8, stdin_bytes, " \t\r\n");
         if (trimmed.len == 0) return .{ .err = .missing_prompt };
         prompt = allocator.dupe(u8, trimmed) catch return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
-    } else return .{ .err = .missing_prompt };
+    } else if (prompt_file == null) return .{ .err = .missing_prompt };
 
     return .{ .ok = .{ .run = .{
         .backend = backend,
@@ -182,6 +187,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         .timeout_seconds = timeout_seconds,
         .output_mode = output_mode,
         .prompt = prompt,
+        .prompt_file = prompt_file,
         .extra_backend_args = extra_args,
     } } };
 }
@@ -344,6 +350,42 @@ test "loop run accepts piped prompt and parses duration suffixes" {
     defer std.testing.allocator.free(o.prompt);
     try std.testing.expectEqual(@as(u64, 28800), o.timeout_seconds.?);
     try std.testing.expectEqualStrings("piped prompt", o.prompt);
+}
+
+test "loop run parses options around positional prompt and prompt file" {
+    const parsed = parseLoopCommand(std.testing.allocator, &.{ "fix", "the", "build", "--max-turns", "5", "--quiet" }, true, "");
+    const o = switch (parsed) {
+        .ok => |command| command.run,
+        .err => unreachable,
+    };
+    defer std.testing.allocator.free(o.prompt);
+    try std.testing.expectEqualStrings("fix the build", o.prompt);
+    try std.testing.expectEqual(@as(u32, 5), o.max_turns.?);
+    try std.testing.expectEqual(OutputMode.quiet, o.output_mode);
+
+    const file = parseLoopCommand(std.testing.allocator, &.{ "--prompt-file=task.md", "--yolo" }, true, "");
+    const file_options = switch (file) {
+        .ok => |command| command.run,
+        .err => unreachable,
+    };
+    try std.testing.expectEqualStrings("task.md", file_options.prompt_file.?);
+    try std.testing.expect(file_options.yolo);
+    try std.testing.expectEqualStrings("", file_options.prompt);
+    try std.testing.expect(switch (parseLoopCommand(std.testing.allocator, &.{ "text", "--prompt-file", "task.md" }, true, "")) {
+        .err => true,
+        else => false,
+    });
+    try std.testing.expect(switch (parseLoopCommand(std.testing.allocator, &.{ "text", "--misspelled" }, true, "")) {
+        .err => |e| e == .unknown_option,
+        else => false,
+    });
+    const literal = parseLoopCommand(std.testing.allocator, &.{"@task.md"}, true, "");
+    const literal_options = switch (literal) {
+        .ok => |command| command.run,
+        .err => unreachable,
+    };
+    defer std.testing.allocator.free(literal_options.prompt);
+    try std.testing.expectEqualStrings("@task.md", literal_options.prompt);
 }
 
 test "loop subcommands validate update and verify combinations" {
