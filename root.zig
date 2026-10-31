@@ -1,4 +1,5 @@
 const root = @import("src/root.zig");
+const std = @import("std");
 
 pub const assets = root.assets;
 pub const cli = root.cli;
@@ -16,3 +17,7 @@ pub const loop_prompts = root.loop_prompts;
 pub const loop_store = root.loop_store;
 pub const loop_stream = root.loop_stream;
 pub const version = root.version;
+
+test "loop runtime declarations are included" {
+    std.testing.refAllDecls(@import("src/loop.zig"));
+}

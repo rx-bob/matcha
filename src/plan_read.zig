@@ -67,6 +67,7 @@ pub fn parsePlanReadInput(
         };
     };
     const raw_output = allocator.dupe(u8, plan_payload) catch return PlanReadError.out_of_memory;
+    errdefer allocator.free(raw_output);
     const title = extractTitle(parsed.value);
     const title_output = allocator.dupe(u8, title) catch return PlanReadError.out_of_memory;
 

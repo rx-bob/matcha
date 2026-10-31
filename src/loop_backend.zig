@@ -100,7 +100,13 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     var stderr_drain = StderrDrain.init(request.io, stderr_file);
     var stderr_thread = try std.Thread.spawn(.{}, StderrDrain.run, .{&stderr_drain});
     var stdin_write = StdinWrite.init(request.io, stdin_file, request.prompt);
-    var stdin_thread = try std.Thread.spawn(.{}, StdinWrite.run, .{&stdin_write});
+    var stdin_thread = std.Thread.spawn(.{}, StdinWrite.run, .{&stdin_write}) catch |err| {
+        // The stderr worker may be blocked on the child pipe. Kill the child
+        // before joining it so a failed second spawn cannot leak the thread.
+        child.kill(request.io);
+        stderr_thread.join();
+        return err;
+    };
 
     var accumulator: stream.TurnAccumulator = .{};
     defer accumulator.deinit(request.allocator);
@@ -298,8 +304,10 @@ fn buildCodex(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u
     if (config.yolo) {
         try builder.add("--dangerously-bypass-approvals-and-sandbox");
     } else {
-        try builder.add("-s");
-        try builder.add("workspace-write");
+        if (!hasSandboxOverride(config.extra_args)) {
+            try builder.add("-s");
+            try builder.add("workspace-write");
+        }
         try builder.add("--add-dir");
         try builder.add(loop_dir);
     }
@@ -317,6 +325,14 @@ fn buildCodex(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u
         try builder.add("--json");
         try builder.add("-");
     }
+}
+
+fn hasSandboxOverride(args: []const []const u8) bool {
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--sandbox")) return i + 1 < args.len;
+        if (std.mem.startsWith(u8, arg, "--sandbox=")) return true;
+    }
+    return false;
 }
 
 fn buildDroid(builder: *ArgvBuilder, config: BackendOptions, session_id: ?[]const u8, prompt_file: []const u8) !void {
@@ -443,6 +459,11 @@ test "Codex argv orders sandbox flags before resume and forwards options" {
     var resumed = try buildArgv(allocator, .{ .backend = .codex, .yolo = true, .extra_args = &extra }, "/loops/id", "sid", "prompt.md");
     defer resumed.deinit();
     try expectArgv(&resumed, &.{ "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--experimental", "value", "resume", "--json", "sid", "-" });
+
+    const sandbox_override = [_][]const u8{ "-s", "danger-full-access", "--model_reasoning_effort", "high" };
+    var overridden = try buildArgv(allocator, .{ .backend = .codex, .extra_args = &sandbox_override }, "/loops/id", null, "prompt.md");
+    defer overridden.deinit();
+    try expectArgv(&overridden, &.{ "codex", "exec", "--add-dir", "/loops/id", "-s", "danger-full-access", "--model_reasoning_effort", "high", "--json", "-" });
 }
 
 test "Droid and Agy argv cover initial, resumed, and yolo modes" {

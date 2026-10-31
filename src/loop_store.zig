@@ -138,11 +138,13 @@ pub const Store = struct {
         defer root_dir.close(self.io);
         var iterator = root_dir.iterate();
         var latest: ?[]const u8 = null;
+        errdefer if (latest) |id| self.allocator.free(id);
         while (try iterator.next(self.io)) |entry| {
             if (entry.kind != .directory or !validLoopId(entry.name)) continue;
             if (latest == null or std.mem.order(u8, entry.name, latest.?) == .gt) {
+                const replacement = try self.allocator.dupe(u8, entry.name);
                 if (latest) |old| self.allocator.free(old);
-                latest = try self.allocator.dupe(u8, entry.name);
+                latest = replacement;
             }
         }
         return latest;
@@ -159,7 +161,11 @@ pub const Store = struct {
         var iterator = root_dir.iterate();
         while (try iterator.next(self.io)) |entry| {
             if (entry.kind != .directory or !validLoopId(entry.name)) continue;
-            try ids.append(self.allocator, try self.allocator.dupe(u8, entry.name));
+            const id = try self.allocator.dupe(u8, entry.name);
+            ids.append(self.allocator, id) catch |err| {
+                self.allocator.free(id);
+                return err;
+            };
         }
         std.mem.sort([]const u8, ids.items, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -211,6 +217,28 @@ fn validLoopId(id: []const u8) bool {
     if (id.len < 3 or id.len > 32) return false;
     for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
     return true;
+}
+
+test "listLoopIds frees allocations when ID collection fails" {
+    const fail_indices = [_]usize{ 1, 2 };
+    for (fail_indices) |fail_index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer std.testing.allocator.free(root);
+        try tmp.dir.createDir(std.testing.io, "aaa", .default_dir);
+        try tmp.dir.createDir(std.testing.io, "bbb", .default_dir);
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var store: Store = .{
+            .allocator = failing.allocator(),
+            .io = std.testing.io,
+            .root = root,
+        };
+        try std.testing.expectError(error.OutOfMemory, store.listLoopIds());
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "store creates and round-trips every state field with atomic overwrite" {

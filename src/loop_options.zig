@@ -7,11 +7,13 @@ pub const LoopStatus = enum { complete, blocked };
 
 pub const RunOptions = struct {
     backend: BackendKind,
+    backend_explicit: bool = false,
     verifier: ?BackendKind = null,
     verify_enabled: bool = true,
     model: ?[]const u8 = null,
     yolo: bool = false,
     max_turns: ?u32 = null,
+    turn_limit_explicit: bool = false,
     token_budget: ?u64 = null,
     timeout_seconds: ?u64 = null,
     output_mode: OutputMode = .live,
@@ -31,6 +33,7 @@ pub const LoopCommand = union(enum) {
     show: ShowOptions,
     update: UpdateOptions,
     verify: VerifyOptions,
+    config,
     help,
 };
 
@@ -47,7 +50,7 @@ pub fn parseLoopCommand(
 }
 
 fn isReserved(arg: []const u8) bool {
-    const names = [_][]const u8{ "resume", "list", "show", "update", "verify", "help", "--help", "-h" };
+    const names = [_][]const u8{ "resume", "list", "show", "update", "verify", "config", "help", "--help", "-h" };
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
 }
@@ -60,12 +63,14 @@ fn parseBackend(value: []const u8) ?BackendKind {
 }
 
 fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty: bool, stdin_bytes: []const u8) LoopCommandResult {
-    var backend: ?BackendKind = null;
+    var backend: BackendKind = .codex;
+    var backend_explicit = false;
     var verifier: ?BackendKind = null;
     var no_verify = false;
     var model: ?[]const u8 = null;
     var yolo = false;
     var max_turns: ?u32 = null;
+    var turn_limit_explicit = false;
     var token_budget: ?u64 = null;
     var timeout_seconds: ?u64 = null;
     var output_mode: OutputMode = .live;
@@ -91,9 +96,11 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
             i += 1;
             const value = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
             backend = parseBackend(value) orelse return .{ .err = .{ .unknown_backend = value } };
+            backend_explicit = true;
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             const value = arg["--backend=".len..];
             backend = parseBackend(value) orelse return .{ .err = .{ .unknown_backend = value } };
+            backend_explicit = true;
         } else if (std.mem.eql(u8, arg, "--verifier")) {
             i += 1;
             const value = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
@@ -114,9 +121,14 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
             i += 1;
             const value = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
             max_turns = parseInteger(u32, value) orelse return .{ .err = .{ .invalid_number = value } };
+            turn_limit_explicit = true;
         } else if (std.mem.startsWith(u8, arg, "--max-turns=")) {
             const value = arg["--max-turns=".len..];
             max_turns = parseInteger(u32, value) orelse return .{ .err = .{ .invalid_number = value } };
+            turn_limit_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--unlimited")) {
+            max_turns = null;
+            turn_limit_explicit = true;
         } else if (std.mem.eql(u8, arg, "--token-budget")) {
             i += 1;
             const value = if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
@@ -145,7 +157,6 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         }
     }
 
-    if (backend == null) return .{ .err = .missing_backend };
     if (no_verify and verifier != null) return .{ .err = .{ .invalid_loop_arguments = "--verifier cannot be combined with --no-verify" } };
     if (quiet_set and json_set) return .{ .err = .{ .invalid_loop_arguments = "--quiet cannot be combined with --json" } };
 
@@ -159,12 +170,14 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     } else return .{ .err = .missing_prompt };
 
     return .{ .ok = .{ .run = .{
-        .backend = backend.?,
+        .backend = backend,
+        .backend_explicit = backend_explicit,
         .verifier = verifier,
         .verify_enabled = !no_verify,
         .model = model,
         .yolo = yolo,
         .max_turns = max_turns,
+        .turn_limit_explicit = turn_limit_explicit,
         .token_budget = token_budget,
         .timeout_seconds = timeout_seconds,
         .output_mode = output_mode,
@@ -182,6 +195,10 @@ fn parseSubcommand(args: []const []const u8) LoopCommandResult {
     if (std.mem.eql(u8, cmd, "list")) {
         if (args.len != 1) return extra(args[1]);
         return .{ .ok = .list };
+    }
+    if (std.mem.eql(u8, cmd, "config")) {
+        if (args.len != 1) return extra(args[1]);
+        return .{ .ok = .config };
     }
     if (std.mem.eql(u8, cmd, "show")) {
         if (args.len > 2 or (args.len == 2 and std.mem.startsWith(u8, args[1], "-"))) return .{ .err = .{ .invalid_loop_arguments = "show accepts at most one loop id" } };
@@ -299,11 +316,15 @@ test "loop run parses backend, limits, prompt, and passthrough" {
     try std.testing.expectEqualStrings("--danger", o.extra_backend_args[0]);
 }
 
-test "loop run rejects missing or invalid backends and conflicting modes" {
-    try std.testing.expect(switch (parseLoopCommand(std.testing.allocator, &.{"fix"}, true, "")) {
-        .err => |e| e == .missing_backend,
-        else => false,
-    });
+test "loop run defaults to Codex and still rejects invalid backends and conflicting modes" {
+    const default_result = parseLoopCommand(std.testing.allocator, &.{"fix"}, true, "");
+    const default_options = switch (default_result) {
+        .ok => |command| command.run,
+        .err => unreachable,
+    };
+    defer std.testing.allocator.free(default_options.prompt);
+    try std.testing.expectEqual(BackendKind.codex, default_options.backend);
+
     try std.testing.expect(switch (parseLoopCommand(std.testing.allocator, &.{ "-b", "nope", "fix" }, true, "")) {
         .err => |e| e == .unknown_backend,
         else => false,

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const serve_routes = @import("serve_routes.zig");
+const scan_ownership = @import("scan_ownership.zig");
 
 /// Maximum number of bytes read from an artifact while classifying it. The
 /// markers are often located well into historical artifacts, so this window is
@@ -64,12 +65,7 @@ pub const CatalogEntry = struct {
 /// A concise per-file warning recorded while scanning a malformed or oversized
 /// Matcha artifact. The scan continues after recording a warning so a single
 /// bad file cannot abort discovery.
-pub const ScanWarning = struct {
-    /// Normalized relative path from the serving root using forward slashes.
-    rel_path: []const u8,
-    /// Short human-readable reason for the warning.
-    reason: []const u8,
-};
+pub const ScanWarning = scan_ownership.ScanWarning;
 
 /// Result of a scan: the discovered catalog entries and any per-file warnings.
 /// Both slices are owned by the caller and must be released with
@@ -181,6 +177,7 @@ pub fn scan(
         // or oversized metadata is reported as a warning without aborting.
         extractMetadata(io, allocator, walker_entry.dir, walker_entry.basename, kind, &entry, &warnings, rel_path) catch |err| switch (err) {
             error.OutOfMemory => {
+                freeEntryMetadata(allocator, entry);
                 allocator.free(rel_path);
                 return error.OutOfMemory;
             },
@@ -193,9 +190,10 @@ pub fn scan(
         };
     }
 
+    const owned = scan_ownership.takeTwoSlices(allocator, &entries, &warnings, freeEntries) catch return error.OutOfMemory;
     return .{
-        .entries = entries.toOwnedSlice(allocator) catch return error.OutOfMemory,
-        .warnings = warnings.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .entries = owned.first,
+        .warnings = owned.second,
     };
 }
 
@@ -423,6 +421,10 @@ fn handleMetadataKey(
             try appendWarning(allocator, warnings, rel_path, "malformed json metadata");
             return error.Unexpected;
         },
+    };
+    defer switch (value_token) {
+        .allocated_string => |owned| allocator.free(owned),
+        else => {},
     };
 
     const value_slice: ?[]const u8 = switch (value_token) {
@@ -843,6 +845,11 @@ pub fn catalogJsonAlloc(
         error.WriteFailed => return error.OutOfMemory,
     };
     var out = allocating.toArrayList();
+    // `toArrayList` transfers ownership out of the allocating writer. If the
+    // final resize/copy fails, the writer no longer owns the buffer, so its
+    // existing errdefer cannot release it; keep the ArrayList cleanup active
+    // until ownership is successfully transferred to the caller.
+    errdefer out.deinit(allocator);
     return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
@@ -864,7 +871,7 @@ pub const Scanner = struct {
     scan_fn: ScanFn,
 
     mutex: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
+    wake_event: std.Io.Event = .unset,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     current: ?*Catalog = null,
     last_scan_failed: bool = false,
@@ -929,7 +936,7 @@ pub const Scanner = struct {
     /// thread handle.
     pub fn stop(self: *Scanner) void {
         self.shutdown.store(true, .release);
-        self.cond.broadcast(self.io);
+        self.wake_event.set(self.io);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -942,11 +949,7 @@ pub const Scanner = struct {
     }
 
     fn freePrevWarnings(self: *Scanner) void {
-        for (self.prev_warnings) |w| {
-            self.allocator.free(w.rel_path);
-            self.allocator.free(w.reason);
-        }
-        if (self.prev_warnings.len > 0) self.allocator.free(self.prev_warnings);
+        if (self.prev_warnings.len > 0) scan_ownership.freeWarnings(self.allocator, self.prev_warnings);
         self.prev_warnings = &.{};
     }
 
@@ -1023,21 +1026,7 @@ pub const Scanner = struct {
             self.prev_warnings = &.{};
             return;
         }
-        const owned = self.allocator.alloc(ScanWarning, catalog.warnings.len) catch {
-            self.prev_warnings = &.{};
-            return;
-        };
-        var count: usize = 0;
-        for (catalog.warnings) |warning| {
-            const rel = self.allocator.dupe(u8, warning.rel_path) catch continue;
-            const reason = self.allocator.dupe(u8, warning.reason) catch {
-                self.allocator.free(rel);
-                continue;
-            };
-            owned[count] = .{ .rel_path = rel, .reason = reason };
-            count += 1;
-        }
-        self.prev_warnings = owned[0..count];
+        self.prev_warnings = scan_ownership.duplicateWarnings(self.allocator, catalog.warnings) catch &.{};
     }
 
     /// Acquire the current snapshot for reading. The caller MUST hold the
@@ -1055,11 +1044,8 @@ pub const Scanner = struct {
                 .raw = std.Io.Duration.fromSeconds(@intCast(self.interval_seconds)),
                 .clock = .awake,
             };
-            self.mutex.lockUncancelable(self.io);
-            if (!self.shutdown.load(.acquire)) {
-                self.cond.waitTimeout(self.io, &self.mutex, .{ .duration = duration }) catch {};
-            }
-            self.mutex.unlock(self.io);
+            self.wake_event.waitTimeout(self.io, .{ .duration = duration }) catch {};
+            self.wake_event.reset();
             if (self.shutdown.load(.acquire)) return;
             self.runScan();
         }
@@ -1826,6 +1812,7 @@ fn dupeScanResult(allocator: std.mem.Allocator, result: ScanResult) !ScanResult 
         const rel = try allocator.dupe(u8, entry.rel_path);
         errdefer allocator.free(rel);
         var md: ArtifactMetadata = .{};
+        errdefer freeEntryMetadata(allocator, .{ .rel_path = "", .kind = entry.kind, .size = entry.size, .mtime = entry.mtime, .metadata = md });
         if (entry.metadata.title) |s| md.title = try allocator.dupe(u8, s);
         if (entry.metadata.project) |s| md.project = try allocator.dupe(u8, s);
         if (entry.metadata.status) |s| md.status = try allocator.dupe(u8, s);
@@ -1856,10 +1843,8 @@ fn dupeScanResult(allocator: std.mem.Allocator, result: ScanResult) !ScanResult 
         try warnings.append(allocator, .{ .rel_path = rel, .reason = reason });
     }
 
-    return .{
-        .entries = try entries.toOwnedSlice(allocator),
-        .warnings = try warnings.toOwnedSlice(allocator),
-    };
+    const owned = try scan_ownership.takeTwoSlices(allocator, &entries, &warnings, freeEntries);
+    return .{ .entries = owned.first, .warnings = owned.second };
 }
 
 /// Build a canned `ScanResult` with the given entries (no warnings).
@@ -1876,6 +1861,7 @@ fn cannedResult(allocator: std.mem.Allocator, entries: []const CatalogEntry) !Sc
         const rel = try allocator.dupe(u8, entry.rel_path);
         errdefer allocator.free(rel);
         var md: ArtifactMetadata = .{};
+        errdefer freeEntryMetadata(allocator, .{ .rel_path = "", .kind = entry.kind, .size = entry.size, .mtime = entry.mtime, .metadata = md });
         if (entry.metadata.title) |s| md.title = try allocator.dupe(u8, s);
         if (entry.metadata.project) |s| md.project = try allocator.dupe(u8, s);
         if (entry.metadata.status) |s| md.status = try allocator.dupe(u8, s);
@@ -1904,6 +1890,7 @@ fn cannedResultWithWarnings(
     warnings: []const ScanWarning,
 ) !ScanResult {
     var result = try cannedResult(allocator, entries);
+    errdefer freeScanResult(allocator, result);
     var owned: std.ArrayList(ScanWarning) = .empty;
     errdefer {
         for (owned.items) |w| {

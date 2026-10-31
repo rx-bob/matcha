@@ -44,3 +44,5 @@ Blocked audit:
 {{ verifier_section }}
 
 When the previous completion attempt failed independent verification, this placeholder contains a `<verifier_rejection>...</verifier_rejection>` block with the verifier's findings. Treat its contents as actionable evidence: address each failed requirement, gather stronger evidence, and do not repeat the rejected completion claim without resolving the findings.
+
+At the end of each turn, leave a concise cumulative summary of the entire loop so far: what was changed, checks actually run and their results, and any unfinished work or blocker. Use at most 80 words, with no preamble or tool transcript. This final response is shown in Matcha’s end-of-loop Summary section. Use the same brief summary for any `matcha loop update --summary` report. Preserve earlier accomplishments when updating it; distinguish partial progress from verified completion.

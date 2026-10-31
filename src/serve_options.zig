@@ -128,10 +128,14 @@ pub fn parseServeOptions(
     }
 
     if (directory_set) {
-        const normalized = path.expandHomePath(allocator, directory) catch |err| switch (err) {
+        const expanded = path.expandHomePath(allocator, directory) catch |err| switch (err) {
             error.MissingHome => return .{ .err = .{ .missing_home = directory } },
             else => return .{ .err = .{ .path_error = directory } },
         };
+        const normalized = if (expanded.ptr == directory.ptr)
+            allocator.dupe(u8, expanded) catch return .{ .err = .{ .path_error = directory } }
+        else
+            expanded;
 
         return .{ .ok = .{
             .directory = normalized,

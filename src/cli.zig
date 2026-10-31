@@ -1,4 +1,10 @@
 const std = @import("std");
+const c = @cImport({
+    @cInclude("termios.h");
+    @cInclude("unistd.h");
+    @cInclude("poll.h");
+    @cInclude("sys/ioctl.h");
+});
 
 const assets = @import("assets.zig");
 const errors = @import("errors.zig");
@@ -10,6 +16,8 @@ const plan_read = @import("plan_read.zig");
 const serve_options = @import("serve_options.zig");
 const serve = @import("serve.zig");
 const loop_options = @import("loop_options.zig");
+const loop_config = @import("loop_config.zig");
+const loop_models = @import("loop_models.zig");
 const loop_store = @import("loop_store.zig");
 const loop_runtime = @import("loop.zig");
 const loop_backend = @import("loop_backend.zig");
@@ -141,7 +149,12 @@ fn runLoopCommand(
             return .usage;
         },
     };
+    defer switch (command) {
+        .run => |run_options| std.heap.page_allocator.free(run_options.prompt),
+        else => {},
+    };
     switch (command) {
+        .config => return runLoopConfig(io, stdout, stderr),
         .help => {
             try writeLoopHelp(stdout);
             return .ok;
@@ -157,7 +170,11 @@ fn runLoopCommand(
 
     switch (command) {
         .run => |run_options| {
-            defer std.heap.page_allocator.free(run_options.prompt);
+            var effective_options = run_options;
+            if (store_root == null) applyLoopConfig(io, &effective_options, stderr) catch return .failure;
+            defer if (run_options.model == null) {
+                if (effective_options.model) |model| std.heap.page_allocator.free(model);
+            };
             var real_runner: loop_backend.RealBackendRunner = .{};
             const services: loop_runtime.Services = .{
                 .allocator = std.heap.page_allocator,
@@ -168,7 +185,7 @@ fn runLoopCommand(
                 .stdout = stdout,
                 .stderr = stderr,
             };
-            return switch (try loop_runtime.run(services, run_options)) {
+            return switch (try loop_runtime.run(services, effective_options)) {
                 .ok => .ok,
                 .failure => .failure,
             };
@@ -200,6 +217,7 @@ fn runLoopCommand(
                     try stderr.print("Cannot resume loop {s} from its current status\n", .{resolved_id});
                     return .failure;
                 }
+                if (err == error.FileNotFound or err == error.NotDir) return reportLoopStoreError(err, resolved_id, stderr);
                 return err;
             }) {
                 .ok => .ok,
@@ -230,6 +248,249 @@ fn runLoopCommand(
         },
         else => unreachable,
     }
+}
+
+fn applyLoopConfig(io: std.Io, options: *loop_options.RunOptions, stderr: *std.Io.Writer) !void {
+    var parsed = loop_config.load(std.heap.page_allocator, io) catch |err| {
+        if (err == error.FileNotFound) return;
+        try stderr.print("Cannot read matcha loop config: {s}\n", .{@errorName(err)});
+        return error.InvalidLoopConfig;
+    };
+    defer parsed.deinit();
+    if (!options.backend_explicit) options.backend = parsed.value.backend;
+    if (options.model == null) {
+        if (parsed.value.model) |model| options.model = try std.heap.page_allocator.dupe(u8, model);
+    }
+    if (!options.turn_limit_explicit) options.max_turns = parsed.value.max_turns;
+}
+
+fn runLoopConfig(io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !ExitCode {
+    var config: loop_config.Config = .{};
+    var parsed: ?std.json.Parsed(loop_config.Config) = loop_config.load(std.heap.page_allocator, io) catch |err| blk: {
+        if (err != error.FileNotFound) {
+            try stderr.print("Cannot read existing matcha loop config: {s}\n", .{@errorName(err)});
+            return .failure;
+        }
+        break :blk null;
+    };
+    if (parsed) |*value| {
+        defer value.deinit();
+        config = value.value;
+        if (config.model) |model| {
+            // Clear the borrowed JSON slice before transferring ownership so
+            // an allocation failure cannot make the outer cleanup free it.
+            config.model = null;
+            config.model = try std.heap.page_allocator.dupe(u8, model);
+        }
+    }
+    defer if (config.model) |model| std.heap.page_allocator.free(model);
+
+    var input = stdinDirectoryAcquirer(io);
+    const acquirer = input.acquirer();
+    if (!acquirer.isInteractive()) {
+        try stderr.writeAll("matcha loop config requires an interactive terminal.\n");
+        return .usage;
+    }
+
+    const backend_choices = [_][]const u8{ "codex", "droid", "agy" };
+    const backend_index: usize = switch (config.backend) {
+        .codex => 0,
+        .droid => 1,
+        .agy => 2,
+    };
+    const previous_backend = config.backend;
+    config.backend = switch (try selectConfigOption(stdout, "Default harness", &backend_choices, backend_index)) {
+        0 => .codex,
+        1 => .droid,
+        2 => .agy,
+        else => unreachable,
+    };
+    if (config.backend != previous_backend) {
+        if (config.model) |old_model| std.heap.page_allocator.free(old_model);
+        config.model = null;
+    }
+
+    var catalog = try loop_models.load(std.heap.page_allocator, io, config.backend);
+    defer catalog.deinit();
+    var model_choices: std.ArrayList(ConfigModelChoice) = .empty;
+    defer {
+        for (model_choices.items) |choice| if (choice.owns_label) std.heap.page_allocator.free(choice.label);
+        model_choices.deinit(std.heap.page_allocator);
+    }
+    try model_choices.append(std.heap.page_allocator, .{ .id = null, .label = "Harness default (no model override)" });
+    var selected_model: usize = 0;
+    var has_saved_model = false;
+    for (catalog.items.items) |model| {
+        const label = try std.fmt.allocPrint(std.heap.page_allocator, "{s} [{s}]", .{ model.name, model.id });
+        errdefer std.heap.page_allocator.free(label);
+        const index = model_choices.items.len;
+        try model_choices.append(std.heap.page_allocator, .{ .id = model.id, .label = label, .owns_label = true });
+        if (config.model) |saved| if (std.mem.eql(u8, saved, model.id)) {
+            selected_model = index;
+            has_saved_model = true;
+        };
+    }
+    if (config.model) |saved| {
+        if (!has_saved_model) {
+            const label = try std.fmt.allocPrint(std.heap.page_allocator, "Saved model [{s}]", .{saved});
+            errdefer std.heap.page_allocator.free(label);
+            selected_model = model_choices.items.len;
+            try model_choices.append(std.heap.page_allocator, .{ .id = saved, .label = label, .owns_label = true });
+        }
+    }
+    const custom_model_choice = model_choices.items.len;
+    try model_choices.append(std.heap.page_allocator, .{ .id = null, .label = "Enter a custom model ID", .custom = true });
+    const model_labels = try std.heap.page_allocator.alloc([]const u8, model_choices.items.len);
+    defer std.heap.page_allocator.free(model_labels);
+    for (model_choices.items, 0..) |choice, index| model_labels[index] = choice.label;
+    const selected_choice = try selectConfigOption(stdout, "Default model", model_labels, selected_model);
+    if (selected_choice == custom_model_choice) {
+        try stdout.writeAll("Model ID: ");
+        try stdout.flush();
+        const model_line = try readConfigLine(acquirer, stderr);
+        defer std.heap.page_allocator.free(model_line);
+        const model_value = std.mem.trim(u8, model_line, " \t\r\n");
+        if (model_value.len == 0) {
+            try stderr.writeAll("Model ID cannot be empty.\n");
+            return .usage;
+        }
+        const owned_model = try std.heap.page_allocator.dupe(u8, model_value);
+        if (config.model) |old_model| std.heap.page_allocator.free(old_model);
+        config.model = owned_model;
+    } else if (model_choices.items[selected_choice].id) |selected_id| {
+        const owned_model = try std.heap.page_allocator.dupe(u8, selected_id);
+        if (config.model) |old_model| std.heap.page_allocator.free(old_model);
+        config.model = owned_model;
+    } else {
+        if (config.model) |old_model| std.heap.page_allocator.free(old_model);
+        config.model = null;
+    }
+
+    const turn_choices = [_][]const u8{ "unlimited", "set a maximum" };
+    const turn_selection = try selectConfigOption(stdout, "Turn limit", &turn_choices, if (config.max_turns == null) 0 else 1);
+    if (turn_selection == 0) {
+        config.max_turns = null;
+    } else {
+        try stdout.print("Maximum turns (current: {d}): ", .{config.max_turns orelse 10});
+        try stdout.flush();
+        const turns_line = try readConfigLine(acquirer, stderr);
+        defer std.heap.page_allocator.free(turns_line);
+        const turns_value = std.mem.trim(u8, turns_line, " \t\r\n");
+        config.max_turns = std.fmt.parseInt(u32, turns_value, 10) catch {
+            try stderr.writeAll("Maximum turns must be a positive integer.\n");
+            return .usage;
+        };
+        if (config.max_turns.? == 0) {
+            try stderr.writeAll("Maximum turns must be a positive integer.\n");
+            return .usage;
+        }
+    }
+
+    const saved_path = loop_config.save(std.heap.page_allocator, io, config) catch |err| {
+        try stderr.print("Cannot save matcha loop config: {s}\n", .{@errorName(err)});
+        return .failure;
+    };
+    defer std.heap.page_allocator.free(saved_path);
+    try stdout.print("Saved matcha loop defaults to {s}\n", .{saved_path});
+    return .ok;
+}
+
+fn selectConfigOption(stdout: *std.Io.Writer, title: []const u8, choices: []const []const u8, initial: usize) !usize {
+    var original: c.struct_termios = undefined;
+    if (c.tcgetattr(c.STDIN_FILENO, &original) != 0) return error.TerminalSetupFailed;
+    var raw = original;
+    raw.c_lflag &= @as(c.tcflag_t, ~@as(c.tcflag_t, c.ICANON | c.ECHO));
+    raw.c_cc[c.VMIN] = 1;
+    raw.c_cc[c.VTIME] = 0;
+    if (c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &raw) != 0) return error.TerminalSetupFailed;
+    defer _ = c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &original);
+
+    var selected = @min(initial, choices.len - 1);
+    var first_visible = visibleMenuStart(selected, choices.len);
+    try drawConfigMenu(stdout, title, choices, selected, first_visible, false);
+    while (true) {
+        var byte: u8 = 0;
+        if (c.read(c.STDIN_FILENO, &byte, 1) != 1) return error.TerminalReadFailed;
+        if (byte == '\r' or byte == '\n') {
+            try stdout.writeByte('\n');
+            try stdout.flush();
+            return selected;
+        }
+        if (byte == 3) return error.ConfigCancelled;
+        var changed = false;
+        if (byte == 0x1b) {
+            var poll_fd = c.struct_pollfd{ .fd = c.STDIN_FILENO, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&poll_fd, 1, 80) > 0 and (poll_fd.revents & c.POLLIN) != 0) {
+                var sequence: [2]u8 = undefined;
+                if (c.read(c.STDIN_FILENO, &sequence, 2) == 2 and sequence[0] == '[') {
+                    if (sequence[1] == 'A') {
+                        selected = if (selected == 0) choices.len - 1 else selected - 1;
+                        changed = true;
+                    } else if (sequence[1] == 'B') {
+                        selected = (selected + 1) % choices.len;
+                        changed = true;
+                    }
+                }
+            }
+        } else if (byte == 'k' or byte == 'K') {
+            selected = if (selected == 0) choices.len - 1 else selected - 1;
+            changed = true;
+        } else if (byte == 'j' or byte == 'J') {
+            selected = (selected + 1) % choices.len;
+            changed = true;
+        }
+        if (changed) {
+            first_visible = visibleMenuStart(selected, choices.len);
+            try drawConfigMenu(stdout, title, choices, selected, first_visible, true);
+        }
+    }
+}
+
+const ConfigModelChoice = struct {
+    id: ?[]const u8,
+    label: []const u8,
+    owns_label: bool = false,
+    custom: bool = false,
+};
+
+fn visibleMenuStart(selected: usize, count: usize) usize {
+    const visible_count = @min(count, 10);
+    if (selected >= visible_count) return selected - visible_count + 1;
+    return 0;
+}
+
+fn drawConfigMenu(stdout: *std.Io.Writer, title: []const u8, choices: []const []const u8, selected: usize, first_visible: usize, redraw: bool) !void {
+    const visible_count = @min(choices.len, 10);
+    const columns = configMenuColumns();
+    if (redraw) {
+        try stdout.print("\x1b[{d}A\r\x1b[J", .{visible_count + 1});
+    }
+    var header_buffer: [512]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buffer, "{s} ({d}/{d}; ↑/↓, Enter)", .{ title, selected + 1, choices.len });
+    try stdout.writeAll(truncateUtf8(header, columns));
+    try stdout.writeByte('\n');
+    for (choices[first_visible .. first_visible + visible_count], first_visible..) |choice, index| {
+        try stdout.writeAll(if (index == selected) "> " else "  ");
+        try stdout.writeAll(truncateUtf8(choice, columns -| 2));
+        try stdout.writeByte('\n');
+    }
+    try stdout.flush();
+}
+
+fn configMenuColumns() usize {
+    var window: c.struct_winsize = undefined;
+    if (c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &window) == 0 and window.ws_col > 0) return window.ws_col;
+    return 80;
+}
+
+fn readConfigLine(acquirer: DirectoryAcquirer, stderr: *std.Io.Writer) ![]const u8 {
+    return switch (acquirer.readLine(std.heap.page_allocator)) {
+        .ok => |line| line,
+        .err => |err| {
+            try stderr.print("Could not read configuration input: {s}\n", .{@tagName(err)});
+            return error.ConfigInputFailed;
+        },
+    };
 }
 
 fn resolveLoopId(explicit_id: ?[]const u8, io: std.Io) ?[]const u8 {
@@ -377,7 +638,7 @@ fn oneLineObjective(allocator: std.mem.Allocator, text: []const u8) ![]const u8 
 }
 
 fn writeLoopUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.writeAll("Usage: matcha loop <run|resume|list|show|update|verify|help> [options]\n");
+    try writer.writeAll("Usage: matcha loop [options] | resume | list | show | update | verify | help\n");
 }
 
 pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -385,7 +646,8 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\matcha loop
         \\
         \\Usage:
-        \\  matcha loop -b <codex|droid|agy> <prompt> [options]
+        \\  matcha loop [-b <codex|droid|agy>] <prompt> [options]
+        \\  matcha loop config
         \\  matcha loop resume [<id>|--last] [--objective <new objective>]
         \\  matcha loop list
         \\  matcha loop show [<id>]
@@ -393,6 +655,9 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha loop verify [<id>] --pass | --fail --reason <text>
         \\
         \\Loop callbacks accept MATCHA_LOOP_ID when <id> is omitted.
+        \\The default backend is codex; use -b to select droid or agy.
+        \\Use matcha loop config to set default harness, model, and turn limit.
+        \\Run options --model, -b, --max-turns, and --unlimited override saved defaults.
         \\Use matcha loop --help for this help.
         \\
     );
@@ -444,6 +709,8 @@ fn runRenderCommand(
             return .usage;
         },
     }
+    defer std.heap.page_allocator.free(options.input);
+    defer std.heap.page_allocator.free(options.output);
 
     if (!prepareOutputDirectory(io, stderr, options.output)) {
         return .failure;
@@ -595,10 +862,15 @@ fn runServeCommandAcquired(
         },
     };
     _ = &options;
+    var owns_directory = options.directory_set;
+    defer if (owns_directory) std.heap.page_allocator.free(options.directory);
 
     if (!options.directory_set) {
         switch (acquireServeDirectory(acquirer, stdout, stderr)) {
-            .ok => |entered| options.directory = entered,
+            .ok => |entered| {
+                options.directory = entered;
+                owns_directory = true;
+            },
             .err => |cli_error| {
                 try writeCliError(stderr, cli_error);
                 try writeServeUsage(stderr);
@@ -657,12 +929,17 @@ pub fn acquireServeDirectory(
     const entered = acquirer.readLine(std.heap.page_allocator);
     return switch (entered) {
         .ok => |line| blk: {
+            defer std.heap.page_allocator.free(line);
             const trimmed = std.mem.trim(u8, line, " \t\r\n");
             if (trimmed.len == 0) break :blk .{ .err = .{ .missing_value = "directory" } };
             const expanded = path.expandHomePath(std.heap.page_allocator, trimmed) catch |err| switch (err) {
-                error.MissingHome => break :blk .{ .err = .{ .missing_home = trimmed } },
-                else => break :blk .{ .err = .{ .path_error = trimmed } },
+                error.MissingHome => break :blk .{ .err = .{ .missing_home = "entered directory" } },
+                else => break :blk .{ .err = .{ .path_error = "entered directory" } },
             };
+            if (expanded.ptr == trimmed.ptr) {
+                const owned = std.heap.page_allocator.dupe(u8, expanded) catch break :blk .{ .err = .{ .path_error = "entered directory" } };
+                break :blk .{ .ok = owned };
+            }
             break :blk .{ .ok = expanded };
         },
         .err => |e| .{ .err = e },
@@ -759,19 +1036,44 @@ pub fn writeServeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
 }
 
 fn normalizeRenderPaths(allocator: std.mem.Allocator, options: *RenderOptions) RenderOptionsResult {
-    options.input = path.expandHomePath(allocator, options.input) catch |err| {
+    const expanded_input = path.expandHomePath(allocator, options.input) catch |err| {
         switch (err) {
             error.MissingHome => return RenderOptionsResult{ .err = .{ .missing_home = options.input } },
             else => return RenderOptionsResult{ .err = .{ .path_error = options.input } },
         }
     };
-    options.output = path.expandHomePath(allocator, options.output) catch |err| {
+    const normalized_input = if (expanded_input.ptr == options.input.ptr)
+        allocator.dupe(u8, expanded_input) catch return RenderOptionsResult{ .err = .{ .path_error = options.input } }
+    else
+        expanded_input;
+    const expanded_output = path.expandHomePath(allocator, options.output) catch |err| {
+        allocator.free(normalized_input);
         switch (err) {
             error.MissingHome => return RenderOptionsResult{ .err = .{ .missing_home = options.output } },
             else => return RenderOptionsResult{ .err = .{ .path_error = options.output } },
         }
     };
+    const normalized_output = if (expanded_output.ptr == options.output.ptr)
+        allocator.dupe(u8, expanded_output) catch {
+            allocator.free(normalized_input);
+            return RenderOptionsResult{ .err = .{ .path_error = options.output } };
+        }
+    else
+        expanded_output;
+    options.input = normalized_input;
+    options.output = normalized_output;
     return RenderOptionsResult{ .ok = options.* };
+}
+
+test "render path normalization returns owned copies for ordinary paths" {
+    const allocator = std.testing.allocator;
+    var options: RenderOptions = .{ .target = .plan, .input = "relative/input.json", .output = "dist/output.html" };
+    const normalized = normalizeRenderPaths(allocator, &options);
+    try std.testing.expect(normalized == .ok);
+    defer allocator.free(options.input);
+    defer allocator.free(options.output);
+    try std.testing.expectEqualStrings("relative/input.json", options.input);
+    try std.testing.expectEqualStrings("dist/output.html", options.output);
 }
 
 fn prepareOutputDirectory(io: std.Io, stderr: *std.Io.Writer, output: []const u8) bool {
@@ -2246,4 +2548,54 @@ test "loop resume CLI accepts last and injects the changed objective" {
     try std.testing.expectEqualStrings("updated objective", after.value.objective);
     try std.testing.expectEqual(@as(u8, 0), after.value.blocked_strikes);
     try std.testing.expect(!after.value.objective_update_pending);
+}
+
+test "loop resume CLI accepts an explicit loop id" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(store_root);
+    var store = try loop_store.Store.init(allocator, std.testing.io, store_root);
+    defer store.deinit();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const state: loop_store.LoopState = .{
+        .id = "6722c1a0-0003",
+        .status = .paused,
+        .backend = .codex,
+        .cwd = cwd,
+        .objective = "resume by ID",
+        .worker_session_id = "saved-session",
+        .started_at_ms = 100,
+        .updated_at_ms = 100,
+    };
+    try store.createLoop(state);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var fake = ResumeCliFake{ .allocator = allocator, .store = &store };
+    defer fake.deinit();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    const code = try runArgsRuntime(&.{ "loop", "resume", state.id }, std.testing.io, &stdout, &stderr, store_root, &env, fake.runner());
+    try std.testing.expectEqual(ExitCode.ok, code);
+    try std.testing.expect(fake.resumed);
+}
+
+test "loop resume CLI reports a missing ID without an internal error" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(store_root);
+    var stdout_buffer: [2048]u8 = undefined;
+    var stderr_buffer: [2048]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    const code = try runArgsWithLoopStoreRoot(&.{ "loop", "resume", "6722c1a0-ffff" }, std.testing.io, &stdout, &stderr, store_root);
+    try std.testing.expectEqual(ExitCode.failure, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Loop not found:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer[0..stderr.end], "Internal error:") == null);
 }

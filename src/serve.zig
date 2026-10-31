@@ -503,9 +503,11 @@ fn writeIndexResponse(writer: *std.Io.Writer) !void {
 const TestScanner = struct {
     tmp: std.testing.TmpDir,
     scanner: serve_catalog.Scanner,
+    root: []u8,
 
     fn deinit(self: *TestScanner) void {
         self.scanner.stop();
+        std.testing.allocator.free(self.root);
         self.tmp.cleanup();
     }
 };
@@ -513,17 +515,17 @@ const TestScanner = struct {
 fn testScanner() !TestScanner {
     const io = std.testing.io;
     const tmp = std.testing.tmpDir(.{});
-    const root = try std.heap.page_allocator.dupe(u8, tmp.dir.path.?);
-    errdefer std.heap.page_allocator.free(root);
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    errdefer std.testing.allocator.free(root);
     var scanner = serve_catalog.Scanner.init(
         io,
-        std.heap.page_allocator,
+        std.testing.allocator,
         root,
         5,
         serve_catalog.scan,
     );
     scanner.initialScan();
-    return .{ .tmp = tmp, .scanner = scanner };
+    return .{ .tmp = tmp, .scanner = scanner, .root = root };
 }
 
 test "resolveAddress maps 0.0.0.0 to unspecified" {
@@ -904,18 +906,18 @@ test "writeStartupReport uses singular 'artifact' for one entry" {
 fn testScannerWithOneArtifact() !TestScanner {
     const io = std.testing.io;
     const tmp = std.testing.tmpDir(.{});
-    const root = try std.heap.page_allocator.dupe(u8, tmp.dir.path.?);
-    errdefer std.heap.page_allocator.free(root);
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    errdefer std.testing.allocator.free(root);
     try tmp.dir.writeFile("plan.html", minimalPlanHtml());
     var scanner = serve_catalog.Scanner.init(
         io,
-        std.heap.page_allocator,
+        std.testing.allocator,
         root,
         5,
         serve_catalog.scan,
     );
     scanner.initialScan();
-    return .{ .tmp = tmp, .scanner = scanner };
+    return .{ .tmp = tmp, .scanner = scanner, .root = root };
 }
 
 fn minimalPlanHtml() []const u8 {
@@ -1327,14 +1329,16 @@ test "handleConnection refuses artifact replaced by outside-root symlink" {
 
     // Remove the cataloged file then create a symlink at the same path.
     scanner_ctx.tmp.dir.deleteFile(io, "plan.html") catch return error.DeleteFailed;
+    const symlink_target = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/secret.txt",
+        .{outside.dir.path.?},
+    );
+    defer std.testing.allocator.free(symlink_target);
     scanner_ctx.tmp.dir.symLink(
         io,
         // Absolute path to the outside-root target so the link escapes the root.
-        try std.fmt.allocPrint(
-            std.heap.page_allocator,
-            "{s}/secret.txt",
-            .{outside.dir.path.?},
-        ),
+        symlink_target,
         "plan.html",
         .{},
     ) catch return; // symlinks may be unavailable on some platforms; skip silently.

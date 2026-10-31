@@ -4,6 +4,7 @@ const options = @import("loop_options.zig");
 const prompts = @import("loop_prompts.zig");
 const store_mod = @import("loop_store.zig");
 const stream = @import("loop_stream.zig");
+const loop_summary = @import("loop_summary.zig");
 
 pub const ExitCode = enum { ok, failure };
 
@@ -153,7 +154,11 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
     const allocator = services.allocator;
     var signal_guard = SignalGuard.install();
     defer signal_guard.deinit();
+    var initial_state = try services.store.loadState(id);
+    defer initial_state.deinit();
+    const elapsed_base_seconds = (nowMilliseconds(services) -| initial_state.value.started_at_ms) / 1000;
     var presenter = stream.Presenter.init(allocator, services.stdout, run_options.output_mode, id, run_options.backend);
+    presenter.configureStatus(services.io, run_options.model, run_options.max_turns, elapsed_base_seconds);
     defer presenter.deinit();
     try presenter.loopStarted();
 
@@ -171,16 +176,16 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
                     return finishBudgetLimited(services, &presenter, &limited, .unverified_completion);
                 }
                 const outcome = current.completion_summary orelse "Loop completed and verification passed.";
-                try presenter.loopFinished(current.status, current.turns_completed, current.tokens_used, outcome);
+                try finishLoop(services, &presenter, current.status, current.turns_completed, current.tokens_used, outcome);
                 return .ok;
             },
             .blocked => {
                 const outcome = current.last_blocker_summary orelse "Loop reached the blocker limit.";
-                try presenter.loopFinished(current.status, current.turns_completed, current.tokens_used, outcome);
+                try finishLoop(services, &presenter, current.status, current.turns_completed, current.tokens_used, outcome);
                 return .failure;
             },
             .paused, .budget_limited => {
-                try presenter.loopFinished(current.status, current.turns_completed, current.tokens_used, "Loop is not active.");
+                try finishLoop(services, &presenter, current.status, current.turns_completed, current.tokens_used, "Loop is not active.");
                 return .failure;
             },
             .active, .verifying => {},
@@ -310,7 +315,9 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
         const verifier_exited_without_verdict = role == .verifier and after_turn.status == .verifying and result.exit_code != 0 and !result.was_interrupted;
         const interrupted = retry_result.interrupted or result.was_interrupted;
         if ((result.exit_code != 0 or interrupted or retry_result.exhausted) and !verifier_exited_without_verdict) {
-            const summary = if (after_turn.status == .blocked)
+            const summary = if (interrupted)
+                "Loop paused by SIGINT or SIGTERM."
+            else if (after_turn.status == .blocked)
                 after_turn.last_blocker_summary orelse "Loop reached the blocker limit."
             else if (result.stderr_tail.len > 0)
                 result.stderr_tail
@@ -334,7 +341,7 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
             if (is_budget_wrapup and role == .worker and after_turn.status != .blocked) {
                 return finishBudgetLimited(services, &presenter, &after_turn, .wrapup_failed);
             }
-            try presenter.loopFinished(after_turn.status, after_turn.turns_completed, after_turn.tokens_used, summary);
+            try finishLoop(services, &presenter, after_turn.status, after_turn.turns_completed, after_turn.tokens_used, summary);
             return .failure;
         }
 
@@ -411,14 +418,19 @@ fn runWithRetries(services: Services, request: backend.TurnRequest) !RetryRun {
                 return err;
             };
         } else {
-            const duration: std.Io.Clock.Duration = .{
-                .raw = .{ .nanoseconds = @as(i96, @intCast(delay_ms)) * std.time.ns_per_ms },
-                .clock = .awake,
-            };
-            duration.sleep(services.io) catch |err| {
-                if (signalWasCaught()) return .{ .interrupted = true };
-                return err;
-            };
+            var remaining_ms = delay_ms;
+            while (remaining_ms > 0 and !signalWasCaught()) {
+                const slice_ms = @min(remaining_ms, 100);
+                const duration: std.Io.Clock.Duration = .{
+                    .raw = .{ .nanoseconds = @as(i96, @intCast(slice_ms)) * std.time.ns_per_ms },
+                    .clock = .awake,
+                };
+                duration.sleep(services.io) catch |err| {
+                    if (signalWasCaught()) return .{ .interrupted = true };
+                    return err;
+                };
+                remaining_ms -= slice_ms;
+            }
         }
         if (signalWasCaught()) return .{ .interrupted = true };
     }
@@ -429,7 +441,7 @@ fn pauseLoop(services: Services, presenter: *stream.Presenter, id: []const u8, r
     defer parsed.deinit();
     var state = parsed.value;
     if (state.status == .complete) {
-        try presenter.loopFinished(state.status, state.turns_completed, state.tokens_used, state.completion_summary orelse "Loop completed.");
+        try finishLoop(services, presenter, state.status, state.turns_completed, state.tokens_used, state.completion_summary orelse "Loop completed.");
         return .ok;
     }
     const previous = state.status;
@@ -453,8 +465,20 @@ fn pauseLoop(services: Services, presenter: *stream.Presenter, id: []const u8, r
         try outcome.writer.print(". Attach: {s}", .{native});
     }
     try services.stdout.flush();
-    try presenter.loopFinished(.paused, state.turns_completed, state.tokens_used, outcome.written());
+    try finishLoop(services, presenter, .paused, state.turns_completed, state.tokens_used, outcome.written());
     return .failure;
+}
+
+fn finishLoop(services: Services, presenter: *stream.Presenter, status: store_mod.LoopStatus, turns: u32, tokens: u64, outcome: []const u8) !void {
+    var state = try services.store.loadState(presenter.loop_id);
+    defer state.deinit();
+    const history = services.store.readRecentTurnLog(presenter.loop_id, 100) catch try services.allocator.dupe(u8, "");
+    defer services.allocator.free(history);
+    const summary = try loop_summary.render(services.allocator, state.value, history);
+    defer services.allocator.free(summary);
+    presenter.final_summary = summary;
+    defer presenter.final_summary = null;
+    try presenter.loopFinished(status, turns, tokens, outcome);
 }
 
 fn nowMilliseconds(services: Services) u64 {
@@ -518,7 +542,7 @@ fn finishBudgetLimited(
         state.id,
     });
     defer services.allocator.free(summary);
-    try presenter.loopFinished(state.status, state.turns_completed, state.tokens_used, summary);
+    try finishLoop(services, presenter, state.status, state.turns_completed, state.tokens_used, summary);
     return .failure;
 }
 
@@ -582,6 +606,7 @@ test "worker continuation, independent verifier rejection, repair, and pass" {
     });
     try std.testing.expectEqual(ExitCode.ok, exit_code);
     try std.testing.expectEqual(@as(usize, 5), fake.calls.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\nSummary\nfake progress\n") != null);
     for (fake.calls.items) |call| try std.testing.expect(std.mem.indexOf(u8, call.prompt, "soft wrap-up turn") == null);
     try expectFakeCall(&fake.calls.items[0], .codex, false, "Implement the feature");
     try expectFakeCall(&fake.calls.items[1], .codex, true, "Implement the feature");
@@ -985,6 +1010,7 @@ test "interrupted turn pauses and prints both resume commands" {
     }, .{ .backend = .droid, .verify_enabled = false, .prompt = "Handle an interrupt." });
     try std.testing.expectEqual(ExitCode.failure, exit_code);
     try std.testing.expectEqual(@as(usize, 0), sleeper.delays.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Loop paused by SIGINT or SIGTERM.") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "matcha loop resume") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "droid -r worker-session") != null);
     const id = try store.resolveLatestLoopId();

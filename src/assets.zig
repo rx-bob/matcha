@@ -233,8 +233,10 @@ test "theme assets are non-empty and in CLI order" {
 }
 
 test "format documents are available without file IO" {
-    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "Plan input format") != null);
-    try std.testing.expect(std.mem.indexOf(u8, llm_uml_output_format.contents, "Map input format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "schemaVersion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "Output exactly one JSON object") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_uml_output_format.contents, "diagramKind") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_uml_output_format.contents, "Output exactly one JSON object") != null);
 }
 
 test "embedded serve assets are non-empty and lookup-able" {
@@ -279,10 +281,10 @@ test "embedded loop prompts are non-empty, registered, and contain required guar
 }
 
 test "theme css can be streamed in manifest order" {
-    var buffer: [4096]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
 
-    try writeThemeCss(&writer);
-    try std.testing.expect(writer.end > 0);
-    try std.testing.expectEqual(themeCssByteLength(), writer.end);
+    try writeThemeCss(&output.writer);
+    try std.testing.expect(output.written().len > 0);
+    try std.testing.expectEqual(themeCssByteLength(), output.written().len);
 }

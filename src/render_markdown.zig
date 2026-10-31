@@ -1123,7 +1123,7 @@ test "renders epics and stories with core fields" {
     for ([_][]const u8{
         "## Epics",
         "### area-1: Core Area",
-        "Epic summary.",
+        "Core area summary.",
         "- **Status:** in-progress",
         "- **Tags:** cli",
         "- **Test Focus:** Argument parsing",

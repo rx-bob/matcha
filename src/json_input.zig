@@ -34,12 +34,12 @@ pub fn readJsonDocument(
         error.OutOfMemory => return DocumentParseError.OutOfMemory,
         else => return DocumentParseError.CannotReadInput,
     };
+    errdefer allocator.free(raw_input);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
 
     const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), raw_input, .{}) catch |err| {
-        allocator.free(raw_input);
         return switch (err) {
             error.OutOfMemory => DocumentParseError.OutOfMemory,
             else => DocumentParseError.InvalidJson,
