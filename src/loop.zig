@@ -119,7 +119,7 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
     preflightRoles(services, state) catch return .failure;
     try services.store.createLoop(state);
 
-    return runExisting(services, run_options, id);
+    return runExisting(services, run_options, id, false);
 }
 
 pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !ExitCode {
@@ -166,7 +166,7 @@ pub fn resumeLoopWithPolicy(services: Services, id: []const u8, objective: ?[]co
     state.updated_at_ms = nowMilliseconds(services);
     try services.store.saveState(state);
     const run_options = runOptionsFromState(state);
-    return runExisting(services, run_options, id);
+    return runExisting(services, run_options, id, true);
 }
 
 fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
@@ -262,21 +262,33 @@ test "resume options come only from captured snapshot, including legacy shared v
     try std.testing.expectEqualStrings("--legacy", options_from_state.extra_backend_args[0]);
 }
 
-fn runExisting(services: Services, run_options: options.RunOptions, id: []const u8) !ExitCode {
+fn runExisting(services: Services, run_options: options.RunOptions, id: []const u8, is_resume: bool) !ExitCode {
     const allocator = services.allocator;
     var log_pair: ?loop_log.Pair = if (run_options.log_dir) |directory| try loop_log.open(allocator, services.io, directory, id) else null;
-    defer if (log_pair) |*pair| pair.deinit(services.io);
+    errdefer if (log_pair) |*pair| pair.deinit(services.io);
     if (log_pair) |*pair| {
         var snapshot = try services.store.loadState(id);
         defer snapshot.deinit();
         snapshot.value.last_invocation_id = pair.invocation_id;
         try services.store.saveState(snapshot.value);
-        try pair.record(services.io, id, "start", "invocation started");
+        try pair.record(services.io, id, if (is_resume) "resume" else "start", "invocation started");
         if (services.stderr) |stderr| {
             try stderr.print("Loop logs: {s}/{s}.log and {s}/{s}.jsonl\n", .{ run_options.log_dir.?, pair.invocation_id, run_options.log_dir.?, pair.invocation_id });
             try stderr.flush();
         }
     }
+    const exit_code = try runExistingBody(services, run_options, id, &log_pair);
+    if (log_pair) |*pair| {
+        var final_state = try services.store.loadState(id);
+        defer final_state.deinit();
+        try pair.record(services.io, id, "final", @tagName(final_state.value.status));
+        pair.deinit(services.io);
+    }
+    return exit_code;
+}
+
+fn runExistingBody(services: Services, run_options: options.RunOptions, id: []const u8, log_pair: *?loop_log.Pair) !ExitCode {
+    const allocator = services.allocator;
     var signal_guard = SignalGuard.install();
     defer signal_guard.deinit();
     var initial_state = try services.store.loadState(id);
@@ -372,6 +384,8 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
         const started_ms = nowMilliseconds(services);
         try presenter.configureExecution(role, execution.backend, execution.model);
         try presenter.turnStarted(turn_number, role, current.tokens_used);
+        const log_context: loop_log.Pair.Context = .{ .turn = turn_number, .role = @tagName(role), .backend = @tagName(turn_backend) };
+        if (log_pair.*) |*pair| try pair.recordContext(services.io, id, log_context, "turn_start", "backend turn started");
         var persist_context = PersistSessionContext{ .store = services.store, .loop_id = id };
         var request = backend.TurnRequest{
             .allocator = allocator,
@@ -388,13 +402,13 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
             .child_context = null,
             .on_child_id = childIdChanged,
             .diagnostics = services.stderr,
-            .log_pair = if (log_pair) |*pair| pair else null,
+            .log_pair = if (log_pair.*) |*pair| pair else null,
         };
         if (role == .worker) {
             request.session_context = &persist_context;
             request.on_session_id = PersistSessionContext.persist;
         }
-        const retry_result = runWithRetries(services, request) catch |err| {
+        const retry_result = runWithRetries(services, request, if (log_pair.*) |*pair| pair else null, log_context) catch |err| {
             if (signalWasCaught()) return pauseLoop(services, &presenter, id, "Loop paused by SIGINT or SIGTERM.");
             if (is_budget_wrapup) {
                 var limited = current;
@@ -419,6 +433,13 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
         const blocked_strikes_before = current.blocked_strikes;
         after_turn.turns_completed +|= 1;
         after_turn.tokens_used +|= result.tokens_used;
+        if (log_pair.*) |*pair| {
+            if (result.session_id) |session| try pair.recordContext(services.io, id, log_context, "session", session);
+            const totals = try std.fmt.allocPrint(allocator, "turn={d} total={d}", .{ result.tokens_used, after_turn.tokens_used });
+            defer allocator.free(totals);
+            try pair.recordContext(services.io, id, log_context, "tokens", totals);
+            try pair.recordContext(services.io, id, log_context, "turn_end", @tagName(after_turn.status));
+        }
         after_turn.updated_at_ms = nowMilliseconds(services);
         if (role == .worker) after_turn.objective_update_pending = false;
 
@@ -458,7 +479,10 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
                 .summary = summary,
             });
             try services.store.saveState(after_turn);
-            if (after_turn.status != previous_status) try presenter.statusChanged(previous_status, after_turn.status);
+            if (after_turn.status != previous_status) {
+                if (log_pair.*) |*pair| try pair.recordContext(services.io, id, log_context, "status", @tagName(after_turn.status));
+                try presenter.statusChanged(previous_status, after_turn.status);
+            }
             try presenter.turnCompleted(after_turn.status, result.tokens_used, elapsed_ms);
             if (interrupted or retry_result.exhausted) return pauseLoop(services, &presenter, id, summary);
             if (is_budget_wrapup and role == .worker and after_turn.status != .blocked) {
@@ -483,7 +507,10 @@ fn runExisting(services: Services, run_options: options.RunOptions, id: []const 
             .summary = result.last_assistant_text orelse "",
         });
         try services.store.saveState(after_turn);
-        if (after_turn.status != previous_status) try presenter.statusChanged(previous_status, after_turn.status);
+        if (after_turn.status != previous_status) {
+            if (log_pair.*) |*pair| try pair.recordContext(services.io, id, log_context, "status", @tagName(after_turn.status));
+            try presenter.statusChanged(previous_status, after_turn.status);
+        }
         try presenter.turnCompleted(after_turn.status, result.tokens_used, elapsed_ms);
         if (is_budget_wrapup and after_turn.status == .budget_limited) {
             const reason: BudgetFinish = if (wrapup_claimed_unverified_completion) .unverified_completion else .wrapup_recorded;
@@ -522,17 +549,30 @@ const RetryRun = struct {
     interrupted: bool = false,
 };
 
-fn runWithRetries(services: Services, request: backend.TurnRequest) !RetryRun {
+fn runWithRetries(services: Services, request: backend.TurnRequest, log_pair: ?*loop_log.Pair, log_context: loop_log.Pair.Context) !RetryRun {
     const delays_ms = [_]u64{ 5000, 15000, 45000 };
     var retry_index: usize = 0;
     while (true) {
         if (signalWasCaught()) return .{ .interrupted = true };
+        if (log_pair) |pair| {
+            var attempt_context = log_context;
+            attempt_context.attempt = @intCast(retry_index + 1);
+            try pair.recordContext(services.io, request.loop_id, attempt_context, "attempt_start", "backend attempt started");
+        }
         var result = try services.runner.runTurn(request);
+        var result_owned = true;
+        errdefer if (result_owned) result.deinit();
+        if (log_pair) |pair| {
+            var attempt_context = log_context;
+            attempt_context.attempt = @intCast(retry_index + 1);
+            try pair.recordContext(services.io, request.loop_id, attempt_context, "attempt_end", if (result.exit_code == 0) "success" else "failure");
+        }
         if (result.exit_code == 0 and !result.was_interrupted) return .{ .result = result };
         if (result.was_interrupted or signalWasCaught()) return .{ .result = result, .interrupted = true };
         if (retry_index == delays_ms.len) return .{ .result = result, .exhausted = true };
 
         result.deinit();
+        result_owned = false;
         const delay_ms = delays_ms[retry_index];
         retry_index += 1;
         if (services.sleeper) |sleeper| {

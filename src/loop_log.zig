@@ -8,6 +8,13 @@ pub const Pair = struct {
     sequence: u64 = 0,
     mutex: std.atomic.Value(bool) = .init(false),
 
+    pub const Context = struct {
+        turn: ?u32 = null,
+        role: ?[]const u8 = null,
+        backend: ?[]const u8 = null,
+        attempt: ?u32 = null,
+    };
+
     pub fn deinit(self: *Pair, io: std.Io) void {
         self.readable.close(io);
         self.events.close(io);
@@ -15,13 +22,17 @@ pub const Pair = struct {
     }
 
     pub fn record(self: *Pair, io: std.Io, loop_id: []const u8, kind: []const u8, payload: []const u8) !void {
+        return self.recordContext(io, loop_id, .{}, kind, payload);
+    }
+
+    pub fn recordContext(self: *Pair, io: std.Io, loop_id: []const u8, context: Context, kind: []const u8, payload: []const u8) !void {
         self.lock();
         defer self.unlock();
         self.sequence += 1;
         const stamp = std.Io.Clock.real.now(io).toMilliseconds();
         var event_buffer: [1024]u8 = undefined;
         var event_writer = self.events.writer(io, &event_buffer);
-        try event_writer.interface.print("{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":\"{f}\",\"invocation_id\":\"{s}\",\"kind\":\"{s}\",\"payload\":\"{f}\"}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), self.invocation_id, kind, std.json.fmt(payload, .{}) });
+        try event_writer.interface.print("{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":{f},\"invocation_id\":{f},\"turn\":{f},\"role\":{f},\"backend\":{f},\"attempt\":{f},\"kind\":{f},\"payload\":{f}}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), std.json.fmt(self.invocation_id, .{}), std.json.fmt(context.turn, .{}), std.json.fmt(context.role, .{}), std.json.fmt(context.backend, .{}), std.json.fmt(context.attempt, .{}), std.json.fmt(kind, .{}), std.json.fmt(payload, .{}) });
         try event_writer.interface.flush();
         var readable_buffer: [512]u8 = undefined;
         var readable_writer = self.readable.writer(io, &readable_buffer);
@@ -41,7 +52,7 @@ pub const Pair = struct {
             const stamp = std.Io.Clock.real.now(io).toMilliseconds();
             var out_buffer: [5120]u8 = undefined;
             var writer = self.events.writer(io, &out_buffer);
-            try writer.interface.print("{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":\"{f}\",\"invocation_id\":\"{s}\",\"kind\":\"raw\",\"stream\":\"{s}\",\"encoding\":\"base64\",\"payload\":\"{s}\"}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), self.invocation_id, stream_name, text });
+            try writer.interface.print("{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":{f},\"invocation_id\":{f},\"kind\":\"raw\",\"stream\":{f},\"encoding\":\"base64\",\"payload\":\"{s}\"}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), std.json.fmt(self.invocation_id, .{}), std.json.fmt(stream_name, .{}), text });
             try writer.interface.flush();
             offset += chunk.len;
         }
@@ -76,6 +87,7 @@ pub fn open(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, loo
         const events = std.Io.Dir.cwd().createFile(io, jsonl_path, .{ .exclusive = true }) catch |err| {
             readable.close(io);
             std.Io.Dir.cwd().deleteFile(io, log_path) catch {};
+            if (err == error.PathAlreadyExists) continue;
             return err;
         };
         return .{ .allocator = allocator, .readable = readable, .events = events, .invocation_id = invocation };
@@ -92,4 +104,17 @@ test "logger creates fresh paired files and sequenced JSONL lifecycle" {
     defer pair.deinit(std.testing.io);
     try pair.record(std.testing.io, "loop-1", "start", "initial");
     try std.testing.expectEqual(@as(u64, 1), pair.sequence);
+    const first_id = try std.testing.allocator.dupe(u8, pair.invocation_id);
+    defer std.testing.allocator.free(first_id);
+    const jsonl_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}.jsonl", .{ dir, first_id });
+    defer std.testing.allocator.free(jsonl_path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, jsonl_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, bytes, "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("loop-1", parsed.value.object.get("loop_id").?.string);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("sequence").?.integer);
+    var second = try open(std.testing.allocator, std.testing.io, dir, "loop-1");
+    defer second.deinit(std.testing.io);
+    try std.testing.expect(!std.mem.eql(u8, first_id, second.invocation_id));
 }
