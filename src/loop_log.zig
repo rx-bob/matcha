@@ -124,6 +124,24 @@ pub fn open(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, loo
     return openWithFault(allocator, io, directory, loop_id, null);
 }
 
+pub fn validateDestination(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, directory);
+    const stamp = std.Io.Clock.real.now(io).toMilliseconds();
+    var suffix: u32 = 0;
+    while (suffix < 100) : (suffix += 1) {
+        const path = try std.fmt.allocPrint(allocator, "{s}/.matcha-write-probe-{d}-{d}", .{ directory, stamp, suffix });
+        defer allocator.free(path);
+        const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        file.close(io);
+        try std.Io.Dir.cwd().deleteFile(io, path);
+        return;
+    }
+    return error.LogProbeCollision;
+}
+
 pub fn openWithFault(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, loop_id: []const u8, fault: ?Pair.Fault) !Pair {
     return openWithReport(allocator, io, directory, loop_id, fault, null);
 }

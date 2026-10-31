@@ -1,5 +1,6 @@
 const std = @import("std");
 const backend = @import("loop_backend.zig");
+const loop_config = @import("loop_config.zig");
 const options = @import("loop_options.zig");
 const loop_log = @import("loop_log.zig");
 const prompts = @import("loop_prompts.zig");
@@ -103,6 +104,9 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
         .separate_verifier_settings = true,
         .verify_enabled = run_options.verify_enabled,
         .model = run_options.model,
+        .reasoning_effort = run_options.reasoning_effort,
+        .env = run_options.env,
+        .path_prepend = run_options.path_prepend,
         .output_mode = run_options.output_mode,
         .log_dir = run_options.log_dir,
         .yolo = run_options.yolo,
@@ -124,30 +128,63 @@ pub fn run(services: Services, run_options: options.RunOptions) !ExitCode {
 }
 
 pub fn resumeLoop(services: Services, id: []const u8, objective: ?[]const u8) !ExitCode {
-    return resumeLoopWithPolicy(services, id, objective, null, false);
+    return resumeLoopWithOptions(services, id, .{ .objective = objective });
 }
 
 pub fn resumeLoopWithPolicy(services: Services, id: []const u8, objective: ?[]const u8, sandbox: ?options.SandboxPolicy, yolo: bool) !ExitCode {
+    return resumeLoopWithOptions(services, id, .{ .objective = objective, .sandbox = sandbox, .yolo = yolo });
+}
+
+pub fn resumeLoopWithOptions(services: Services, id: []const u8, patch: options.ResumeOptions) !ExitCode {
     const allocator = services.allocator;
     var loaded = try services.store.loadState(id);
     defer loaded.deinit();
     var state = loaded.value;
     if (state.status == .complete or state.status == .blocked) return error.LoopCannotResume;
-    if (sandbox != null and yolo) {
+    if (patch.sandbox != null and patch.yolo) {
         if (services.stderr) |writer| try writer.writeAll("Sandbox and yolo cannot be selected together.\n");
         return .failure;
     }
-    if (sandbox != null or yolo) state.policy_validation_enabled = true;
-    if (sandbox) |policy| {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(services.io, a);
+    if (!state.verify_enabled and (patch.verifier_bin_explicit or patch.verifier_model_explicit or patch.verifier_reasoning_explicit)) return invalidResume(services, "verifier override", error.VerificationDisabled);
+    for ([_]?[]const u8{ patch.model, patch.verifier_model }) |maybe_model| {
+        if (maybe_model) |model| {
+            if (std.mem.indexOfScalar(u8, model, 0) != null) return invalidResume(services, "model", error.InvalidModel);
+        }
+    }
+    if (patch.backend_bin) |value| state.backend_bin = loop_config.resolveExecutablePath(a, services.io, cwd, value) catch |err| return invalidResume(services, "--backend-bin", err);
+    if (patch.verifier_bin_explicit) {
+        state.verifier_options.backend_bin = if (patch.verifier_bin) |value| loop_config.resolveExecutablePath(a, services.io, cwd, value) catch |err| return invalidResume(services, "--verifier-bin", err) else null;
+        state.verifier_options.backend_bin_explicit = true;
+    }
+    if (patch.model_explicit) state.model = patch.model;
+    if (patch.verifier_model_explicit) {
+        state.verifier_options.model = patch.verifier_model;
+        state.verifier_options.model_explicit = true;
+    }
+    if (patch.reasoning_explicit) state.reasoning_effort = patch.reasoning_effort;
+    if (patch.verifier_reasoning_explicit) {
+        state.verifier_options.reasoning_effort = patch.verifier_reasoning_effort;
+        state.verifier_options.reasoning_explicit = true;
+    }
+    for (patch.env_files) |file| {
+        const resolved = try std.fs.path.resolve(a, &.{ cwd, file });
+        loop_config.applyEnvFile(a, services.io, &state.env, resolved, services.stderr orelse services.stdout) catch return .failure;
+    }
+    for (patch.env) |entry| loop_config.mergeEnv(a, &state.env, entry) catch |err| return invalidResume(services, "--env", err);
+    if (patch.path_prepend_explicit) state.path_prepend = loop_config.resolvePaths(a, services.io, cwd, patch.path_prepend) catch |err| return invalidResume(services, "--path-prepend", err);
+    if (patch.log_dir) |value| state.log_dir = std.fs.path.resolve(a, &.{ cwd, value }) catch |err| return invalidResume(services, "--log-dir", err);
+    if (patch.sandbox != null or patch.yolo) state.policy_validation_enabled = true;
+    if (patch.sandbox) |policy| {
         state.sandbox = policy;
         state.yolo = false;
-    } else if (yolo) {
+    } else if (patch.yolo) {
         state.sandbox = null;
         state.yolo = true;
     }
-
-    const cwd = try std.process.currentPathAlloc(services.io, allocator);
-    defer allocator.free(cwd);
     if (!std.mem.eql(u8, cwd, state.cwd)) {
         if (services.stderr) |stderr| {
             try stderr.print("Warning: resuming loop {s} from {s}; backend will restore saved working directory {s}.\n", .{ id, cwd, state.cwd });
@@ -155,12 +192,13 @@ pub fn resumeLoopWithPolicy(services: Services, id: []const u8, objective: ?[]co
         }
     }
     preflightRoles(services, state) catch return .failure;
+    if (state.log_dir) |directory| loop_log.validateDestination(a, services.io, directory) catch |err| return invalidResume(services, "--log-dir", err);
     state.status = .active;
     state.last_audit_failure = null;
     // Upgrade only on resume, when state is already being changed and saved.
     // Listing and inspection leave legacy files byte-for-byte untouched.
     if (state.schema_version < 2) state.schema_version = 2;
-    if (objective) |new_objective| {
+    if (patch.objective) |new_objective| {
         state.objective = new_objective;
         state.blocked_strikes = 0;
         state.objective_update_pending = true;
@@ -169,6 +207,14 @@ pub fn resumeLoopWithPolicy(services: Services, id: []const u8, objective: ?[]co
     try services.store.saveState(state);
     const run_options = runOptionsFromState(state);
     return runExisting(services, run_options, id, true);
+}
+
+fn invalidResume(services: Services, flag: []const u8, err: anyerror) !ExitCode {
+    if (services.stderr) |writer| {
+        try writer.print("Invalid resume setting {s}: {s}\n", .{ flag, @errorName(err) });
+        try writer.flush();
+    }
+    return .failure;
 }
 
 fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
@@ -180,6 +226,9 @@ fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
         .verifier_options = state.verifier_options,
         .verify_enabled = state.verify_enabled,
         .model = state.model,
+        .reasoning_effort = state.reasoning_effort,
+        .env = state.env,
+        .path_prepend = state.path_prepend,
         .yolo = state.yolo,
         .sandbox = state.sandbox,
         .max_turns = state.max_turns,
@@ -196,13 +245,14 @@ fn runOptionsFromState(state: store_mod.LoopState) options.RunOptions {
 pub fn roleSettings(state: store_mod.LoopState, role: store_mod.TurnRole) backend.BackendOptions {
     const selected = if (role == .verifier) state.verifier_backend orelse state.backend else state.backend;
     const same_backend = selected == state.backend;
-    const worker: backend.BackendOptions = .{ .backend = selected, .backend_bin = if (same_backend) state.backend_bin else null, .model = state.model, .yolo = state.yolo, .sandbox = state.sandbox, .legacy_policy_passthrough = !state.policy_validation_enabled, .extra_args = state.extra_args };
+    const worker: backend.BackendOptions = .{ .backend = selected, .backend_bin = if (same_backend) state.backend_bin else null, .model = state.model, .reasoning_effort = state.reasoning_effort, .yolo = state.yolo, .sandbox = state.sandbox, .legacy_policy_passthrough = !state.policy_validation_enabled, .extra_args = state.extra_args };
     if (role == .worker) return worker;
     const verifier = state.verifier_options;
     return .{
         .backend = selected,
         .backend_bin = if (verifier.backend_bin_explicit) verifier.backend_bin else if (same_backend) state.backend_bin else null,
         .model = if (verifier.model_explicit) verifier.model else if (same_backend or !state.separate_verifier_settings) state.model else null,
+        .reasoning_effort = if (verifier.reasoning_explicit) verifier.reasoning_effort else if (same_backend) state.reasoning_effort else null,
         .yolo = state.yolo,
         .sandbox = state.sandbox,
         .legacy_policy_passthrough = !state.policy_validation_enabled,
@@ -219,7 +269,7 @@ fn preflightRoles(services: Services, state: store_mod.LoopState) !void {
             return err;
         };
     }
-    var environment = try backend.buildChildEnvironment(services.allocator, services.io, services.parent_environment, state.id);
+    var environment = try backend.buildChildEnvironmentConfigured(services.allocator, services.io, services.parent_environment, state.id, state.env, state.path_prepend);
     defer environment.deinit();
     for ([_]store_mod.TurnRole{ .worker, .verifier }) |role| {
         if (role == .verifier and !state.verify_enabled) continue;
@@ -262,6 +312,182 @@ test "resume options come only from captured snapshot, including legacy shared v
     try std.testing.expectEqual(@as(u64, 900), options_from_state.token_budget.?);
     try std.testing.expectEqual(@as(u64, 60), options_from_state.timeout_seconds.?);
     try std.testing.expectEqualStrings("--legacy", options_from_state.extra_backend_args[0]);
+}
+
+test "resume overrides persist across invocations and follow same-backend inheritance" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const store_dir = try std.fmt.allocPrint(a, "{s}/loops", .{root});
+    defer a.free(store_dir);
+    const log_dir = try std.fmt.allocPrint(a, "{s}/new-logs", .{root});
+    defer a.free(log_dir);
+    const old_log_dir = try std.fmt.allocPrint(a, "{s}/old-logs", .{root});
+    defer a.free(old_log_dir);
+    const env_file = try std.fmt.allocPrint(a, "{s}/new.env", .{root});
+    defer a.free(env_file);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "new.env", .data = "NEW_VAR=from-file\nJAVA_HOME=from-file\n" });
+    var store = try store_mod.Store.init(a, std.testing.io, store_dir);
+    defer store.deinit();
+    const id = "resume-overrides";
+    var prior_pair = try loop_log.open(a, std.testing.io, old_log_dir, id);
+    try prior_pair.record(std.testing.io, id, "prior", "keep this invocation");
+    try prior_pair.sync(std.testing.io, .final_sync);
+    const prior_invocation = try a.dupe(u8, prior_pair.invocation_id);
+    defer a.free(prior_invocation);
+    prior_pair.deinit(std.testing.io);
+    const old_event_path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ old_log_dir, prior_invocation });
+    defer a.free(old_event_path);
+    const old_events = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, old_event_path, a, .unlimited);
+    defer a.free(old_events);
+    try store.createLoop(.{ .id = id, .status = .paused, .backend = .codex, .verifier_backend = .codex, .separate_verifier_settings = true, .backend_bin = "/bin/sh", .model = "old-model", .log_dir = old_log_dir, .last_invocation_id = prior_invocation, .cwd = "/saved/child", .objective = "old objective", .worker_session_id = "saved-session", .blocked_strikes = 2, .last_blocker_summary = "old blocker", .started_at_ms = 1, .updated_at_ms = 1, .env = &.{.{ .key = "JAVA_HOME", .value = "captured" }} });
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    try environment.put("PATH", "/bin:/usr/bin");
+    try environment.put("UNRELATED", "first");
+    try environment.put("JAVA_HOME", "ambient");
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var diagnostic = std.Io.Writer.Allocating.init(a);
+    defer diagnostic.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_interrupted, .worker_interrupted } };
+    defer fake.deinit(a);
+    const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &environment, .runner = fake.runner(), .stdout = &output.writer, .stderr = &diagnostic.writer };
+    try std.testing.expectEqual(ExitCode.failure, try resumeLoopWithOptions(services, id, .{ .objective = "new objective", .backend_bin = "/bin/cat", .model = "new-model", .model_explicit = true, .reasoning_effort = "high", .reasoning_explicit = true, .env_files = &.{env_file}, .env = &.{.{ .key = "JAVA_HOME", .value = "/new-jdk" }}, .path_prepend = &.{"./new-bin"}, .path_prepend_explicit = true, .log_dir = log_dir }));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+    try std.testing.expectEqualStrings("/new-jdk", fake.calls.items[0].java_home.?);
+    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[0].prompt, "new objective") != null);
+    try std.testing.expectEqualStrings("first", fake.calls.items[0].unrelated.?);
+    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[0].child_path.?, "new-bin") != null);
+    var first = try store.loadState(id);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("new objective", first.value.objective);
+    try std.testing.expectEqual(@as(u8, 0), first.value.blocked_strikes);
+    try std.testing.expectEqualStrings("saved-session", first.value.worker_session_id.?);
+    try std.testing.expectEqualStrings("/saved/child", first.value.cwd);
+    try std.testing.expectEqualStrings("/bin/cat", first.value.backend_bin.?);
+    try std.testing.expectEqualStrings("new-model", roleSettings(first.value, .verifier).model.?);
+    try std.testing.expectEqualStrings("high", roleSettings(first.value, .verifier).reasoning_effort.?);
+    try std.testing.expectEqualStrings("/bin/cat", roleSettings(first.value, .verifier).backend_bin.?);
+    const invocation_cwd = try std.process.currentPathAlloc(std.testing.io, a);
+    defer a.free(invocation_cwd);
+    const absolute_log_dir = try std.fs.path.resolve(a, &.{ invocation_cwd, log_dir });
+    defer a.free(absolute_log_dir);
+    try std.testing.expectEqualStrings(absolute_log_dir, first.value.log_dir.?);
+    const old_events_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, old_event_path, a, .unlimited);
+    defer a.free(old_events_after);
+    try std.testing.expectEqualStrings(old_events, old_events_after);
+    try std.testing.expect(!std.mem.eql(u8, prior_invocation, first.value.last_invocation_id.?));
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, env_file);
+    try environment.put("UNRELATED", "second");
+    try environment.put("JAVA_HOME", "new-ambient");
+    try environment.put("PATH", "/new-ambient-bin:/bin");
+    try std.testing.expectEqual(ExitCode.failure, try resumeLoopWithOptions(services, id, .{ .verifier_reasoning_effort = "medium", .verifier_reasoning_explicit = true }));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+    try std.testing.expectEqualStrings("/new-jdk", fake.calls.items[1].java_home.?);
+    try std.testing.expectEqualStrings("second", fake.calls.items[1].unrelated.?);
+    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[1].child_path.?, "/new-ambient-bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[1].child_path.?, "new-bin") != null);
+    var second = try store.loadState(id);
+    defer second.deinit();
+    try std.testing.expectEqualStrings("medium", roleSettings(second.value, .verifier).reasoning_effort.?);
+    try std.testing.expectEqualStrings("high", roleSettings(second.value, .worker).reasoning_effort.?);
+    try std.testing.expectEqual(options.BackendKind.codex, second.value.backend);
+    try std.testing.expectEqual(options.BackendKind.codex, second.value.verifier_backend.?);
+}
+
+test "invalid resume candidate leaves durable snapshot and objective untouched" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const store_dir = try std.fmt.allocPrint(a, "{s}/loops", .{root});
+    defer a.free(store_dir);
+    const bad_env = try std.fmt.allocPrint(a, "{s}/bad.env", .{root});
+    defer a.free(bad_env);
+    const file_destination = try std.fmt.allocPrint(a, "{s}/regular-file", .{root});
+    defer a.free(file_destination);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.env", .data = "BROKEN=\"unterminated\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "regular-file", .data = "keep" });
+    var store = try store_mod.Store.init(a, std.testing.io, store_dir);
+    defer store.deinit();
+    const id = "invalid-resume";
+    const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+    defer a.free(cwd);
+    try store.createLoop(.{ .id = id, .status = .paused, .backend = .codex, .backend_bin = "/bin/sh", .verify_enabled = true, .cwd = cwd, .objective = "original objective", .worker_session_id = "original-session", .turns_completed = 2, .tokens_used = 42, .started_at_ms = 1, .updated_at_ms = 1 });
+    const state_path = try std.fmt.allocPrint(a, "{s}/{s}/state.json", .{ store_dir, id });
+    defer a.free(state_path);
+    const before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, a, .unlimited);
+    defer a.free(before);
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    try environment.put("PATH", "/bin:/usr/bin");
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var diagnostic = std.Io.Writer.Allocating.init(a);
+    defer diagnostic.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{}, .validate_executables = true };
+    defer fake.deinit(a);
+    const services: Services = .{ .allocator = a, .io = std.testing.io, .store = &store, .parent_environment = &environment, .runner = fake.runner(), .stdout = &output.writer, .stderr = &diagnostic.writer };
+    const cases = [_]options.ResumeOptions{
+        .{ .objective = "wrong", .backend_bin = "/definitely/missing/matcha-backend" },
+        .{ .objective = "wrong", .verifier_bin = "/definitely/missing/matcha-verifier", .verifier_bin_explicit = true },
+        .{ .objective = "wrong", .sandbox = .@"read-only" },
+        .{ .objective = "wrong", .reasoning_effort = "unsupported", .reasoning_explicit = true },
+        .{ .objective = "wrong", .env_files = &.{bad_env} },
+        .{ .objective = "wrong", .log_dir = file_destination },
+    };
+    for (cases) |patch| {
+        try std.testing.expectEqual(ExitCode.failure, try resumeLoopWithOptions(services, id, patch));
+        const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, a, .unlimited);
+        defer a.free(after);
+        try std.testing.expectEqualStrings(before, after);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "resume candidate frees owned paths and env entries on allocation failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const store_dir = try std.fmt.allocPrint(a, "{s}/loops", .{root});
+    defer a.free(store_dir);
+    const bad_env = try std.fmt.allocPrint(a, "{s}/bad.env", .{root});
+    defer a.free(bad_env);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.env", .data = "A=one\nB=\"broken\n" });
+    var store = try store_mod.Store.init(a, std.testing.io, store_dir);
+    defer store.deinit();
+    const id = "resume-oom";
+    const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+    defer a.free(cwd);
+    try store.createLoop(.{ .id = id, .status = .paused, .backend = .codex, .backend_bin = "/bin/sh", .verify_enabled = false, .cwd = cwd, .objective = "original", .started_at_ms = 1, .updated_at_ms = 1 });
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var diagnostic = std.Io.Writer.Allocating.init(a);
+    defer diagnostic.deinit();
+    var fake = FakeRunner{ .store = &store, .script = &.{} };
+    defer fake.deinit(a);
+    var saw_complete = false;
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const services: Services = .{ .allocator = failing.allocator(), .io = std.testing.io, .store = &store, .parent_environment = &environment, .runner = fake.runner(), .stdout = &output.writer, .stderr = &diagnostic.writer };
+        const result = resumeLoopWithOptions(services, id, .{ .backend_bin = "/bin/cat", .env = &.{.{ .key = "JAVA_HOME", .value = "jdk" }}, .env_files = &.{bad_env} });
+        if (result) |code| try std.testing.expectEqual(ExitCode.failure, code) else |_| {}
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) {
+            saw_complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_complete);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
 fn runExisting(services: Services, run_options: options.RunOptions, id: []const u8, is_resume: bool) !ExitCode {
@@ -432,7 +658,7 @@ fn runExistingBody(services: Services, run_options: options.RunOptions, id: []co
         defer allocator.free(prompt_file);
         var argv = try backend.buildArgv(allocator, execution, loop_dir, session_id, prompt_file);
         defer argv.deinit();
-        var child_environment = try backend.buildChildEnvironment(allocator, services.io, services.parent_environment, id);
+        var child_environment = try backend.buildChildEnvironmentConfigured(allocator, services.io, services.parent_environment, id, current.env, current.path_prepend);
         defer child_environment.deinit();
 
         const started_ms = nowMilliseconds(services);
@@ -1431,8 +1657,14 @@ const FakeCall = struct {
     is_verifier: bool,
     session_id_absent: bool,
     prompt: []u8,
+    java_home: ?[]u8 = null,
+    unrelated: ?[]u8 = null,
+    child_path: ?[]u8 = null,
 
     fn deinit(self: *FakeCall, allocator: std.mem.Allocator) void {
+        if (self.java_home) |value| allocator.free(value);
+        if (self.unrelated) |value| allocator.free(value);
+        if (self.child_path) |value| allocator.free(value);
         allocator.free(self.prompt);
         allocator.free(self.executable);
         allocator.free(self.argv_json);
@@ -1446,6 +1678,7 @@ const FakeRunner = struct {
     next_step: usize = 0,
     preflight_calls: std.ArrayList(backend.BackendKind) = .empty,
     fail_second_preflight: bool = false,
+    validate_executables: bool = false,
     tokens_per_turn: u64 = 10,
     clock: ?*FakeClock = null,
     advance_clock_ms: u64 = 0,
@@ -1457,6 +1690,10 @@ const FakeRunner = struct {
     fn preflight(context: *anyopaque, request: backend.PreflightRequest) anyerror!void {
         const self: *FakeRunner = @ptrCast(@alignCast(context));
         try self.preflight_calls.append(self.store.allocator, request.config.backend);
+        if (self.validate_executables) {
+            var real: backend.RealBackendRunner = .{};
+            try real.runner().preflight(request);
+        }
         if (self.fail_second_preflight and self.preflight_calls.items.len == 2) return error.FakeVerifierUnavailable;
     }
 
@@ -1487,6 +1724,12 @@ const FakeRunner = struct {
             errdefer self.store.allocator.free(prompt);
             const argv_json = try std.json.Stringify.valueAlloc(self.store.allocator, request.argv, .{});
             errdefer self.store.allocator.free(argv_json);
+            const java_home = if (request.environ_map.get("JAVA_HOME")) |value| try self.store.allocator.dupe(u8, value) else null;
+            errdefer if (java_home) |value| self.store.allocator.free(value);
+            const unrelated = if (request.environ_map.get("UNRELATED")) |value| try self.store.allocator.dupe(u8, value) else null;
+            errdefer if (unrelated) |value| self.store.allocator.free(value);
+            const child_path = if (request.environ_map.get("PATH")) |value| try self.store.allocator.dupe(u8, value) else null;
+            errdefer if (child_path) |value| self.store.allocator.free(value);
             try self.calls.append(self.store.allocator, .{
                 .argv_json = argv_json,
                 .executable = executable,
@@ -1494,6 +1737,9 @@ const FakeRunner = struct {
                 .is_verifier = is_verifier,
                 .session_id_absent = !has_session_flag,
                 .prompt = prompt,
+                .java_home = java_home,
+                .unrelated = unrelated,
+                .child_path = child_path,
             });
         }
 
@@ -1685,26 +1931,31 @@ test "custom executable survives retries continuation and resume with role isola
 }
 
 test "role settings distinguish inherited native and explicit choices with legacy compatibility" {
-    var state: store_mod.LoopState = .{ .id = "role", .backend = .codex, .backend_bin = "/worker", .model = "worker-model", .cwd = "/repo", .objective = "task", .started_at_ms = 1, .updated_at_ms = 1, .yolo = true, .extra_args = &.{"--worker-only"}, .separate_verifier_settings = true };
+    var state: store_mod.LoopState = .{ .id = "role", .backend = .codex, .backend_bin = "/worker", .model = "worker-model", .reasoning_effort = "high", .cwd = "/repo", .objective = "task", .started_at_ms = 1, .updated_at_ms = 1, .yolo = true, .extra_args = &.{"--worker-only"}, .separate_verifier_settings = true };
     const same = roleSettings(state, .verifier);
     try std.testing.expectEqualStrings("worker-model", same.model.?);
     try std.testing.expectEqualStrings("/worker", same.backend_bin.?);
+    try std.testing.expectEqualStrings("high", same.reasoning_effort.?);
     try std.testing.expectEqual(@as(usize, 0), same.extra_args.len);
     state.model = "updated-worker";
     try std.testing.expectEqualStrings("updated-worker", roleSettings(state, .verifier).model.?);
-    state.verifier_options = .{ .model_explicit = true, .backend_bin_explicit = true, .args = &.{ "--verifier-only", "literal arg" }, .args_explicit = true };
+    state.verifier_options = .{ .model_explicit = true, .backend_bin_explicit = true, .reasoning_explicit = true, .args = &.{ "--verifier-only", "literal arg" }, .args_explicit = true };
     const native = roleSettings(state, .verifier);
     try std.testing.expect(native.model == null);
     try std.testing.expect(native.backend_bin == null);
+    try std.testing.expect(native.reasoning_effort == null);
     try std.testing.expectEqualStrings("literal arg", native.extra_args[1]);
     state.verifier_options.model = "verifier-model";
     state.verifier_options.backend_bin = "/verifier";
+    state.verifier_options.reasoning_effort = "medium";
     state.model = "changed-again";
     try std.testing.expectEqualStrings("verifier-model", roleSettings(state, .verifier).model.?);
+    try std.testing.expectEqualStrings("medium", roleSettings(state, .verifier).reasoning_effort.?);
     state.verifier_backend = .agy;
     state.verifier_options = .{};
     const different = roleSettings(state, .verifier);
     try std.testing.expect(different.model == null and different.backend_bin == null);
+    try std.testing.expect(different.reasoning_effort == null);
     try std.testing.expect(different.yolo);
     state.separate_verifier_settings = false;
     const legacy = roleSettings(state, .verifier);

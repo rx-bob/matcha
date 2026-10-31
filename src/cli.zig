@@ -170,6 +170,7 @@ fn runLoopCommandWithInputs(
     };
     defer switch (command) {
         .run => |run_options| loop_options.deinitParsedRun(std.heap.page_allocator, run_options),
+        .@"resume" => |resume_options| loop_options.deinitParsedResume(std.heap.page_allocator, resume_options),
         else => {},
     };
     switch (command) {
@@ -253,7 +254,7 @@ fn runLoopCommandWithInputs(
                 .stdout = stdout,
                 .stderr = stderr,
             };
-            return switch (loop_runtime.resumeLoopWithPolicy(services, resolved_id, resume_options.objective, resume_options.sandbox, resume_options.yolo) catch |err| {
+            return switch (loop_runtime.resumeLoopWithOptions(services, resolved_id, resume_options) catch |err| {
                 if (err == error.LoopCannotResume) {
                     try stderr.print("Cannot resume loop {s} from its current status\n", .{resolved_id});
                     return .failure;
@@ -644,10 +645,12 @@ fn writeLoopShow(store: *const loop_store.Store, id: []const u8, stdout: *std.Io
         state.cwd,
         state.objective,
     });
+    try stdout.print("Reasoning effort: {s}\n", .{state.reasoning_effort orelse "backend default"});
     const verifier_execution = loop_runtime.roleSettings(state, .verifier);
-    try stdout.print("Verifier model: {s}\nVerifier executable: {s}\n", .{
+    try stdout.print("Verifier model: {s}\nVerifier executable: {s}\nVerifier reasoning effort: {s}\n", .{
         verifier_execution.model orelse "backend default",
         verifier_execution.backend_bin orelse @tagName(verifier_execution.backend),
+        verifier_execution.reasoning_effort orelse "backend default",
     });
     const history = store.readRecentTurnLog(id, 5) catch |err| switch (err) {
         error.FileNotFound => "",
@@ -698,7 +701,7 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha loop [options] <prompt> [options]
         \\  matcha loop --prompt-file <path> [options]
         \\  matcha loop config
-        \\  matcha loop resume [<id>|--last] [--objective <new objective>] [--sandbox <policy>|--yolo]
+        \\  matcha loop resume [<id>|--last] [--objective <new objective>] [execution overrides]
         \\  matcha loop list
         \\  matcha loop show [<id>]
         \\  matcha loop update [<id>] --status <complete|blocked> [--summary <text>]
@@ -713,6 +716,13 @@ pub fn writeLoopHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\Verifier overrides: --verifier-model <model>, --verifier-bin <executable>,
         \\  repeatable --verifier-arg=<argument>. Empty model/bin selects native default.
         \\Arguments after -- belong only to the worker in new loops.
+        \\Execution overrides on run and resume: --env KEY=VALUE, --env-file <path>,
+        \\  --path-prepend <dir>, --backend-bin <executable>, --verifier-bin <executable>,
+        \\  --model <id>, --verifier-model <id>, --reasoning-effort <level>,
+        \\  --verifier-reasoning-effort <level>, --sandbox <policy>, --yolo, --log-dir <dir>.
+        \\Env values are literal; env files use KEY=VALUE lines and are flattened into snapshots.
+        \\Configured PATH prefixes follow Matcha's callback binary directory.
+        \\Resume uses saved settings plus explicit overrides; --config and new prompts are run-only.
         \\--sandbox <workspace-write|danger-full-access|backend-default> selects isolation.
         \\Codex supports the first two; backend-default resets to native policy for all backends.
         \\Read-only cannot support loop callbacks. Sandbox never implies --yolo approval bypass.

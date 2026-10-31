@@ -7,6 +7,9 @@ pub const Config = struct {
     backend: options.BackendKind = .codex,
     backend_bin: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    reasoning_effort: ?[]const u8 = null,
+    env: []const options.EnvEntry = &.{},
+    path_prepend: []const []const u8 = &.{},
     max_turns: ?u32 = null,
     prompt_file: ?[]const u8 = null,
     verifier: ?options.BackendKind = null,
@@ -45,6 +48,7 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, cli: options.RunOptions
     result.run.backend = if (cli.backend_explicit) cli.backend else settings.backend;
     result.run.backend_bin = if (cli.backend_bin) |v| try resolveExecutablePath(a, io, ".", v) else settings.backend_bin;
     result.run.model = cli.model orelse settings.model;
+    result.run.reasoning_effort = cli.reasoning_effort orelse settings.reasoning_effort;
     result.run.max_turns = if (cli.turn_limit_explicit) cli.max_turns else settings.max_turns;
     result.run.verifier_explicit = cli.verifier_explicit or verifier_present;
     result.run.verifier = cli.verifier orelse settings.verifier;
@@ -52,6 +56,10 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, cli: options.RunOptions
     if (cli.verifier_options.model_explicit) {
         result.run.verifier_options.model = cli.verifier_options.model;
         result.run.verifier_options.model_explicit = true;
+    }
+    if (cli.verifier_options.reasoning_explicit) {
+        result.run.verifier_options.reasoning_effort = cli.verifier_options.reasoning_effort;
+        result.run.verifier_options.reasoning_explicit = true;
     }
     if (cli.verifier_options.backend_bin_explicit) {
         result.run.verifier_options.backend_bin = if (cli.verifier_options.backend_bin) |v| try resolveExecutablePath(a, io, ".", v) else null;
@@ -73,10 +81,16 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, cli: options.RunOptions
     result.run.timeout_seconds = cli.timeout_seconds orelse settings.timeout_seconds;
     result.run.output_mode = if (cli.output_mode != .live) cli.output_mode else settings.output_mode;
     result.run.log_dir = cli.log_dir orelse settings.log_dir;
+    result.run.env = settings.env;
+    for (cli.env_files) |file| try applyEnvFile(a, io, &result.run.env, file, diagnostic);
+    for (cli.env) |entry| try mergeEnv(a, &result.run.env, entry);
+    result.run.path_prepend = if (cli.path_prepend_explicit) try resolvePaths(a, io, ".", cli.path_prepend) else settings.path_prepend;
     result.run.extra_backend_args = if (cli.extra_args_explicit) cli.extra_backend_args else settings.extra_backend_args;
     result.run.prompt_file = cli.prompt_file orelse settings.prompt_file;
     result.run.prompt = try a.dupe(u8, result.run.prompt);
     if (result.run.model) |v| result.run.model = try a.dupe(u8, v);
+    if (result.run.reasoning_effort) |v| result.run.reasoning_effort = try a.dupe(u8, v);
+    if (result.run.verifier_options.reasoning_effort) |v| result.run.verifier_options.reasoning_effort = try a.dupe(u8, v);
     if (result.run.prompt_file) |v| result.run.prompt_file = try a.dupe(u8, v);
     if (result.run.log_dir) |v| result.run.log_dir = try std.fs.path.resolve(a, &.{ ".", v });
     if (result.run.config_path) |v| result.run.config_path = try a.dupe(u8, v);
@@ -109,6 +123,33 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
     } else if (project) return error.MissingSchemaVersion;
     const value = if (project) root.object.get("loop") orelse return error.MissingLoopSettings else root;
     if (value != .object) return error.InvalidLoopSettings;
+    if (value.object.get("env_files")) |files| {
+        if (files != .array) return error.InvalidFieldType;
+        for (files.array.items) |item| {
+            if (item != .string or item.string.len == 0) return error.InvalidFieldType;
+            if (resolve_paths) {
+                const file = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(source) orelse ".", item.string });
+                try applyEnvFile(a, io, &settings.env, file, diagnostic);
+            }
+        }
+    }
+    if (value.object.get("env")) |env_value| {
+        if (env_value != .object) return error.InvalidFieldType;
+        var env_it = env_value.object.iterator();
+        while (env_it.next()) |entry| {
+            if (entry.value_ptr.* != .string) return error.InvalidFieldType;
+            try mergeEnv(a, &settings.env, .{ .key = entry.key_ptr.*, .value = entry.value_ptr.string });
+        }
+    }
+    if (value.object.get("path_prepend")) |paths| {
+        if (paths != .array) return error.InvalidFieldType;
+        const raw_paths = try a.alloc([]const u8, paths.array.items.len);
+        for (paths.array.items, 0..) |item, index| {
+            if (item != .string or item.string.len == 0) return error.InvalidFieldType;
+            raw_paths[index] = item.string;
+        }
+        settings.path_prepend = if (resolve_paths) try resolvePaths(a, io, std.fs.path.dirname(source) orelse ".", raw_paths) else raw_paths;
+    }
     if (project) {
         var keys = root.object.iterator();
         while (keys.next()) |entry| {
@@ -123,6 +164,7 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
         const raw = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "env") or std.mem.eql(u8, key, "env_files") or std.mem.eql(u8, key, "path_prepend")) continue;
         if (std.mem.eql(u8, key, "sandbox")) {
             if (raw != .string and raw != .null) {
                 try diagnostic.print("Config {s}, field sandbox: expected policy name or null\n", .{source});
@@ -161,7 +203,7 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
                 return error.InvalidFieldType;
             }
         }
-        if (std.mem.eql(u8, key, "model") or std.mem.eql(u8, key, "prompt_file") or std.mem.eql(u8, key, "backend_bin") or std.mem.eql(u8, key, "log_dir")) {
+        if (std.mem.eql(u8, key, "model") or std.mem.eql(u8, key, "reasoning_effort") or std.mem.eql(u8, key, "prompt_file") or std.mem.eql(u8, key, "backend_bin") or std.mem.eql(u8, key, "log_dir")) {
             if (raw != .string and raw != .null) return error.InvalidFieldType;
         }
         if (std.mem.eql(u8, key, "extra_backend_args")) {
@@ -250,7 +292,9 @@ fn applyVerifier(a: std.mem.Allocator, settings: *Config, value: std.json.Value,
             settings.verifier_options.args = args;
             settings.verifier_options.args_explicit = true;
         } else if (std.mem.eql(u8, key, "reasoning_effort")) {
-            if (raw != .null) return error.UnsupportedVerifierReasoning;
+            if (raw != .string and raw != .null) return error.InvalidFieldType;
+            settings.verifier_options.reasoning_effort = if (raw == .null) null else raw.string;
+            settings.verifier_options.reasoning_explicit = true;
         } else {
             try diagnostic.print("Config {s}: unknown verifier field {s}\n", .{ source, key });
             return error.UnknownField;
@@ -269,6 +313,66 @@ pub fn resolveExecutablePath(a: std.mem.Allocator, io: std.Io, base: []const u8,
         return std.fs.path.resolve(a, &.{ cwd, base, value });
     }
     return a.dupe(u8, value);
+}
+
+pub fn resolvePaths(a: std.mem.Allocator, io: std.Io, base: []const u8, values: []const []const u8) ![]const []const u8 {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    defer a.free(cwd);
+    const result = try a.alloc([]const u8, values.len);
+    for (values, 0..) |value, index| {
+        if (value.len == 0 or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidPathPrepend;
+        result[index] = try std.fs.path.resolve(a, &.{ cwd, base, value });
+    }
+    return result;
+}
+
+pub fn mergeEnv(a: std.mem.Allocator, entries: *[]const options.EnvEntry, entry: options.EnvEntry) !void {
+    if (!options.validEnvKey(entry.key) or std.mem.indexOfScalar(u8, entry.value, 0) != null) return error.InvalidEnvironmentEntry;
+    for (entries.*, 0..) |existing, index| {
+        if (std.mem.eql(u8, existing.key, entry.key)) {
+            const replacement = try a.alloc(options.EnvEntry, entries.len);
+            @memcpy(replacement, entries.*);
+            replacement[index] = .{ .key = try a.dupe(u8, entry.key), .value = try a.dupe(u8, entry.value) };
+            entries.* = replacement;
+            return;
+        }
+    }
+    const extended = try a.alloc(options.EnvEntry, entries.len + 1);
+    @memcpy(extended[0..entries.len], entries.*);
+    extended[entries.len] = .{ .key = try a.dupe(u8, entry.key), .value = try a.dupe(u8, entry.value) };
+    entries.* = extended;
+}
+
+pub fn applyEnvFile(a: std.mem.Allocator, io: std.Io, entries: *[]const options.EnvEntry, file_path: []const u8, diagnostic: *std.Io.Writer) !void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, file_path, a, .limited(1024 * 1024)) catch |err| {
+        try diagnostic.print("Cannot read env file {s}: {s}\n", .{ file_path, @errorName(err) });
+        return err;
+    };
+    defer a.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var line_number: usize = 0;
+    while (lines.next()) |raw_line| {
+        line_number += 1;
+        var line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "export ")) line = std.mem.trimStart(u8, line[7..], " \t");
+        const parsed = options.parseEnvAssignment(line) orelse {
+            try diagnostic.print("Invalid env file {s}:{d}: expected KEY=VALUE\n", .{ file_path, line_number });
+            return error.InvalidEnvFile;
+        };
+        var value = parsed.value;
+        if (value.len > 0 and (value[0] == '"' or value[0] == '\'')) {
+            if (value.len < 2 or value[value.len - 1] != value[0]) {
+                try diagnostic.print("Invalid env file {s}:{d}: unmatched quote\n", .{ file_path, line_number });
+                return error.InvalidEnvFile;
+            }
+            value = value[1 .. value.len - 1];
+        } else if (value.len > 0 and (value[value.len - 1] == '"' or value[value.len - 1] == '\'')) {
+            try diagnostic.print("Invalid env file {s}:{d}: unmatched quote\n", .{ file_path, line_number });
+            return error.InvalidEnvFile;
+        }
+        try mergeEnv(a, entries, .{ .key = parsed.key, .value = value });
+    }
 }
 
 pub fn configPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
@@ -359,6 +463,65 @@ test "config load releases allocations at every OOM point" {
         if (saw_success and !failing.has_induced_failure) break;
     }
     try std.testing.expect(saw_success);
+}
+
+test "dotenv keeps literal values and reports malformed source lines" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/values.env", .{tmp.sub_path});
+    defer allocator.free(file);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "values.env", .data = "# comment\nexport JAVA_HOME=\"/opt/jdk 21\"\r\nPATH='$HOME/bin'\nEMPTY=\nA=one=two\nA=last\n" });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var entries: []const options.EnvEntry = &.{};
+    var diagnostic = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostic.deinit();
+    try applyEnvFile(arena.allocator(), std.testing.io, &entries, file, &diagnostic.writer);
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    try std.testing.expectEqualStrings("/opt/jdk 21", entries[0].value);
+    try std.testing.expectEqualStrings("$HOME/bin", entries[1].value);
+    try std.testing.expectEqualStrings("", entries[2].value);
+    try std.testing.expectEqualStrings("last", entries[3].value);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "values.env", .data = "GOOD=one\nBROKEN=\"unterminated\n" });
+    try std.testing.expectError(error.InvalidEnvFile, applyEnvFile(arena.allocator(), std.testing.io, &entries, file, &diagnostic.writer));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), ":2:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "unterminated") == null);
+}
+
+test "config and cli environment layers flatten with source-relative path prefixes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    const user = try std.fmt.allocPrint(a, "{s}/user.json", .{root});
+    defer a.free(user);
+    const project = try std.fmt.allocPrint(a, "{s}/project.json", .{root});
+    defer a.free(project);
+    const cli_file = try std.fmt.allocPrint(a, "{s}/cli.env", .{root});
+    defer a.free(cli_file);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user.env", .data = "X=user-file\nU=user\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.env", .data = "X=project-file\nP=project\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cli.env", .data = "X=cli-file\nC=cli\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user.json", .data = "{\"env_files\":[\"user.env\"],\"env\":{\"X\":\"user-direct\"},\"path_prepend\":[\"user-bin\"]}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = "{\"schema_version\":1,\"loop\":{\"env_files\":[\"project.env\"],\"env\":{\"X\":\"project-direct\"},\"path_prepend\":[\"project-bin\"]}}" });
+    var diagnostic = std.Io.Writer.Allocating.init(a);
+    defer diagnostic.deinit();
+    var resolved = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task", .env_files = &.{cli_file}, .env = &.{.{ .key = "X", .value = "cli-direct" }} }, user, project, &diagnostic.writer);
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 4), resolved.run.env.len);
+    for (resolved.run.env) |entry| {
+        if (std.mem.eql(u8, entry.key, "X")) try std.testing.expectEqualStrings("cli-direct", entry.value);
+    }
+    try std.testing.expectEqualStrings("U", resolved.run.env[1].key);
+    try std.testing.expectEqualStrings("project-bin", std.fs.path.basename(resolved.run.path_prepend[0]));
+    try std.testing.expect(std.fs.path.isAbsolute(resolved.run.path_prepend[0]));
+    var with_cli_paths = try resolve(a, std.testing.io, .{ .backend = .codex, .prompt = "task", .path_prepend = &.{ "first-bin", "second-bin" }, .path_prepend_explicit = true }, user, project, &diagnostic.writer);
+    defer with_cli_paths.deinit();
+    try std.testing.expectEqual(@as(usize, 2), with_cli_paths.run.path_prepend.len);
+    try std.testing.expectEqualStrings("first-bin", std.fs.path.basename(with_cli_paths.run.path_prepend[0]));
+    try std.testing.expectEqualStrings("second-bin", std.fs.path.basename(with_cli_paths.run.path_prepend[1]));
 }
 
 test "config save releases allocations at every OOM point" {
@@ -641,7 +804,7 @@ test "nested verifier validation is strict and interactive edits preserve raw pa
         .{ .json = "{\"verifier\":{\"model\":[65]}}", .err = error.InvalidFieldType },
         .{ .json = "{\"verifier\":{\"backend\":\"1\"}}", .err = error.InvalidEnumTag },
         .{ .json = "{\"verifier\":{\"args\":[12]}}", .err = error.InvalidFieldType },
-        .{ .json = "{\"verifier\":{\"reasoning_effort\":\"high\"}}", .err = error.UnsupportedVerifierReasoning },
+        .{ .json = "{\"verifier\":{\"reasoning_effort\":12}}", .err = error.InvalidFieldType },
     };
     for (cases) |case| {
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "loop.json", .data = case.json });

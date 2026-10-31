@@ -437,6 +437,7 @@ pub const BackendOptions = struct {
     legacy_policy_passthrough: bool = false,
     backend_bin: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    reasoning_effort: ?[]const u8 = null,
     yolo: bool = false,
     extra_args: []const []const u8 = &.{},
 };
@@ -444,6 +445,25 @@ pub const BackendOptions = struct {
 /// Capability evidence and the callback restriction are recorded in
 /// LOOP_SANDBOX_CAPABILITIES.md. No vendor discovery runs during execution.
 pub fn validatePolicy(config: BackendOptions, diagnostic: ?*std.Io.Writer) !void {
+    if (config.model) |model| {
+        if (std.mem.indexOfScalar(u8, model, 0) != null) return error.InvalidModel;
+    }
+    if (config.reasoning_effort) |effort| {
+        const allowed = [_][]const u8{ "low", "medium", "high", "xhigh", "max" };
+        var supported = false;
+        for (allowed) |value| if (std.mem.eql(u8, value, effort)) {
+            supported = true;
+            break;
+        };
+        if (!supported) {
+            if (diagnostic) |writer| try writer.print("Unsupported reasoning effort {s} for {s}\n", .{ effort, @tagName(config.backend) });
+            return error.UnsupportedReasoningEffort;
+        }
+        if (conflictingNativeReasoning(config.backend, config.extra_args)) |arg| {
+            if (diagnostic) |writer| try writer.print("Structured reasoning effort conflicts with native argument {s}\n", .{arg});
+            return error.ConflictingNativeReasoning;
+        }
+    }
     if (config.yolo and config.sandbox != null) {
         if (diagnostic) |writer| try writer.writeAll("sandbox and yolo cannot both be selected\n");
         return error.ConflictingPolicy;
@@ -464,6 +484,22 @@ pub fn validatePolicy(config: BackendOptions, diagnostic: ?*std.Io.Writer) !void
             return error.ConflictingNativePolicy;
         }
     }
+}
+
+fn conflictingNativeReasoning(kind: BackendKind, args: []const []const u8) ?[]const u8 {
+    for (args, 0..) |arg, index| {
+        switch (kind) {
+            .codex => {
+                if (std.mem.startsWith(u8, arg, "model_reasoning_effort=")) return arg;
+                if (std.mem.startsWith(u8, arg, "--config=model_reasoning_effort=")) return arg;
+                if (std.mem.startsWith(u8, arg, "-cmodel_reasoning_effort=")) return arg;
+                if ((std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) and index + 1 < args.len and std.mem.startsWith(u8, args[index + 1], "model_reasoning_effort=")) return arg;
+            },
+            .droid => if (std.mem.eql(u8, arg, "-r") or flagMatches(arg, "--reasoning-effort")) return arg,
+            .agy => if (flagMatches(arg, "--effort")) return arg,
+        }
+    }
+    return null;
 }
 
 fn flagMatches(arg: []const u8, flag: []const u8) bool {
@@ -543,6 +579,12 @@ fn buildCodex(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u
         try builder.add("--model");
         try builder.add(model);
     }
+    if (config.reasoning_effort) |effort| {
+        try builder.add("-c");
+        const setting = try std.fmt.allocPrint(builder.allocator, "model_reasoning_effort=\"{s}\"", .{effort});
+        defer builder.allocator.free(setting);
+        try builder.add(setting);
+    }
     try builder.addMany(config.extra_args);
     if (session_id) |id| {
         try builder.add("resume");
@@ -580,6 +622,10 @@ fn buildDroid(builder: *ArgvBuilder, config: BackendOptions, session_id: ?[]cons
         try builder.add("-m");
         try builder.add(model);
     }
+    if (config.reasoning_effort) |effort| {
+        try builder.add("--reasoning-effort");
+        try builder.add(effort);
+    }
     try builder.addMany(config.extra_args);
     try builder.add("-o");
     try builder.add("stream-json");
@@ -608,6 +654,10 @@ fn buildAgy(builder: *ArgvBuilder, config: BackendOptions, loop_dir: []const u8,
         try builder.add("--model");
         try builder.add(model);
     }
+    if (config.reasoning_effort) |effort| {
+        try builder.add("--effort");
+        try builder.add(effort);
+    }
     try builder.addMany(config.extra_args);
     try builder.add("--output-format");
     try builder.add("stream-json");
@@ -620,9 +670,20 @@ pub fn buildChildEnvironment(
     parent: *const std.process.Environ.Map,
     loop_id: []const u8,
 ) !ChildEnvironment {
+    return buildChildEnvironmentConfigured(allocator, io, parent, loop_id, &.{}, &.{});
+}
+
+pub fn buildChildEnvironmentConfigured(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: *const std.process.Environ.Map,
+    loop_id: []const u8,
+    overrides: []const options.EnvEntry,
+    path_prepend: []const []const u8,
+) !ChildEnvironment {
     const executable_dir = try std.process.executableDirPathAlloc(io, allocator);
     defer allocator.free(executable_dir);
-    return buildChildEnvironmentWithBinaryDir(allocator, parent, loop_id, executable_dir);
+    return buildChildEnvironmentWithSettings(allocator, parent, loop_id, executable_dir, overrides, path_prepend);
 }
 
 fn buildChildEnvironmentWithBinaryDir(
@@ -631,18 +692,40 @@ fn buildChildEnvironmentWithBinaryDir(
     loop_id: []const u8,
     binary_dir: []const u8,
 ) !ChildEnvironment {
+    return buildChildEnvironmentWithSettings(allocator, parent, loop_id, binary_dir, &.{}, &.{});
+}
+
+fn buildChildEnvironmentWithSettings(
+    allocator: std.mem.Allocator,
+    parent: *const std.process.Environ.Map,
+    loop_id: []const u8,
+    binary_dir: []const u8,
+    overrides: []const options.EnvEntry,
+    path_prepend: []const []const u8,
+) !ChildEnvironment {
     var map = try parent.clone(allocator);
     errdefer map.deinit();
+    for (overrides) |entry| {
+        if (!options.validEnvKey(entry.key)) return error.InvalidEnvironmentKey;
+        try map.put(entry.key, entry.value);
+    }
     try map.put("MATCHA_LOOP_ID", loop_id);
 
     const old_path = map.get("PATH") orelse "";
     const separator: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
-    const path = if (old_path.len == 0)
-        try allocator.dupe(u8, binary_dir)
-    else
-        try std.mem.concat(allocator, u8, &.{ binary_dir, &.{separator}, old_path });
-    defer allocator.free(path);
-    try map.put("PATH", path);
+    var path: std.ArrayList(u8) = .empty;
+    defer path.deinit(allocator);
+    try path.appendSlice(allocator, binary_dir);
+    for (path_prepend) |entry| {
+        if (entry.len == 0) return error.InvalidPathPrepend;
+        try path.append(allocator, separator);
+        try path.appendSlice(allocator, entry);
+    }
+    if (old_path.len > 0) {
+        try path.append(allocator, separator);
+        try path.appendSlice(allocator, old_path);
+    }
+    try map.put("PATH", path.items);
     return .{ .map = map };
 }
 
@@ -763,6 +846,53 @@ test "environment builder clones parent and prepends binary directory" {
     try std.testing.expectEqualStrings("present", child.map.get("KEEP_ME").?);
     try std.testing.expect(parent.get("MATCHA_LOOP_ID") == null);
     try std.testing.expectEqualStrings("/usr/bin:/bin", parent.get("PATH").?);
+}
+
+test "configured child environment preserves override and prefix order" {
+    const a = std.testing.allocator;
+    var parent = std.process.Environ.Map.init(a);
+    defer parent.deinit();
+    try parent.put("PATH", "/ambient");
+    try parent.put("UNRELATED", "ambient-value");
+    var child = try buildChildEnvironmentWithSettings(a, &parent, "current-id", "/matcha", &.{ .{ .key = "PATH", .value = "/literal" }, .{ .key = "JAVA_HOME", .value = "/jdk" } }, &.{ "/first", "/second" });
+    defer child.deinit();
+    try std.testing.expectEqualStrings("/matcha:/first:/second:/literal", child.map.get("PATH").?);
+    try std.testing.expectEqualStrings("/jdk", child.map.get("JAVA_HOME").?);
+    try std.testing.expectEqualStrings("ambient-value", child.map.get("UNRELATED").?);
+    try std.testing.expectEqualStrings("/ambient", parent.get("PATH").?);
+    try std.testing.expectError(error.InvalidEnvironmentKey, buildChildEnvironmentWithSettings(a, &parent, "current-id", "/matcha", &.{.{ .key = "MATCHA_LOOP_ID", .value = "wrong" }}, &.{}));
+    var empty = try buildChildEnvironmentWithSettings(a, &parent, "current-id", "/matcha", &.{.{ .key = "PATH", .value = "" }}, &.{});
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("/matcha", empty.map.get("PATH").?);
+}
+
+test "reasoning efforts reach each backend and resumed codex turns" {
+    const a = std.testing.allocator;
+    for ([_]BackendKind{ .codex, .droid, .agy }) |kind| {
+        var argv = try buildArgv(a, .{ .backend = kind, .reasoning_effort = "high" }, "/loops/id", null, "prompt.md");
+        defer argv.deinit();
+        const flag: []const u8 = switch (kind) {
+            .codex => "model_reasoning_effort=\"high\"",
+            .droid => "--reasoning-effort",
+            .agy => "--effort",
+        };
+        var found = false;
+        for (argv.items) |item| if (std.mem.eql(u8, item, flag)) {
+            found = true;
+            break;
+        };
+        try std.testing.expect(found);
+    }
+    var resumed = try buildArgv(a, .{ .backend = .codex, .reasoning_effort = "xhigh" }, "/loops/id", "saved-session", "prompt.md");
+    defer resumed.deinit();
+    var resume_effort_found = false;
+    for (resumed.items) |item| if (std.mem.eql(u8, item, "model_reasoning_effort=\"xhigh\"")) {
+        resume_effort_found = true;
+        break;
+    };
+    try std.testing.expect(resume_effort_found);
+    try std.testing.expectError(error.UnsupportedReasoningEffort, buildArgv(a, .{ .backend = .codex, .reasoning_effort = "none" }, "/loops/id", null, "prompt.md"));
+    try std.testing.expectError(error.ConflictingNativeReasoning, buildArgv(a, .{ .backend = .codex, .reasoning_effort = "high", .extra_args = &.{ "-c", "model_reasoning_effort=\"low\"" } }, "/loops/id", null, "prompt.md"));
 }
 
 test "native resume command uses backend attach syntax" {

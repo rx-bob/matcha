@@ -5,12 +5,15 @@ pub const BackendKind = enum { codex, droid, agy };
 pub const SandboxPolicy = enum { @"read-only", @"workspace-write", @"danger-full-access", @"backend-default" };
 pub const OutputMode = enum { live, quiet, json };
 pub const LoopStatus = enum { complete, blocked };
+pub const EnvEntry = struct { key: []const u8, value: []const u8 };
 
 pub const VerifierOptions = struct {
     model: ?[]const u8 = null,
     model_explicit: bool = false,
     backend_bin: ?[]const u8 = null,
     backend_bin_explicit: bool = false,
+    reasoning_effort: ?[]const u8 = null,
+    reasoning_explicit: bool = false,
     args: []const []const u8 = &.{},
     args_explicit: bool = false,
 };
@@ -24,6 +27,11 @@ pub const RunOptions = struct {
     verifier_options: VerifierOptions = .{},
     verify_enabled: bool = true,
     model: ?[]const u8 = null,
+    reasoning_effort: ?[]const u8 = null,
+    env: []const EnvEntry = &.{},
+    env_files: []const []const u8 = &.{},
+    path_prepend: []const []const u8 = &.{},
+    path_prepend_explicit: bool = false,
     yolo: bool = false,
     sandbox: ?SandboxPolicy = null,
     max_turns: ?u32 = null,
@@ -44,9 +52,40 @@ pub const RunOptions = struct {
 pub fn deinitParsedRun(allocator: std.mem.Allocator, run: RunOptions) void {
     allocator.free(run.prompt);
     allocator.free(run.verifier_options.args);
+    allocator.free(run.env);
+    allocator.free(run.env_files);
+    allocator.free(run.path_prepend);
 }
 
-pub const ResumeOptions = struct { id: ?[]const u8 = null, last: bool = false, objective: ?[]const u8 = null, sandbox: ?SandboxPolicy = null, yolo: bool = false };
+pub const ResumeOptions = struct {
+    id: ?[]const u8 = null,
+    last: bool = false,
+    objective: ?[]const u8 = null,
+    sandbox: ?SandboxPolicy = null,
+    yolo: bool = false,
+    env: []const EnvEntry = &.{},
+    env_files: []const []const u8 = &.{},
+    path_prepend: []const []const u8 = &.{},
+    path_prepend_explicit: bool = false,
+    backend_bin: ?[]const u8 = null,
+    verifier_bin: ?[]const u8 = null,
+    verifier_bin_explicit: bool = false,
+    model: ?[]const u8 = null,
+    model_explicit: bool = false,
+    verifier_model: ?[]const u8 = null,
+    verifier_model_explicit: bool = false,
+    reasoning_effort: ?[]const u8 = null,
+    reasoning_explicit: bool = false,
+    verifier_reasoning_effort: ?[]const u8 = null,
+    verifier_reasoning_explicit: bool = false,
+    log_dir: ?[]const u8 = null,
+};
+
+pub fn deinitParsedResume(allocator: std.mem.Allocator, parsed: ResumeOptions) void {
+    allocator.free(parsed.env);
+    allocator.free(parsed.env_files);
+    allocator.free(parsed.path_prepend);
+}
 pub const ShowOptions = struct { id: ?[]const u8 = null };
 pub const UpdateOptions = struct { id: ?[]const u8 = null, status: LoopStatus, summary: ?[]const u8 = null };
 pub const VerifyOptions = struct { id: ?[]const u8 = null, passed: bool, reason: ?[]const u8 = null };
@@ -70,7 +109,7 @@ pub fn parseLoopCommand(
     stdin_is_tty: bool,
     stdin_bytes: []const u8,
 ) LoopCommandResult {
-    if (args.len > 0 and isReserved(args[0])) return parseSubcommand(args);
+    if (args.len > 0 and isReserved(args[0])) return parseSubcommand(allocator, args);
     return parseRun(allocator, args, stdin_is_tty, stdin_bytes);
 }
 
@@ -95,8 +134,16 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     var verifier_options: VerifierOptions = .{};
     var verifier_args: std.ArrayList([]const u8) = .empty;
     defer verifier_args.deinit(allocator);
+    var env_entries: std.ArrayList(EnvEntry) = .empty;
+    defer env_entries.deinit(allocator);
+    var env_files: std.ArrayList([]const u8) = .empty;
+    defer env_files.deinit(allocator);
+    var path_entries: std.ArrayList([]const u8) = .empty;
+    defer path_entries.deinit(allocator);
+    var path_prepend_explicit = false;
     var no_verify = false;
     var model: ?[]const u8 = null;
+    var reasoning_effort: ?[]const u8 = null;
     var yolo = false;
     var sandbox: ?SandboxPolicy = null;
     var max_turns: ?u32 = null;
@@ -118,12 +165,29 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        if (i + 1 == args.len and needsValue(arg)) return .{ .err = .{ .missing_value = arg } };
         if (std.mem.eql(u8, arg, "--")) {
             extra_args_explicit = true;
             extra_args = args[i + 1 ..];
             break;
         }
-        if (std.mem.eql(u8, arg, "--verifier-model") or std.mem.startsWith(u8, arg, "--verifier-model=")) {
+        if (optionValue(args, &i, "--env")) |value| {
+            const entry = parseEnvAssignment(value) orelse return .{ .err = .{ .invalid_loop_arguments = "--env requires KEY=VALUE with a valid name" } };
+            env_entries.append(allocator, entry) catch return outOfMemory();
+        } else if (optionValue(args, &i, "--env-file")) |value| {
+            if (value.len == 0) return .{ .err = .{ .missing_value = "--env-file" } };
+            env_files.append(allocator, value) catch return outOfMemory();
+        } else if (optionValue(args, &i, "--path-prepend")) |value| {
+            if (value.len == 0) return .{ .err = .{ .missing_value = "--path-prepend" } };
+            path_prepend_explicit = true;
+            path_entries.append(allocator, value) catch return outOfMemory();
+        } else if (optionValue(args, &i, "--reasoning-effort")) |value| {
+            if (value.len == 0) return .{ .err = .{ .missing_value = "--reasoning-effort" } };
+            reasoning_effort = value;
+        } else if (optionValue(args, &i, "--verifier-reasoning-effort")) |value| {
+            verifier_options.reasoning_explicit = true;
+            verifier_options.reasoning_effort = if (value.len == 0) null else value;
+        } else if (std.mem.eql(u8, arg, "--verifier-model") or std.mem.startsWith(u8, arg, "--verifier-model=")) {
             const value = if (std.mem.startsWith(u8, arg, "--verifier-model=")) arg["--verifier-model=".len..] else blk: {
                 i += 1;
                 break :blk if (i < args.len) args[i] else return .{ .err = .{ .missing_value = arg } };
@@ -241,7 +305,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     }
 
     if (sandbox != null and yolo) return .{ .err = .{ .invalid_loop_arguments = "--sandbox cannot be combined with --yolo" } };
-    if (no_verify and (verifier != null or verifier_options.model_explicit or verifier_options.backend_bin_explicit or verifier_options.args_explicit)) return .{ .err = .{ .invalid_loop_arguments = "verifier options cannot be combined with --no-verify" } };
+    if (no_verify and (verifier != null or verifier_options.model_explicit or verifier_options.backend_bin_explicit or verifier_options.reasoning_explicit or verifier_options.args_explicit)) return .{ .err = .{ .invalid_loop_arguments = "verifier options cannot be combined with --no-verify" } };
     if (quiet_set and json_set) return .{ .err = .{ .invalid_loop_arguments = "--quiet cannot be combined with --json" } };
 
     if (prompt_parts.items.len > 0 and prompt_file != null) return .{ .err = .{ .invalid_loop_arguments = "positional prompt and --prompt-file cannot be combined" } };
@@ -258,6 +322,24 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         allocator.free(prompt);
         return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
     };
+    const owned_env = env_entries.toOwnedSlice(allocator) catch {
+        allocator.free(prompt);
+        allocator.free(verifier_options.args);
+        return outOfMemory();
+    };
+    const owned_files = env_files.toOwnedSlice(allocator) catch {
+        allocator.free(prompt);
+        allocator.free(verifier_options.args);
+        allocator.free(owned_env);
+        return outOfMemory();
+    };
+    const owned_paths = path_entries.toOwnedSlice(allocator) catch {
+        allocator.free(prompt);
+        allocator.free(verifier_options.args);
+        allocator.free(owned_env);
+        allocator.free(owned_files);
+        return outOfMemory();
+    };
 
     return .{ .ok = .{ .run = .{
         .backend = backend,
@@ -268,6 +350,11 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
         .verifier_options = verifier_options,
         .verify_enabled = !no_verify,
         .model = model,
+        .reasoning_effort = reasoning_effort,
+        .env = owned_env,
+        .env_files = owned_files,
+        .path_prepend = owned_paths,
+        .path_prepend_explicit = path_prepend_explicit,
         .yolo = yolo,
         .sandbox = sandbox,
         .max_turns = max_turns,
@@ -285,7 +372,7 @@ fn parseRun(allocator: std.mem.Allocator, args: []const []const u8, stdin_is_tty
     } } };
 }
 
-fn parseSubcommand(args: []const []const u8) LoopCommandResult {
+fn parseSubcommand(allocator: std.mem.Allocator, args: []const []const u8) LoopCommandResult {
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         if (args.len != 1) return extra(args[1]);
@@ -303,13 +390,19 @@ fn parseSubcommand(args: []const []const u8) LoopCommandResult {
         if (args.len > 2 or (args.len == 2 and std.mem.startsWith(u8, args[1], "-"))) return .{ .err = .{ .invalid_loop_arguments = "show accepts at most one loop id" } };
         return .{ .ok = .{ .show = .{ .id = if (args.len == 2) args[1] else null } } };
     }
-    if (std.mem.eql(u8, cmd, "resume")) return parseResume(args);
+    if (std.mem.eql(u8, cmd, "resume")) return parseResume(allocator, args);
     if (std.mem.eql(u8, cmd, "update")) return parseUpdate(args);
     return parseVerify(args);
 }
 
-fn parseResume(args: []const []const u8) LoopCommandResult {
+fn parseResume(allocator: std.mem.Allocator, args: []const []const u8) LoopCommandResult {
     var o: ResumeOptions = .{};
+    var env_entries: std.ArrayList(EnvEntry) = .empty;
+    defer env_entries.deinit(allocator);
+    var env_files: std.ArrayList([]const u8) = .empty;
+    defer env_files.deinit(allocator);
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
     var i: usize = 1;
     if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
         o.id = args[i];
@@ -321,22 +414,103 @@ fn parseResume(args: []const []const u8) LoopCommandResult {
         i += 1;
     }
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--objective")) {
+        const arg = args[i];
+        if (i + 1 == args.len and needsValue(arg)) return .{ .err = .{ .missing_value = arg } };
+        if (optionValue(args, &i, "--env")) |value| {
+            const entry = parseEnvAssignment(value) orelse return .{ .err = .{ .invalid_loop_arguments = "--env requires KEY=VALUE with a valid name" } };
+            env_entries.append(allocator, entry) catch return outOfMemory();
+        } else if (optionValue(args, &i, "--env-file")) |value| {
+            if (value.len == 0) return .{ .err = .{ .missing_value = "--env-file" } };
+            env_files.append(allocator, value) catch return outOfMemory();
+        } else if (optionValue(args, &i, "--path-prepend")) |value| {
+            if (value.len == 0) return .{ .err = .{ .missing_value = "--path-prepend" } };
+            o.path_prepend_explicit = true;
+            paths.append(allocator, value) catch return outOfMemory();
+        } else if (optionValue(args, &i, "--backend-bin")) |value| {
+            if (value.len == 0) return .{ .err = .{ .missing_value = "--backend-bin" } };
+            o.backend_bin = value;
+        } else if (optionValue(args, &i, "--verifier-bin")) |value| {
+            o.verifier_bin_explicit = true;
+            o.verifier_bin = if (value.len == 0) null else value;
+        } else if (optionValue(args, &i, "--model")) |value| {
+            o.model_explicit = true;
+            o.model = if (value.len == 0) null else value;
+        } else if (optionValue(args, &i, "--verifier-model")) |value| {
+            o.verifier_model_explicit = true;
+            o.verifier_model = if (value.len == 0) null else value;
+        } else if (optionValue(args, &i, "--reasoning-effort")) |value| {
+            o.reasoning_explicit = true;
+            o.reasoning_effort = if (value.len == 0) null else value;
+        } else if (optionValue(args, &i, "--verifier-reasoning-effort")) |value| {
+            o.verifier_reasoning_explicit = true;
+            o.verifier_reasoning_effort = if (value.len == 0) null else value;
+        } else if (optionValue(args, &i, "--log-dir")) |value| {
+            if (value.len == 0) return .{ .err = .{ .missing_value = "--log-dir" } };
+            o.log_dir = value;
+        } else if (std.mem.eql(u8, arg, "--objective")) {
             i += 1;
             if (i >= args.len or o.objective != null) return .{ .err = .{ .invalid_loop_arguments = "--objective requires one value" } };
             o.objective = args[i];
-        } else if (std.mem.eql(u8, args[i], "--sandbox")) {
+        } else if (std.mem.eql(u8, arg, "--sandbox")) {
             i += 1;
             if (i >= args.len) return .{ .err = .{ .missing_value = "--sandbox" } };
             o.sandbox = std.meta.stringToEnum(SandboxPolicy, args[i]) orelse return .{ .err = .{ .invalid_loop_arguments = "--sandbox requires read-only, workspace-write, danger-full-access, or backend-default" } };
-        } else if (std.mem.startsWith(u8, args[i], "--sandbox=")) {
-            o.sandbox = std.meta.stringToEnum(SandboxPolicy, args[i]["--sandbox=".len..]) orelse return .{ .err = .{ .invalid_loop_arguments = "--sandbox requires read-only, workspace-write, danger-full-access, or backend-default" } };
-        } else if (std.mem.eql(u8, args[i], "--yolo")) {
+        } else if (std.mem.startsWith(u8, arg, "--sandbox=")) {
+            o.sandbox = std.meta.stringToEnum(SandboxPolicy, arg["--sandbox=".len..]) orelse return .{ .err = .{ .invalid_loop_arguments = "--sandbox requires read-only, workspace-write, danger-full-access, or backend-default" } };
+        } else if (std.mem.eql(u8, arg, "--yolo")) {
             o.yolo = true;
-        } else return .{ .err = .{ .unknown_option = args[i] } };
+        } else return .{ .err = .{ .unknown_option = arg } };
     }
     if (o.sandbox != null and o.yolo) return .{ .err = .{ .invalid_loop_arguments = "--sandbox cannot be combined with --yolo" } };
+    o.env = env_entries.toOwnedSlice(allocator) catch return outOfMemory();
+    o.env_files = env_files.toOwnedSlice(allocator) catch {
+        allocator.free(o.env);
+        return outOfMemory();
+    };
+    o.path_prepend = paths.toOwnedSlice(allocator) catch {
+        allocator.free(o.env);
+        allocator.free(o.env_files);
+        return outOfMemory();
+    };
     return .{ .ok = .{ .@"resume" = o } };
+}
+
+fn optionValue(args: []const []const u8, index: *usize, name: []const u8) ?[]const u8 {
+    const arg = args[index.*];
+    if (std.mem.eql(u8, arg, name)) {
+        if (index.* + 1 >= args.len) return null;
+        index.* += 1;
+        return args[index.*];
+    }
+    if (arg.len > name.len and std.mem.startsWith(u8, arg, name) and arg[name.len] == '=') return arg[name.len + 1 ..];
+    return null;
+}
+
+fn needsValue(arg: []const u8) bool {
+    for ([_][]const u8{ "--env", "--env-file", "--path-prepend", "--backend-bin", "--verifier-bin", "--model", "--verifier-model", "--reasoning-effort", "--verifier-reasoning-effort", "--log-dir" }) |name| {
+        if (std.mem.eql(u8, arg, name)) return true;
+    }
+    return false;
+}
+
+pub fn parseEnvAssignment(value: []const u8) ?EnvEntry {
+    const separator = std.mem.indexOfScalar(u8, value, '=') orelse return null;
+    const key = value[0..separator];
+    if (!validEnvKey(key)) return null;
+    return .{ .key = key, .value = value[separator + 1 ..] };
+}
+
+pub fn validEnvKey(key: []const u8) bool {
+    if (key.len == 0 or std.ascii.eqlIgnoreCase(key, "MATCHA_LOOP_ID")) return false;
+    for (key, 0..) |byte, index| {
+        if (index == 0 and !std.ascii.isAlphabetic(byte) and byte != '_') return false;
+        if (index > 0 and !std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    }
+    return true;
+}
+
+fn outOfMemory() LoopCommandResult {
+    return .{ .err = .{ .invalid_loop_arguments = "out of memory" } };
 }
 
 fn parseUpdate(args: []const []const u8) LoopCommandResult {
@@ -583,4 +757,66 @@ test "run and resume parse explicit sandbox without approval bypass" {
         &.{ "resume", "--sandbox" },
         &.{ "resume", "--sandbox=" },
     }) |args| try std.testing.expect(parseLoopCommand(std.testing.allocator, args, true, "") == .err);
+}
+
+test "resume accepts only presence-aware execution overrides" {
+    const a = std.testing.allocator;
+    const parsed = parseLoopCommand(a, &.{ "resume", "--last", "--objective", "repair", "--env", "JAVA_HOME=/jdk=a", "--env=EMPTY=", "--env-file", "one.env", "--env-file=two.env", "--path-prepend", "bin1", "--path-prepend=bin2", "--backend-bin=./worker", "--verifier-bin=", "--model=", "--verifier-model=check", "--reasoning-effort=high", "--verifier-reasoning-effort=", "--log-dir=logs" }, true, "");
+    try std.testing.expect(parsed == .ok);
+    const value = parsed.ok.@"resume";
+    defer deinitParsedResume(a, value);
+    try std.testing.expect(value.last);
+    try std.testing.expectEqualStrings("repair", value.objective.?);
+    try std.testing.expectEqualStrings("/jdk=a", value.env[0].value);
+    try std.testing.expectEqualStrings("", value.env[1].value);
+    try std.testing.expectEqual(@as(usize, 2), value.env_files.len);
+    try std.testing.expectEqual(@as(usize, 2), value.path_prepend.len);
+    try std.testing.expect(value.path_prepend_explicit);
+    try std.testing.expectEqualStrings("./worker", value.backend_bin.?);
+    try std.testing.expect(value.verifier_bin_explicit and value.verifier_bin == null);
+    try std.testing.expect(value.model_explicit and value.model == null);
+    try std.testing.expectEqualStrings("check", value.verifier_model.?);
+    try std.testing.expectEqualStrings("high", value.reasoning_effort.?);
+    try std.testing.expect(value.verifier_reasoning_explicit and value.verifier_reasoning_effort == null);
+    try std.testing.expectEqualStrings("logs", value.log_dir.?);
+    for ([_][]const u8{ "--config=x", "--prompt-file=x", "--backend=agy", "--verifier=droid", "--max-turns=2", "--token-budget=2", "new prompt" }) |flag| {
+        try std.testing.expect(parseLoopCommand(a, &.{ "resume", "id", flag }, true, "") == .err);
+    }
+    try std.testing.expect(parseLoopCommand(a, &.{ "resume", "id", "--env=MATCHA_LOOP_ID=other" }, true, "") == .err);
+    try std.testing.expect(parseLoopCommand(a, &.{ "resume", "id", "--env=BAD-NAME=value" }, true, "") == .err);
+    try std.testing.expect(parseLoopCommand(a, &.{ "resume", "id", "--env" }, true, "") == .err);
+    try std.testing.expect(parseLoopCommand(a, &.{ "resume", "id", "--last" }, true, "") == .err);
+}
+
+test "resume parser frees partial override arrays on allocation failure" {
+    const a = std.testing.allocator;
+    var completed = false;
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const parsed = parseLoopCommand(failing.allocator(), &.{ "resume", "id", "--env=A=1", "--env=B=2", "--env-file=one", "--path-prepend=bin" }, true, "");
+        switch (parsed) {
+            .ok => |command| deinitParsedResume(failing.allocator(), command.@"resume"),
+            .err => {},
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+}
+
+test "run parser accepts repeatable environment and reasoning settings" {
+    const a = std.testing.allocator;
+    const parsed = parseLoopCommand(a, &.{ "task", "--env=A=first", "--env=A=second", "--env-file=one.env", "--path-prepend=bin-one", "--path-prepend=bin-two", "--reasoning-effort=high", "--verifier-reasoning-effort=medium" }, true, "");
+    try std.testing.expect(parsed == .ok);
+    const run_options = parsed.ok.run;
+    defer deinitParsedRun(a, run_options);
+    try std.testing.expectEqual(@as(usize, 2), run_options.env.len);
+    try std.testing.expectEqualStrings("second", run_options.env[1].value);
+    try std.testing.expectEqualStrings("one.env", run_options.env_files[0]);
+    try std.testing.expectEqualStrings("bin-two", run_options.path_prepend[1]);
+    try std.testing.expectEqualStrings("high", run_options.reasoning_effort.?);
+    try std.testing.expectEqualStrings("medium", run_options.verifier_options.reasoning_effort.?);
 }
