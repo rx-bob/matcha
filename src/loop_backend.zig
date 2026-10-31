@@ -1,7 +1,247 @@
 const std = @import("std");
 const options = @import("loop_options.zig");
+const stream = @import("loop_stream.zig");
 
 pub const BackendKind = options.BackendKind;
+
+pub const OnSessionId = *const fn (?*anyopaque, []const u8) anyerror!void;
+pub const OnChildId = *const fn (?*anyopaque, ?std.process.Child.Id) void;
+
+pub const TurnRequest = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    backend: BackendKind,
+    argv: []const []const u8,
+    environ_map: *const std.process.Environ.Map,
+    loop_id: []const u8,
+    loop_dir: []const u8,
+    prompt: []const u8,
+    cwd: std.process.Child.Cwd = .inherit,
+    event_context: ?*anyopaque = null,
+    event_handler: ?stream.EventHandler = null,
+    session_context: ?*anyopaque = null,
+    on_session_id: ?OnSessionId = null,
+    child_context: ?*anyopaque = null,
+    on_child_id: ?OnChildId = null,
+    diagnostics: ?*std.Io.Writer = null,
+};
+
+pub const TurnExecutionResult = struct {
+    allocator: std.mem.Allocator,
+    exit_code: i32,
+    session_id: ?[]u8,
+    tokens_used: u64,
+    last_assistant_text: ?[]u8,
+    stderr_tail: []u8,
+    was_interrupted: bool,
+
+    pub fn deinit(self: *TurnExecutionResult) void {
+        if (self.session_id) |value| self.allocator.free(value);
+        if (self.last_assistant_text) |value| self.allocator.free(value);
+        self.allocator.free(self.stderr_tail);
+        self.* = undefined;
+    }
+};
+
+/// Injectable backend runner, matching the callback shape used by CLI runners.
+pub const BackendRunner = struct {
+    context: *anyopaque,
+    runTurnFn: *const fn (context: *anyopaque, request: TurnRequest) anyerror!TurnExecutionResult,
+
+    pub fn runTurn(self: BackendRunner, request: TurnRequest) anyerror!TurnExecutionResult {
+        return self.runTurnFn(self.context, request);
+    }
+};
+
+pub const RealBackendRunner = struct {
+    pub fn runner(self: *RealBackendRunner) BackendRunner {
+        return .{ .context = @ptrCast(self), .runTurnFn = RealBackendRunner.runTurn };
+    }
+
+    fn runTurn(context: *anyopaque, request: TurnRequest) anyerror!TurnExecutionResult {
+        _ = context;
+        return executeTurn(request);
+    }
+};
+
+const stderr_tail_capacity = 8 * 1024;
+
+/// Spawn a backend, stream its stdout events, drain stderr concurrently, and return after wait.
+pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
+    try writePromptFile(request);
+
+    var child = std.process.spawn(request.io, .{
+        .argv = request.argv,
+        .cwd = request.cwd,
+        .environ_map = request.environ_map,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
+        if (err == error.FileNotFound) {
+            if (request.diagnostics) |diagnostics| {
+                try diagnostics.print("required backend CLI '{s}' was not found on PATH\n", .{@tagName(request.backend)});
+                try diagnostics.flush();
+            }
+            return error.BackendNotFound;
+        }
+        return err;
+    };
+    defer child.kill(request.io);
+
+    const child_id = child.id;
+    if (request.on_child_id) |callback| callback(request.child_context, child_id);
+    defer if (request.on_child_id) |callback| callback(request.child_context, null);
+
+    const stdin_file = child.stdin orelse return error.MissingChildStdin;
+    const stdout_file = child.stdout orelse return error.MissingChildStdout;
+    const stderr_file = child.stderr orelse return error.MissingChildStderr;
+
+    var stderr_drain = StderrDrain.init(request.io, stderr_file);
+    var stderr_thread = try std.Thread.spawn(.{}, StderrDrain.run, .{&stderr_drain});
+    var stdin_write = StdinWrite.init(request.io, stdin_file, request.prompt);
+    var stdin_thread = try std.Thread.spawn(.{}, StdinWrite.run, .{&stdin_write});
+
+    var accumulator: stream.TurnAccumulator = .{};
+    defer accumulator.deinit(request.allocator);
+    var callback_state = StreamCallbackState{
+        .request = request,
+    };
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout_reader = stdout_file.readerStreaming(request.io, &stdout_buffer);
+    const stream_result = stream.readStream(request.allocator, &stdout_reader.interface, request.backend, &accumulator, &callback_state, StreamCallbackState.handle);
+
+    stdin_thread.join();
+    stderr_thread.join();
+    // The worker threads closed these pipe handles, so prevent Child.wait from closing
+    // the same descriptors a second time during child cleanup.
+    child.stdin = null;
+    child.stderr = null;
+    const term = try child.wait(request.io);
+
+    try stream_result;
+    if (callback_state.callback_error) |err| return err;
+    if (stdin_write.write_error) return error.ChildStdinWriteFailed;
+    if (stderr_drain.read_error) return error.ChildStderrReadFailed;
+
+    const session_id = if (accumulator.session_id) |value| try request.allocator.dupe(u8, value) else null;
+    errdefer if (session_id) |value| request.allocator.free(value);
+    const last_assistant_text = if (accumulator.last_assistant_message) |value| try request.allocator.dupe(u8, value) else null;
+    errdefer if (last_assistant_text) |value| request.allocator.free(value);
+    const stderr_tail = try stderr_drain.toOwnedSlice(request.allocator);
+    errdefer request.allocator.free(stderr_tail);
+    return .{
+        .allocator = request.allocator,
+        .exit_code = switch (term) {
+            .exited => |code| code,
+            else => -1,
+        },
+        .session_id = session_id,
+        .tokens_used = accumulator.tokens_used,
+        .last_assistant_text = last_assistant_text,
+        .stderr_tail = stderr_tail,
+        .was_interrupted = term != .exited,
+    };
+}
+
+fn writePromptFile(request: TurnRequest) !void {
+    const prompt_path = try std.fmt.allocPrint(request.allocator, "{s}{c}current_prompt.md", .{
+        request.loop_dir,
+        std.Io.Dir.path.sep,
+    });
+    defer request.allocator.free(prompt_path);
+    const file = try std.Io.Dir.cwd().createFile(request.io, prompt_path, .{ .truncate = true });
+    defer file.close(request.io);
+    try file.writeStreamingAll(request.io, request.prompt);
+}
+
+const StreamCallbackState = struct {
+    request: TurnRequest,
+    callback_error: ?anyerror = null,
+
+    fn handle(context: ?*anyopaque, event: stream.NormalizedEvent) void {
+        const self: *StreamCallbackState = @ptrCast(@alignCast(context.?));
+        if (event == .session_id and self.request.on_session_id != null and self.callback_error == null) {
+            self.request.on_session_id.?(self.request.session_context, event.session_id) catch |err| {
+                self.callback_error = err;
+            };
+        }
+        if (self.request.event_handler) |handler| handler(self.request.event_context, event);
+    }
+};
+
+const StdinWrite = struct {
+    io: std.Io,
+    file: std.Io.File,
+    prompt: []const u8,
+    write_error: bool = false,
+
+    fn init(io: std.Io, file: std.Io.File, prompt: []const u8) StdinWrite {
+        return .{ .io = io, .file = file, .prompt = prompt };
+    }
+
+    fn run(self: *StdinWrite) void {
+        self.file.writeStreamingAll(self.io, self.prompt) catch {
+            self.write_error = true;
+        };
+        self.file.close(self.io);
+    }
+};
+
+const StderrDrain = struct {
+    io: std.Io,
+    file: std.Io.File,
+    bytes: [stderr_tail_capacity]u8 = undefined,
+    start: usize = 0,
+    len: usize = 0,
+    read_error: bool = false,
+
+    fn init(io: std.Io, file: std.Io.File) StderrDrain {
+        return .{ .io = io, .file = file };
+    }
+
+    fn run(self: *StderrDrain) void {
+        var buffer: [4096]u8 = undefined;
+        while (true) {
+            const count = self.file.readStreaming(self.io, &.{&buffer}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    self.read_error = true;
+                    break;
+                },
+            };
+            if (count == 0) break;
+            self.append(buffer[0..count]);
+        }
+        self.file.close(self.io);
+    }
+
+    fn append(self: *StderrDrain, incoming: []const u8) void {
+        if (incoming.len >= self.bytes.len) {
+            @memcpy(&self.bytes, incoming[incoming.len - self.bytes.len ..]);
+            self.start = 0;
+            self.len = self.bytes.len;
+            return;
+        }
+        for (incoming) |byte| {
+            if (self.len < self.bytes.len) {
+                self.bytes[(self.start + self.len) % self.bytes.len] = byte;
+                self.len += 1;
+            } else {
+                self.bytes[self.start] = byte;
+                self.start = (self.start + 1) % self.bytes.len;
+            }
+        }
+    }
+
+    fn toOwnedSlice(self: *const StderrDrain, allocator: std.mem.Allocator) ![]u8 {
+        const result = try allocator.alloc(u8, self.len);
+        const first = @min(self.len, self.bytes.len - self.start);
+        @memcpy(result[0..first], self.bytes[self.start .. self.start + first]);
+        if (first < self.len) @memcpy(result[first..], self.bytes[0 .. self.len - first]);
+        return result;
+    }
+};
 
 /// Owns all strings in `items`; callers own the returned value and must deinit it.
 pub const Argv = struct {
@@ -266,6 +506,154 @@ test "native resume command uses backend attach syntax" {
         try std.testing.expectEqualStrings(expected[i], command);
     }
 }
+
+test "real runner streams events, captures early session, stdin, stderr, and exit status" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const loop_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(loop_dir);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const absolute_loop_dir = try std.fs.path.resolve(allocator, &.{ cwd, loop_dir });
+    defer allocator.free(absolute_loop_dir);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("PATH", "/bin:/usr/bin");
+
+    const script =
+        \\payload=$(cat)
+        \\[ "${#payload}" -eq 12000 ] || exit 9
+        \\printf '{"type":"thread.started","thread_id":"sid-early"}\n'
+        \\sleep 0.05
+        \\printf '{"type":"item.completed","item":{"type":"agent_message","text":"answer"}}\n'
+        \\printf '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":2}}\n'
+        \\printf 'begin-'
+        \\i=0; while [ "$i" -lt 9000 ]; do printf x; i=$((i + 1)); done
+        \\printf '%s\n' '-stderr-tail-marker' >&2
+        \\exit 7
+    ;
+    const argv = [_][]const u8{ "/bin/sh", "-c", script };
+    var events = RunnerEventCapture{};
+    var callbacks = RunnerCallbackCapture{ .allocator = allocator };
+    defer if (callbacks.session_id) |id| allocator.free(id);
+    var runner_impl: RealBackendRunner = .{};
+    const request = TurnRequest{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .backend = .codex,
+        .argv = &argv,
+        .environ_map = &environ,
+        .loop_id = "loop-1",
+        .loop_dir = absolute_loop_dir,
+        .prompt = try allocator.alloc(u8, 12000),
+        .event_context = &events,
+        .event_handler = RunnerEventCapture.handle,
+        .session_context = &callbacks,
+        .on_session_id = RunnerCallbackCapture.session,
+        .child_context = &callbacks,
+        .on_child_id = RunnerCallbackCapture.child,
+    };
+    @memset(@constCast(request.prompt), 'p');
+    defer allocator.free(@constCast(request.prompt));
+
+    var result = try runner_impl.runner().runTurn(request);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i32, 7), result.exit_code);
+    try std.testing.expect(!result.was_interrupted);
+    try std.testing.expectEqualStrings("sid-early", callbacks.session_id.?);
+    try std.testing.expect(callbacks.child_started and callbacks.child_cleared and callbacks.session_arrived_while_running);
+    try std.testing.expectEqualStrings("answer", result.last_assistant_text.?);
+    try std.testing.expectEqual(@as(u64, 6), result.tokens_used);
+    try std.testing.expect(events.session_count == 1 and events.assistant_count == 1);
+    try std.testing.expect(result.stderr_tail.len <= stderr_tail_capacity);
+    try std.testing.expect(std.mem.endsWith(u8, result.stderr_tail, "-stderr-tail-marker\n"));
+    const prompt_path = try std.fmt.allocPrint(allocator, "{s}/current_prompt.md", .{absolute_loop_dir});
+    defer allocator.free(prompt_path);
+    const saved_prompt = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, prompt_path, allocator, .limited(20000));
+    defer allocator.free(saved_prompt);
+    try std.testing.expect(saved_prompt.len == 12000);
+
+    const success_script = "cat >/dev/null; printf '{\"type\":\"turn.completed\"}\\n'; exit 0";
+    const success_argv = [_][]const u8{ "/bin/sh", "-c", success_script };
+    var success_request = request;
+    success_request.argv = &success_argv;
+    success_request.prompt = "short prompt";
+    success_request.event_context = null;
+    success_request.event_handler = null;
+    success_request.session_context = null;
+    success_request.on_session_id = null;
+    success_request.child_context = null;
+    success_request.on_child_id = null;
+    var success = try runner_impl.runner().runTurn(success_request);
+    defer success.deinit();
+    try std.testing.expectEqual(@as(i32, 0), success.exit_code);
+    try std.testing.expect(!success.was_interrupted);
+}
+
+test "real runner diagnoses a missing backend executable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const loop_dir = try std.fs.path.resolve(allocator, &.{ cwd, ".zig-cache/tmp", &tmp.sub_path });
+    defer allocator.free(loop_dir);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("PATH", "/bin:/usr/bin");
+    const argv = [_][]const u8{"/does/not/exist/matcha-test-backend"};
+    var diagnostic = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostic.deinit();
+    const request = TurnRequest{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .backend = .agy,
+        .argv = &argv,
+        .environ_map = &environ,
+        .loop_id = "loop-1",
+        .loop_dir = loop_dir,
+        .prompt = "prompt",
+        .diagnostics = &diagnostic.writer,
+    };
+    var runner_impl: RealBackendRunner = .{};
+    try std.testing.expectError(error.BackendNotFound, runner_impl.runner().runTurn(request));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.written(), "agy") != null);
+}
+
+const RunnerEventCapture = struct {
+    session_count: usize = 0,
+    assistant_count: usize = 0,
+
+    fn handle(context: ?*anyopaque, event: stream.NormalizedEvent) void {
+        const self: *RunnerEventCapture = @ptrCast(@alignCast(context.?));
+        switch (event) {
+            .session_id => self.session_count += 1,
+            .assistant_text => self.assistant_count += 1,
+            else => {},
+        }
+    }
+};
+
+const RunnerCallbackCapture = struct {
+    allocator: std.mem.Allocator,
+    session_id: ?[]const u8 = null,
+    child_started: bool = false,
+    child_cleared: bool = false,
+    session_arrived_while_running: bool = false,
+
+    fn session(context: ?*anyopaque, id: []const u8) anyerror!void {
+        const self: *RunnerCallbackCapture = @ptrCast(@alignCast(context.?));
+        self.session_id = try self.allocator.dupe(u8, id);
+        self.session_arrived_while_running = self.child_started and !self.child_cleared;
+    }
+
+    fn child(context: ?*anyopaque, id: ?std.process.Child.Id) void {
+        const self: *RunnerCallbackCapture = @ptrCast(@alignCast(context.?));
+        if (id == null) self.child_cleared = true else self.child_started = true;
+    }
+};
 
 fn expectArgv(actual: *const Argv, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, actual.items.len);
