@@ -26,6 +26,7 @@ pub const TurnRequest = struct {
     on_child_id: ?OnChildId = null,
     diagnostics: ?*std.Io.Writer = null,
     log_pair: ?*loop_log.Pair = null,
+    log_context: loop_log.Pair.Context = .{},
 };
 
 pub const TurnExecutionResult = struct {
@@ -188,7 +189,7 @@ pub fn executeTurn(request: TurnRequest) anyerror!TurnExecutionResult {
     const stdout_file = child.stdout orelse return error.MissingChildStdout;
     const stderr_file = child.stderr orelse return error.MissingChildStderr;
 
-    var stderr_drain = StderrDrain.init(request.io, stderr_file, request.log_pair, request.loop_id);
+    var stderr_drain = StderrDrain.init(request.io, stderr_file, request.log_pair, request.loop_id, request.log_context);
     var stderr_thread = try std.Thread.spawn(.{}, StderrDrain.run, .{&stderr_drain});
     var stdin_write = StdinWrite.init(request.io, stdin_file, request.prompt);
     var stdin_thread = std.Thread.spawn(.{}, StdinWrite.run, .{&stdin_write}) catch |err| {
@@ -264,12 +265,37 @@ const StreamCallbackState = struct {
             };
         }
         if (self.request.event_handler) |handler| handler(self.request.event_context, event);
+        if (self.request.log_pair) |pair| {
+            const kind: []const u8, const payload: []const u8 = switch (event) {
+                .session_id => |value| .{ "session", value },
+                .assistant_text => |value| .{ "assistant", value },
+                .tool_call => |tool| blk: {
+                    pair.recordContext(self.request.io, self.request.loop_id, self.request.log_context, "tool", tool.name) catch |err| {
+                        self.callback_error = err;
+                    };
+                    break :blk .{ "tool_detail", tool.detail };
+                },
+                .error_message => |value| .{ "error", value },
+                .token_usage => |usage| blk: {
+                    var buffer: [80]u8 = undefined;
+                    const value = std.fmt.bufPrint(&buffer, "input={d} output={d} total={d}", .{ usage.input_tokens, usage.output_tokens, usage.total_tokens }) catch break :blk .{ "usage", "usage" };
+                    pair.recordContext(self.request.io, self.request.loop_id, self.request.log_context, "usage", value) catch |err| {
+                        self.callback_error = err;
+                    };
+                    return;
+                },
+                .ignored => return,
+            };
+            pair.recordContext(self.request.io, self.request.loop_id, self.request.log_context, kind, payload) catch |err| {
+                self.callback_error = err;
+            };
+        }
     }
 };
 
 fn rawStdout(context: ?*anyopaque, bytes: []const u8) anyerror!void {
     const request: *const TurnRequest = @ptrCast(@alignCast(context.?));
-    if (request.log_pair) |pair| try pair.raw(request.io, request.loop_id, "stdout", bytes);
+    if (request.log_pair) |pair| try pair.rawContext(request.io, request.loop_id, request.log_context, "stdout", bytes);
 }
 
 const StdinWrite = struct {
@@ -299,9 +325,10 @@ const StderrDrain = struct {
     read_error: bool = false,
     log_pair: ?*loop_log.Pair,
     loop_id: []const u8,
+    log_context: loop_log.Pair.Context,
 
-    fn init(io: std.Io, file: std.Io.File, log_pair: ?*loop_log.Pair, loop_id: []const u8) StderrDrain {
-        return .{ .io = io, .file = file, .log_pair = log_pair, .loop_id = loop_id };
+    fn init(io: std.Io, file: std.Io.File, log_pair: ?*loop_log.Pair, loop_id: []const u8, log_context: loop_log.Pair.Context) StderrDrain {
+        return .{ .io = io, .file = file, .log_pair = log_pair, .loop_id = loop_id, .log_context = log_context };
     }
 
     fn run(self: *StderrDrain) void {
@@ -315,10 +342,16 @@ const StderrDrain = struct {
                 },
             };
             if (count == 0) break;
-            if (self.log_pair) |pair| pair.raw(self.io, self.loop_id, "stderr", buffer[0..count]) catch {
-                self.read_error = true;
-                break;
-            };
+            if (self.log_pair) |pair| {
+                pair.rawContext(self.io, self.loop_id, self.log_context, "stderr", buffer[0..count]) catch {
+                    self.read_error = true;
+                    break;
+                };
+                pair.stderr(self.io, self.loop_id, self.log_context, buffer[0..count]) catch {
+                    self.read_error = true;
+                    break;
+                };
+            }
             self.append(buffer[0..count]);
         }
         self.file.close(self.io);
@@ -746,6 +779,7 @@ test "real runner streams events, captures early session, stdin, stderr, and exi
         \\printf '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":2}}\n'
         \\printf 'begin-'
         \\i=0; while [ "$i" -lt 9000 ]; do printf x; i=$((i + 1)); done
+        \\i=0; while [ "$i" -lt 9000 ]; do printf y >&2; i=$((i + 1)); done
         \\printf '%s\n' '-stderr-tail-marker' >&2
         \\exit 7
     ;
@@ -754,6 +788,8 @@ test "real runner streams events, captures early session, stdin, stderr, and exi
     var callbacks = RunnerCallbackCapture{ .allocator = allocator };
     defer if (callbacks.session_id) |id| allocator.free(id);
     var runner_impl: RealBackendRunner = .{};
+    var pair = try loop_log.open(allocator, std.testing.io, absolute_loop_dir, "loop-1");
+    defer pair.deinit(std.testing.io);
     const request = TurnRequest{
         .allocator = allocator,
         .io = std.testing.io,
@@ -769,6 +805,8 @@ test "real runner streams events, captures early session, stdin, stderr, and exi
         .on_session_id = RunnerCallbackCapture.session,
         .child_context = &callbacks,
         .on_child_id = RunnerCallbackCapture.child,
+        .log_pair = &pair,
+        .log_context = .{ .turn = 1, .role = "worker", .backend = "codex", .attempt = 1 },
     };
     @memset(@constCast(request.prompt), 'p');
     defer allocator.free(@constCast(request.prompt));
@@ -784,6 +822,38 @@ test "real runner streams events, captures early session, stdin, stderr, and exi
     try std.testing.expect(events.session_count == 1 and events.assistant_count == 1);
     try std.testing.expect(result.stderr_tail.len <= stderr_tail_capacity);
     try std.testing.expect(std.mem.endsWith(u8, result.stderr_tail, "-stderr-tail-marker\n"));
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.log", .{ absolute_loop_dir, pair.invocation_id });
+    defer allocator.free(log_path);
+    const readable = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, log_path, allocator, .unlimited);
+    defer allocator.free(readable);
+    try std.testing.expect(std.mem.indexOf(u8, readable, "assistant: answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readable, "-stderr-tail-marker") != null);
+    const jsonl_path = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonl", .{ absolute_loop_dir, pair.invocation_id });
+    defer allocator.free(jsonl_path);
+    const jsonl = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, jsonl_path, allocator, .unlimited);
+    defer allocator.free(jsonl);
+    var stdout_bytes: std.ArrayList(u8) = .empty;
+    defer stdout_bytes.deinit(allocator);
+    var stderr_bytes: std.ArrayList(u8) = .empty;
+    defer stderr_bytes.deinit(allocator);
+    var lines = std.mem.tokenizeScalar(u8, jsonl, '\n');
+    while (lines.next()) |line| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const value = parsed.value;
+        if (!std.mem.eql(u8, value.object.get("kind").?.string, "raw")) continue;
+        const encoded = value.object.get("payload").?.string;
+        const decoded = try allocator.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+        defer allocator.free(decoded);
+        try std.base64.standard.Decoder.decode(decoded, encoded);
+        const target = if (std.mem.eql(u8, value.object.get("stream").?.string, "stdout")) &stdout_bytes else &stderr_bytes;
+        try target.appendSlice(allocator, decoded);
+        try std.testing.expectEqual(@as(i64, 1), value.object.get("attempt").?.integer);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, stdout_bytes.items, "{\"type\":\"thread.started\""));
+    try std.testing.expect(std.mem.endsWith(u8, stdout_bytes.items, "begin-" ++ ("x" ** 9000)));
+    try std.testing.expectEqual(@as(usize, 9000 + "-stderr-tail-marker\n".len), stderr_bytes.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, stderr_bytes.items, "y" ** 9000));
     const prompt_path = try std.fmt.allocPrint(allocator, "{s}/current_prompt.md", .{absolute_loop_dir});
     defer allocator.free(prompt_path);
     const saved_prompt = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, prompt_path, allocator, .limited(20000));

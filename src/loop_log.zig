@@ -30,17 +30,19 @@ pub const Pair = struct {
         defer self.unlock();
         self.sequence += 1;
         const stamp = std.Io.Clock.real.now(io).toMilliseconds();
-        var event_buffer: [1024]u8 = undefined;
-        var event_writer = self.events.writer(io, &event_buffer);
-        try event_writer.interface.print("{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":{f},\"invocation_id\":{f},\"turn\":{f},\"role\":{f},\"backend\":{f},\"attempt\":{f},\"kind\":{f},\"payload\":{f}}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), std.json.fmt(self.invocation_id, .{}), std.json.fmt(context.turn, .{}), std.json.fmt(context.role, .{}), std.json.fmt(context.backend, .{}), std.json.fmt(context.attempt, .{}), std.json.fmt(kind, .{}), std.json.fmt(payload, .{}) });
-        try event_writer.interface.flush();
-        var readable_buffer: [512]u8 = undefined;
-        var readable_writer = self.readable.writer(io, &readable_buffer);
-        try readable_writer.interface.print("[{d}] {s}: {s}\n", .{ self.sequence, kind, payload });
-        try readable_writer.interface.flush();
+        const event_line = try std.fmt.allocPrint(self.allocator, "{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":{f},\"invocation_id\":{f},\"turn\":{f},\"role\":{f},\"backend\":{f},\"attempt\":{f},\"kind\":{f},\"payload\":{f}}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), std.json.fmt(self.invocation_id, .{}), std.json.fmt(context.turn, .{}), std.json.fmt(context.role, .{}), std.json.fmt(context.backend, .{}), std.json.fmt(context.attempt, .{}), std.json.fmt(kind, .{}), std.json.fmt(payload, .{}) });
+        defer self.allocator.free(event_line);
+        try self.events.writeStreamingAll(io, event_line);
+        const readable_line = try std.fmt.allocPrint(self.allocator, "[{d}] {s}: {s}\n", .{ self.sequence, kind, payload });
+        defer self.allocator.free(readable_line);
+        try self.readable.writeStreamingAll(io, readable_line);
     }
 
     pub fn raw(self: *Pair, io: std.Io, loop_id: []const u8, stream_name: []const u8, bytes: []const u8) !void {
+        return self.rawContext(io, loop_id, .{}, stream_name, bytes);
+    }
+
+    pub fn rawContext(self: *Pair, io: std.Io, loop_id: []const u8, context: Context, stream_name: []const u8, bytes: []const u8) !void {
         var offset: usize = 0;
         while (offset < bytes.len) {
             const chunk = bytes[offset..@min(offset + 3072, bytes.len)];
@@ -50,11 +52,33 @@ pub const Pair = struct {
             defer self.unlock();
             self.sequence += 1;
             const stamp = std.Io.Clock.real.now(io).toMilliseconds();
-            var out_buffer: [5120]u8 = undefined;
-            var writer = self.events.writer(io, &out_buffer);
-            try writer.interface.print("{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":{f},\"invocation_id\":{f},\"kind\":\"raw\",\"stream\":{f},\"encoding\":\"base64\",\"payload\":\"{s}\"}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), std.json.fmt(self.invocation_id, .{}), std.json.fmt(stream_name, .{}), text });
-            try writer.interface.flush();
+            const line = try std.fmt.allocPrint(self.allocator, "{{\"schema_version\":1,\"timestamp_ms\":{d},\"sequence\":{d},\"loop_id\":{f},\"invocation_id\":{f},\"turn\":{f},\"role\":{f},\"backend\":{f},\"attempt\":{f},\"kind\":\"raw\",\"stream\":{f},\"encoding\":\"base64\",\"payload\":\"{s}\"}}\n", .{ stamp, self.sequence, std.json.fmt(loop_id, .{}), std.json.fmt(self.invocation_id, .{}), std.json.fmt(context.turn, .{}), std.json.fmt(context.role, .{}), std.json.fmt(context.backend, .{}), std.json.fmt(context.attempt, .{}), std.json.fmt(stream_name, .{}), text });
+            defer self.allocator.free(line);
+            try self.events.writeStreamingAll(io, line);
             offset += chunk.len;
+        }
+    }
+
+    pub fn stderr(self: *Pair, io: std.Io, loop_id: []const u8, context: Context, bytes: []const u8) !void {
+        var offset: usize = 0;
+        const hex = "0123456789abcdef";
+        while (offset < bytes.len) {
+            var rendered: [4096]u8 = undefined;
+            var len: usize = 0;
+            while (offset < bytes.len and len <= rendered.len - 4) : (offset += 1) {
+                const byte = bytes[offset];
+                if (byte == '\n' or byte == '\t' or (byte >= 32 and byte < 127)) {
+                    rendered[len] = byte;
+                    len += 1;
+                } else {
+                    rendered[len] = '\\';
+                    rendered[len + 1] = 'x';
+                    rendered[len + 2] = hex[byte >> 4];
+                    rendered[len + 3] = hex[byte & 15];
+                    len += 4;
+                }
+            }
+            try self.recordContext(io, loop_id, context, "stderr", rendered[0..len]);
         }
     }
 

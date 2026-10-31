@@ -403,6 +403,7 @@ fn runExistingBody(services: Services, run_options: options.RunOptions, id: []co
             .on_child_id = childIdChanged,
             .diagnostics = services.stderr,
             .log_pair = if (log_pair.*) |*pair| pair else null,
+            .log_context = log_context,
         };
         if (role == .worker) {
             request.session_context = &persist_context;
@@ -559,7 +560,10 @@ fn runWithRetries(services: Services, request: backend.TurnRequest, log_pair: ?*
             attempt_context.attempt = @intCast(retry_index + 1);
             try pair.recordContext(services.io, request.loop_id, attempt_context, "attempt_start", "backend attempt started");
         }
-        var result = try services.runner.runTurn(request);
+        var attempt_request = request;
+        attempt_request.log_context = log_context;
+        attempt_request.log_context.attempt = @intCast(retry_index + 1);
+        var result = try services.runner.runTurn(attempt_request);
         var result_owned = true;
         errdefer if (result_owned) result.deinit();
         if (log_pair) |pair| {

@@ -757,6 +757,7 @@ pub fn readStreamRaw(
     raw_context: ?*anyopaque,
     raw_handler: ?RawHandler,
 ) anyerror!void {
+    if (raw_handler) |raw| return readStreamBounded(allocator, reader, backend, accumulator, context, handler, raw_context, raw);
     var line_arena = std.heap.ArenaAllocator.init(allocator);
     defer line_arena.deinit();
 
@@ -786,6 +787,69 @@ pub fn readStreamRaw(
         try processLine(allocator, line_arena.allocator(), line, backend, accumulator, context, handler);
         if (at_eof) return;
     }
+}
+
+fn readStreamBounded(allocator: std.mem.Allocator, reader: *std.Io.Reader, backend: BackendKind, accumulator: *TurnAccumulator, context: ?*anyopaque, handler: EventHandler, raw_context: ?*anyopaque, raw: RawHandler) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var line: [64 * 1024]u8 = undefined;
+    var raw_bytes: [3072]u8 = undefined;
+    var line_len: usize = 0;
+    var raw_len: usize = 0;
+    var oversized = false;
+    while (true) {
+        const byte = reader.takeByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        raw_bytes[raw_len] = byte;
+        raw_len += 1;
+        if (raw_len == raw_bytes.len) {
+            try raw(raw_context, &raw_bytes);
+            raw_len = 0;
+        }
+        if (byte == '\n') {
+            if (!oversized) {
+                _ = arena.reset(.retain_capacity);
+                try processLine(allocator, arena.allocator(), std.mem.trimEnd(u8, line[0..line_len], "\r"), backend, accumulator, context, handler);
+            }
+            line_len = 0;
+            oversized = false;
+        } else if (!oversized) {
+            if (line_len == line.len) oversized = true else {
+                line[line_len] = byte;
+                line_len += 1;
+            }
+        }
+    }
+    if (raw_len > 0) try raw(raw_context, raw_bytes[0..raw_len]);
+    if (!oversized and line_len > 0) {
+        _ = arena.reset(.retain_capacity);
+        try processLine(allocator, arena.allocator(), std.mem.trimEnd(u8, line[0..line_len], "\r"), backend, accumulator, context, handler);
+    }
+}
+
+test "raw stream preserves oversized invalid bytes and unterminated tail" {
+    const RawCapture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn append(context: ?*anyopaque, incoming: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            try self.bytes.appendSlice(std.testing.allocator, incoming);
+        }
+        fn ignore(_: ?*anyopaque, _: NormalizedEvent) void {}
+    };
+    const input = try std.testing.allocator.alloc(u8, 100_003);
+    defer std.testing.allocator.free(input);
+    @memset(input, 'x');
+    input[0] = 0xff;
+    input[70_000] = '\n';
+    var reader: std.Io.Reader = .fixed(input);
+    var accumulator: TurnAccumulator = .{};
+    defer accumulator.deinit(std.testing.allocator);
+    var capture: RawCapture = .{};
+    defer capture.bytes.deinit(std.testing.allocator);
+    try readStreamRaw(std.testing.allocator, &reader, .codex, &accumulator, null, RawCapture.ignore, &capture, RawCapture.append);
+    try std.testing.expectEqualSlices(u8, input, capture.bytes.items);
 }
 
 fn processLine(
