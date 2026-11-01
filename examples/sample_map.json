@@ -40,10 +40,10 @@
       "title": "Generated Artifacts",
       "kind": "folder",
       "elements": [
-        "sample_plan.json",
-        "sample_map.json",
-        "plan.js",
-        "map.js",
+        "examples/sample_plan.json",
+        "examples/sample_map.json",
+        "assets/client/plan.js",
+        "assets/client/map.js",
         "dist/plan.html",
         "dist/map.html"
       ]
@@ -65,10 +65,10 @@
       "id": "planCommand",
       "name": "plan()",
       "kind": "component",
-      "summary": "Reads sample_plan.json and creates a standalone plan browser page.",
+      "summary": "Reads examples/sample_plan.json and creates a standalone plan browser page.",
       "responsibilities": [
         "Embed plan JSON into a script tag.",
-        "Inline plan.css, theme CSS, and plan.js.",
+        "Inline assets/plan.css, theme CSS, and assets/client/plan.js.",
         "Write dist/plan.html."
       ],
       "group": "cli"
@@ -77,10 +77,10 @@
       "id": "mapCommand",
       "name": "map()",
       "kind": "component",
-      "summary": "Reads sample_map.json and creates a standalone UML map page.",
+      "summary": "Reads examples/sample_map.json and creates a standalone UML map page.",
       "responsibilities": [
         "Embed UML JSON into a script tag.",
-        "Inline map.js when the client bundle exists.",
+        "Inline assets/client/map.js when the client bundle exists.",
         "Write dist/map.html."
       ],
       "group": "cli"
@@ -235,29 +235,29 @@
       "group": "client"
     },
     {
-      "id": "sample_plan.json",
-      "name": "sample_plan.json",
+      "id": "examples/sample_plan.json",
+      "name": "examples/sample_plan.json",
       "kind": "note",
       "summary": "Development sample for the plan renderer.",
       "group": "artifacts"
     },
     {
-      "id": "sample_map.json",
-      "name": "sample_map.json",
+      "id": "examples/sample_map.json",
+      "name": "examples/sample_map.json",
       "kind": "note",
       "summary": "Development sample for the map renderer.",
       "group": "artifacts"
     },
     {
-      "id": "plan.js",
-      "name": "plan.js",
+      "id": "assets/client/plan.js",
+      "name": "assets/client/plan.js",
       "kind": "module",
       "summary": "Built IIFE bundle for the plan Svelte app.",
       "group": "artifacts"
     },
     {
-      "id": "map.js",
-      "name": "map.js",
+      "id": "assets/client/map.js",
+      "name": "assets/client/map.js",
       "kind": "module",
       "summary": "Built IIFE bundle for the map Svelte app.",
       "group": "artifacts"
@@ -295,13 +295,13 @@
     {
       "id": "planCommand-reads-sample_plan",
       "from": "planCommand",
-      "to": "sample_plan.json",
+      "to": "examples/sample_plan.json",
       "kind": "reads"
     },
     {
       "id": "mapCommand-reads-sample_map",
       "from": "mapCommand",
-      "to": "sample_map.json",
+      "to": "examples/sample_map.json",
       "kind": "reads"
     },
     {
@@ -319,13 +319,13 @@
     {
       "id": "planCommand-uses-plan_js",
       "from": "planCommand",
-      "to": "plan.js",
+      "to": "assets/client/plan.js",
       "kind": "uses"
     },
     {
       "id": "mapCommand-uses-map_js",
       "from": "mapCommand",
-      "to": "map.js",
+      "to": "assets/client/map.js",
       "kind": "uses"
     },
     {
@@ -374,14 +374,14 @@
     },
     {
       "id": "sample_map-conforms-UmlDiagram",
-      "from": "sample_map.json",
+      "from": "examples/sample_map.json",
       "to": "UmlDiagram",
       "kind": "realization",
       "label": "conforms"
     },
     {
       "id": "sample_plan-conforms-Plan",
-      "from": "sample_plan.json",
+      "from": "examples/sample_plan.json",
       "to": "Plan",
       "kind": "realization",
       "label": "conforms"
@@ -430,7 +430,7 @@
   ],
   "constraints": [
     "LLM-generated map JSON should remain semantic and avoid JointJS cell attributes.",
-    "Renderer development should use sample_map.json as a stable fixture.",
+    "Renderer development should use examples/sample_map.json as a stable fixture.",
     "The eventual JointJS implementation should preserve full-screen pan, zoom, drag, and fit controls."
   ]
 }

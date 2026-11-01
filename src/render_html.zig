@@ -9,8 +9,8 @@ pub const RenderTarget = enum {
 
 pub fn defaultInput(target: RenderTarget) []const u8 {
     return switch (target) {
-        .plan => "sample_plan.json",
-        .map => "sample_map.json",
+        .plan => "examples/sample_plan.json",
+        .map => "examples/sample_map.json",
     };
 }
 
@@ -213,7 +213,7 @@ fn writeThemeBootScript(io: std.Io, file: std.Io.File, storage_key: []const u8) 
 }
 
 test "html renderer defaults match current CLI" {
-    try std.testing.expectEqualStrings("sample_plan.json", defaultInput(.plan));
+    try std.testing.expectEqualStrings("examples/sample_plan.json", defaultInput(.plan));
     try std.testing.expectEqualStrings("dist/map.html", defaultOutput(.map));
 }
 

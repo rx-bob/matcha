@@ -67,12 +67,12 @@ tasks:
       - src/**/*
       - ../assets/*.png
     generates:
-      - ../plan.js
-      - ../plan-components.css
-      - ../map.js
-      - ../map.css
-      - ../serve.js
-      - ../serve.css
+      - ../assets/client/plan.js
+      - ../assets/client/plan-components.css
+      - ../assets/client/map.js
+      - ../assets/client/map.css
+      - ../assets/client/serve.js
+      - ../assets/client/serve.css
     cmds:
       - npm ci
       - npm run build

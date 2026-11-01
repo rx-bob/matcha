@@ -13,37 +13,37 @@ pub const ThemeAsset = struct {
 
 pub const plan_js: TextAsset = .{
     .name = "plan.js",
-    .contents = @embedFile("../plan.js"),
+    .contents = @embedFile("../assets/client/plan.js"),
 };
 
 pub const plan_css: TextAsset = .{
     .name = "plan.css",
-    .contents = @embedFile("../plan.css"),
+    .contents = @embedFile("../assets/plan.css"),
 };
 
 pub const plan_components_css: TextAsset = .{
     .name = "plan-components.css",
-    .contents = @embedFile("../plan-components.css"),
+    .contents = @embedFile("../assets/client/plan-components.css"),
 };
 
 pub const map_js: TextAsset = .{
     .name = "map.js",
-    .contents = @embedFile("../map.js"),
+    .contents = @embedFile("../assets/client/map.js"),
 };
 
 pub const map_css: TextAsset = .{
     .name = "map.css",
-    .contents = @embedFile("../map.css"),
+    .contents = @embedFile("../assets/client/map.css"),
 };
 
 pub const serve_js: TextAsset = .{
     .name = "serve.js",
-    .contents = @embedFile("../serve.js"),
+    .contents = @embedFile("../assets/client/serve.js"),
 };
 
 pub const serve_css: TextAsset = .{
     .name = "serve.css",
-    .contents = @embedFile("../serve.css"),
+    .contents = @embedFile("../assets/client/serve.css"),
 };
 
 pub const llm_output_format: TextAsset = .{

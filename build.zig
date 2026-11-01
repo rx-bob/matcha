@@ -164,10 +164,11 @@ pub fn build(b: *std.Build) void {
 
     const leak_audit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("leak_audit_test.zig"),
+            .root_source_file = b.path("tests/leak_audit_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{.{ .name = "matcha", .module = matcha_module }},
         }),
         .filters = &.{
             "toon rendering releases partial allocations",

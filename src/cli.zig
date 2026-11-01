@@ -1267,7 +1267,7 @@ pub fn writePlanHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha plan read <path>
         \\
         \\Render a plan JSON file to a self-contained HTML page. Without --input, it reads
-        \\sample_plan.json; without --output, it writes dist/plan.html.
+        \\examples/sample_plan.json; without --output, it writes dist/plan.html.
         \\
         \\Options:
         \\  -i, --input <path>    Plan JSON file to render
@@ -1291,7 +1291,7 @@ pub fn writeMapHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha map [options]
         \\
         \\Render a UML-style map JSON file to a self-contained HTML page. Without --input,
-        \\it reads sample_map.json; without --output, it writes dist/map.html.
+        \\it reads examples/sample_map.json; without --output, it writes dist/map.html.
         \\
         \\Options:
         \\  -i, --input <path>    Map JSON file to render
@@ -1321,8 +1321,8 @@ pub fn writeUsageGuide(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  matcha loop resume --last                  Resume the most recent paused loop
         \\
         \\Defaults:
-        \\  matcha plan reads sample_plan.json and writes dist/plan.html.
-        \\  matcha map reads sample_map.json and writes dist/map.html.
+        \\  matcha plan reads examples/sample_plan.json and writes dist/plan.html.
+        \\  matcha map reads examples/sample_map.json and writes dist/map.html.
         \\
         \\Path rules:
         \\  --input is a JSON file matching the selected command format.
@@ -1438,12 +1438,12 @@ test "usage includes embedded plan and map format instructions" {
 test "render command defaults match current CLI" {
     const plan_options = expectRenderOptions(parseRenderOptions(.plan, &.{}));
     try std.testing.expectEqual(render_html.RenderTarget.plan, plan_options.target);
-    try std.testing.expectEqualStrings("sample_plan.json", plan_options.input);
+    try std.testing.expectEqualStrings("examples/sample_plan.json", plan_options.input);
     try std.testing.expectEqualStrings("dist/plan.html", plan_options.output);
 
     const map_options = expectRenderOptions(parseRenderOptions(.map, &.{}));
     try std.testing.expectEqual(render_html.RenderTarget.map, map_options.target);
-    try std.testing.expectEqualStrings("sample_map.json", map_options.input);
+    try std.testing.expectEqualStrings("examples/sample_map.json", map_options.input);
     try std.testing.expectEqualStrings("dist/map.html", map_options.output);
 }
 
@@ -1594,7 +1594,7 @@ test "plan read fixture output is stable and stdout-only" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(cwd);
 
-    const sample_plan_path = try std.fmt.allocPrint(allocator, "{s}/sample_plan.json", .{cwd});
+    const sample_plan_path = try std.fmt.allocPrint(allocator, "{s}/examples/sample_plan.json", .{cwd});
     defer allocator.free(sample_plan_path);
 
     const expected_path = try std.fmt.allocPrint(allocator, "{s}/testdata/sample_plan.toon", .{cwd});
@@ -1799,7 +1799,7 @@ test "runArgs uses default plan path contract in temporary working directory" {
     const original_cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(original_cwd);
 
-    const sample_plan_path = try std.fmt.allocPrint(allocator, "{s}/sample_plan.json", .{original_cwd});
+    const sample_plan_path = try std.fmt.allocPrint(allocator, "{s}/examples/sample_plan.json", .{original_cwd});
     defer allocator.free(sample_plan_path);
     const sample_plan = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -1815,7 +1815,8 @@ test "runArgs uses default plan path contract in temporary working directory" {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}", .{tmp.dir.path.?});
     defer allocator.free(tmp_path);
 
-    try tmp.dir.writeFile("sample_plan.json", sample_plan);
+    try tmp.dir.createDirPath(std.testing.io, "examples");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "examples/sample_plan.json", .data = sample_plan });
     defer _ = std.Io.chdir(original_cwd) catch {};
     try std.Io.chdir(tmp_path);
 
@@ -1848,7 +1849,7 @@ test "runArgs uses default map path contract in temporary working directory" {
     const original_cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(original_cwd);
 
-    const sample_map_path = try std.fmt.allocPrint(allocator, "{s}/sample_map.json", .{original_cwd});
+    const sample_map_path = try std.fmt.allocPrint(allocator, "{s}/examples/sample_map.json", .{original_cwd});
     defer allocator.free(sample_map_path);
     const sample_map = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -1864,7 +1865,8 @@ test "runArgs uses default map path contract in temporary working directory" {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}", .{tmp.dir.path.?});
     defer allocator.free(tmp_path);
 
-    try tmp.dir.writeFile("sample_map.json", sample_map);
+    try tmp.dir.createDirPath(std.testing.io, "examples");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "examples/sample_map.json", .data = sample_map });
     defer _ = std.Io.chdir(original_cwd) catch {};
     try std.Io.chdir(tmp_path);
 

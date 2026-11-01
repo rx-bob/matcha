@@ -1,17 +1,18 @@
 const std = @import("std");
-const toon = @import("src/render_toon.zig");
-const prompts = @import("src/loop_prompts.zig");
-const routes = @import("src/serve_routes.zig");
-const path = @import("src/path.zig");
-const backend = @import("src/loop_backend.zig");
-const loop_options = @import("src/loop_options.zig");
-const json_input = @import("src/json_input.zig");
-const plan_read = @import("src/plan_read.zig");
-const catalog = @import("src/serve_catalog.zig");
-const stream = @import("src/loop_stream.zig");
-const loop_config = @import("src/loop_config.zig");
-const loop_summary = @import("src/loop_summary.zig");
-const loop_store = @import("src/loop_store.zig");
+const matcha = @import("matcha");
+const toon = matcha.render_toon;
+const prompts = matcha.loop_prompts;
+const routes = matcha.serve_routes;
+const path = matcha.path;
+const backend = matcha.loop_backend;
+const loop_options = matcha.loop_options;
+const json_input = matcha.json_input;
+const plan_read = matcha.plan_read;
+const catalog = matcha.serve_catalog;
+const stream = matcha.loop_stream;
+const loop_config = matcha.loop_config;
+const loop_summary = matcha.loop_summary;
+const loop_store = matcha.loop_store;
 
 fn ignoreStreamEvent(_: ?*anyopaque, _: stream.NormalizedEvent) void {}
 
