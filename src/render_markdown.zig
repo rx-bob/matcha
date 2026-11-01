@@ -192,45 +192,6 @@ fn renderPlan(out: *MarkdownWriter, plan: std.json.ObjectMap) !void {
         }
     }
 
-    if (getArray(plan, "workflows")) |workflows| {
-        if (workflows.items.len > 0) {
-            try out.writeLine("## Workflows");
-            try out.writeLine("");
-
-            for (workflows.items) |workflow| {
-                if (workflow == .object) {
-                    try renderWorkflow(out, workflow.object);
-                }
-            }
-        }
-    }
-
-    if (getArray(plan, "commands")) |commands| {
-        if (commands.items.len > 0) {
-            try out.writeLine("## Commands");
-            try out.writeLine("");
-
-            for (commands.items) |command| {
-                if (command == .object) {
-                    try renderCommand(out, command.object);
-                }
-            }
-        }
-    }
-
-    if (getArray(plan, "blockers")) |blockers| {
-        if (blockers.items.len > 0) {
-            try out.writeLine("## Blockers");
-            try out.writeLine("");
-
-            for (blockers.items) |blocker| {
-                if (blocker == .object) {
-                    try renderBlocker(out, blocker.object);
-                }
-            }
-        }
-    }
-
     if (getArray(plan, "recommendedOrder")) |recommended_order| {
         if (recommended_order.items.len > 0) {
             try out.writeLine("## Recommended Order");
@@ -351,17 +312,6 @@ fn renderEpic(out: *MarkdownWriter, epic: std.json.ObjectMap) !void {
         try out.writeKVLine("- **Status:** {s}", status);
     }
 
-    if (getStringList(epic, "tags", out.allocator)) |tags| {
-        defer out.allocator.free(tags);
-        const tags_text = try joinPrefixComma(out.allocator, "- **Tags:** ", tags);
-        defer out.allocator.free(tags_text);
-        try out.writeLine(tags_text);
-    }
-
-    if (getString(epic, "testFocus")) |test_focus| {
-        try out.writeKVLine("- **Test Focus:** {s}", test_focus);
-    }
-
     if (getStringList(epic, "dependencies", out.allocator)) |dependencies| {
         defer out.allocator.free(dependencies);
         const dependencies_text = try joinPrefixComma(out.allocator, "- **Dependencies:** ", dependencies);
@@ -395,31 +345,8 @@ fn renderStory(out: *MarkdownWriter, story: std.json.ObjectMap) !void {
         try out.writeKVLine("- **Status:** {s}", status);
     }
 
-    if (getU64(story, "priority")) |priority| {
-        try out.writeFormattedLine("- **Priority:** {d}", .{priority});
-    }
-
     if (getString(story, "risk")) |risk| {
         try out.writeKVLine("- **Risk:** {s}", risk);
-    }
-
-    if (getString(story, "owner")) |owner| {
-        try out.writeKVLine("- **Owner:** {s}", owner);
-    }
-
-    if (story.get("estimate")) |estimate| {
-        if (estimate != .null) {
-            const estimate_text = try renderJsonValue(out.allocator, estimate);
-            defer out.allocator.free(estimate_text);
-            try out.writeFormattedLine("- **Estimate:** {s}", .{estimate_text});
-        }
-    }
-
-    if (getStringList(story, "tags", out.allocator)) |tags| {
-        defer out.allocator.free(tags);
-        const tags_text = try joinPrefixComma(out.allocator, "- **Tags:** ", tags);
-        defer out.allocator.free(tags_text);
-        try out.writeLine(tags_text);
     }
 
     if (getStringList(story, "dependencies", out.allocator)) |dependencies| {
@@ -480,41 +407,6 @@ fn renderStory(out: *MarkdownWriter, story: std.json.ObjectMap) !void {
         }
     }
 
-    if (getStringList(story, "commandsToRun", out.allocator)) |commands| {
-        defer out.allocator.free(commands);
-        try out.writeLine("");
-        try out.writeLine("**Commands to Run:**");
-        try out.writeLine("");
-
-        for (commands) |command| {
-            try out.writeLine("```sh");
-            try out.writeLine(command);
-            try out.writeLine("```");
-        }
-    }
-
-    if (getStringList(story, "artifacts", out.allocator)) |artifacts| {
-        defer out.allocator.free(artifacts);
-        try out.writeLine("");
-        try out.writeLine("**Artifacts:**");
-        try out.writeLine("");
-
-        for (artifacts) |artifact| {
-            try out.writeFormattedLine("- {s}", .{artifact});
-        }
-    }
-
-    if (getStringList(story, "notes", out.allocator)) |notes| {
-        defer out.allocator.free(notes);
-        try out.writeLine("");
-        try out.writeLine("**Notes:**");
-        try out.writeLine("");
-
-        for (notes) |note| {
-            try out.writeFormattedLine("- {s}", .{note});
-        }
-    }
-
     try out.writeLine("");
 }
 
@@ -524,8 +416,10 @@ fn renderSection(out: *MarkdownWriter, section: std.json.ObjectMap) !void {
     const kind = getString(section, "kind") orelse "";
 
     try out.writeFormattedLine("### {s}: {s}", .{ id, title });
-    try out.writeLine("");
-    try out.writeFormattedLine("- **Kind:** {s}", .{kind});
+    if (kind.len > 0) {
+        try out.writeLine("");
+        try out.writeFormattedLine("- **Kind:** {s}", .{kind});
+    }
 
     if (getArray(section, "summary")) |summary| {
         if (summary.items.len > 0) {
@@ -557,237 +451,12 @@ fn renderSection(out: *MarkdownWriter, section: std.json.ObjectMap) !void {
                 try row.appendSlice(out.allocator, text);
             }
 
-            if (getString(item_object, "status")) |status| {
-                try row.appendSlice(out.allocator, " (");
-                try row.appendSlice(out.allocator, status);
-                try row.appendSlice(out.allocator, ")");
-            }
-
-            if (item_object.get("priority")) |priority| {
-                if (priority == .integer and priority.integer > 0) {
-                    const priority_text = try std.fmt.allocPrint(out.allocator, " [priority {d}]", .{priority.integer});
-                    defer out.allocator.free(priority_text);
-                    try row.appendSlice(out.allocator, priority_text);
-                }
-            }
-
-            if (getStringList(item_object, "tags", out.allocator)) |tags| {
-                defer out.allocator.free(tags);
-                const joined = try joinPrefixComma(out.allocator, " [", tags);
-                defer out.allocator.free(joined);
-                const tags_text = try std.fmt.allocPrint(out.allocator, "{s}]", .{joined});
-                defer out.allocator.free(tags_text);
-                try row.appendSlice(out.allocator, tags_text);
-            }
-
-            if (getString(item_object, "ref")) |ref| {
-                try row.appendSlice(out.allocator, " (ref: ");
-                try row.appendSlice(out.allocator, ref);
-                try row.appendSlice(out.allocator, ")");
-            }
-
             const row_text = try row.toOwnedSlice(out.allocator);
             defer out.allocator.free(row_text);
             try out.writeLine(row_text);
         }
 
         try out.writeLine("");
-    }
-
-    if (getArray(section, "rows")) |rows| {
-        const has_rows = rows.items.len > 0;
-        if (has_rows) {
-            const section_columns = try sectionColumns(out.allocator, section);
-            defer out.allocator.free(section_columns);
-
-            if (section_columns.len > 0) {
-                const header = try sectionHeaderRow(out.allocator, section_columns);
-                defer out.allocator.free(header);
-                try out.writeLine(header);
-
-                const separator = try sectionSeparatorRow(out.allocator, section_columns);
-                defer out.allocator.free(separator);
-                try out.writeLine(separator);
-
-                for (rows.items) |row| {
-                    if (row != .object) continue;
-
-                    const line = try sectionRowLine(out.allocator, section_columns, row.object);
-                    defer out.allocator.free(line);
-                    try out.writeLine(line);
-                }
-
-                try out.writeLine("");
-            }
-        }
-    }
-
-    try out.writeLine("");
-}
-
-fn renderWorkflow(out: *MarkdownWriter, workflow: std.json.ObjectMap) !void {
-    const id = getString(workflow, "id") orelse "";
-    const title = getString(workflow, "title") orelse "";
-    const kind = getString(workflow, "kind") orelse "";
-
-    try out.writeFormattedLine("### {s}: {s}", .{ id, title });
-    try out.writeLine("");
-    try out.writeFormattedLine("- **Kind:** {s}", .{kind});
-    try out.writeLine("");
-
-    if (getArray(workflow, "steps")) |steps| {
-        if (steps.items.len > 0) {
-            try out.writeLine("**Steps:**");
-            try out.writeLine("");
-
-            var index: usize = 0;
-            for (steps.items) |step| {
-                const step_number = index + 1;
-                if (step == .string) {
-                    try out.writeFormattedLine("{d}. {s}", .{ step_number, step.string });
-                } else if (step == .object) {
-                    try renderWorkflowStep(out, step.object, step_number);
-                }
-                index += 1;
-            }
-
-            try out.writeLine("");
-        }
-    }
-
-    try out.writeLine("");
-}
-
-fn renderWorkflowStep(out: *MarkdownWriter, workflow_step: std.json.ObjectMap, step_number: usize) !void {
-    const step_text = getString(workflow_step, "text") orelse "";
-    var line = try std.ArrayList(u8).initCapacity(out.allocator, 0);
-    defer line.deinit(out.allocator);
-
-    const prefix = try std.fmt.allocPrint(out.allocator, "{d}. {s}", .{ step_number, step_text });
-    defer out.allocator.free(prefix);
-    try line.appendSlice(out.allocator, prefix);
-
-    if (getString(workflow_step, "id")) |id| {
-        const id_text = try std.fmt.allocPrint(out.allocator, " ({s})", .{id});
-        defer out.allocator.free(id_text);
-        try line.appendSlice(out.allocator, id_text);
-    }
-
-    if (getString(workflow_step, "status")) |status| {
-        const status_text = try std.fmt.allocPrint(out.allocator, " ({s})", .{status});
-        defer out.allocator.free(status_text);
-        try line.appendSlice(out.allocator, status_text);
-    }
-
-    const line_text = try line.toOwnedSlice(out.allocator);
-    defer out.allocator.free(line_text);
-    try out.writeLine(line_text);
-
-    if (getString(workflow_step, "command")) |command| {
-        try out.writeLine("   ```sh");
-        try out.writeFormattedLine("   {s}", .{command});
-        try out.writeLine("   ```");
-    }
-
-    if (getStringList(workflow_step, "expectedResults", out.allocator)) |results| {
-        defer out.allocator.free(results);
-        for (results) |result| {
-            try out.writeFormattedLine("   - Expected: {s}", .{result});
-        }
-    }
-
-    if (getStringList(workflow_step, "refs", out.allocator)) |refs| {
-        defer out.allocator.free(refs);
-        const refs_text = try joinPrefixComma(out.allocator, "   - Refs: ", refs);
-        defer out.allocator.free(refs_text);
-        try out.writeLine(refs_text);
-    }
-}
-
-fn renderCommand(out: *MarkdownWriter, command: std.json.ObjectMap) !void {
-    const title = getString(command, "title") orelse "";
-    const command_text = getString(command, "command") orelse "";
-
-    try out.writeFormattedLine("### {s}", .{title});
-    try out.writeLine("");
-
-    if (getString(command, "workingDirectory")) |working_directory| {
-        const escaped_path = try escapeInlineCode(out.allocator, working_directory);
-        defer out.allocator.free(escaped_path);
-        try out.writeFormattedLine("- **Working Directory:** `{s}`", .{escaped_path});
-    }
-
-    if (getObject(command, "environment")) |environment| {
-        if (environment.count() > 0) {
-            try out.writeLine("- **Environment:**");
-
-            const env_keys = try sortedKeys(out.allocator, environment);
-            defer out.allocator.free(env_keys);
-
-            for (env_keys) |env_key| {
-                if (environment.get(env_key)) |env_value| {
-                    if (env_value == .string) {
-                        try out.writeFormattedLine("  - {s}={s}", .{ env_key, env_value.string });
-                    }
-                }
-            }
-        }
-    }
-
-    try out.writeLine("");
-    try out.writeLine("```sh");
-    try out.writeLine(command_text);
-    try out.writeLine("```");
-
-    if (getStringList(command, "expectedResults", out.allocator)) |expected_results| {
-        defer out.allocator.free(expected_results);
-        try out.writeLine("");
-        try out.writeLine("**Expected Results:**");
-        try out.writeLine("");
-
-        for (expected_results) |result| {
-            try out.writeFormattedLine("- {s}", .{result});
-        }
-    }
-
-    if (getStringList(command, "refs", out.allocator)) |refs| {
-        defer out.allocator.free(refs);
-        const refs_text = try joinPrefixComma(out.allocator, "**Refs:** ", refs);
-        defer out.allocator.free(refs_text);
-        try out.writeLine("");
-        try out.writeLine(refs_text);
-    }
-
-    try out.writeLine("");
-}
-
-fn renderBlocker(out: *MarkdownWriter, blocker: std.json.ObjectMap) !void {
-    const area = getString(blocker, "area") orelse "";
-    const required_fix = getString(blocker, "requiredFix") orelse "";
-    const priority = blocker.get("priority");
-
-    try out.writeFormattedLine("### Blocker: {s}", .{area});
-    try out.writeLine("");
-
-    if (priority) |priority_value| {
-        if (priority_value == .integer) {
-            try out.writeFormattedLine("- **Priority:** {d}", .{priority_value.integer});
-        }
-    }
-
-    if (required_fix.len > 0) {
-        try out.writeFormattedLine("- **Required Fix:** {s}", .{required_fix});
-    }
-
-    if (getString(blocker, "status")) |status| {
-        try out.writeFormattedLine("- **Status:** {s}", .{status});
-    }
-
-    if (getStringList(blocker, "refs", out.allocator)) |refs| {
-        defer out.allocator.free(refs);
-        const refs_text = try joinPrefixComma(out.allocator, "- **Refs:** ", refs);
-        defer out.allocator.free(refs_text);
-        try out.writeLine(refs_text);
     }
 
     try out.writeLine("");
@@ -804,121 +473,6 @@ fn renderRecommendedOrderItem(out: *MarkdownWriter, item: std.json.ObjectMap) !v
     }
 }
 
-fn sectionColumns(allocator: std.mem.Allocator, section: std.json.ObjectMap) ![][]const u8 {
-    const section_columns = getArray(section, "columns");
-    if (section_columns) |columns| {
-        if (columns.items.len > 0) {
-            var result = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-            errdefer result.deinit(allocator);
-
-            for (columns.items) |column| {
-                if (column == .string) {
-                    try result.append(allocator, column.string);
-                }
-            }
-
-            return try result.toOwnedSlice(allocator);
-        }
-    }
-
-    const rows = getArray(section, "rows") orelse {
-        var empty_columns = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-        return try empty_columns.toOwnedSlice(allocator);
-    };
-
-    var keys = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-    errdefer keys.deinit(allocator);
-
-    for (rows.items) |row| {
-        if (row != .object) continue;
-        var it = row.object.iterator();
-        while (it.next()) |entry| {
-            var exists = false;
-            for (keys.items) |key| {
-                if (std.mem.eql(u8, key, entry.key_ptr.*)) {
-                    exists = true;
-                    break;
-                }
-            }
-
-            if (!exists) {
-                try keys.append(allocator, entry.key_ptr.*);
-            }
-        }
-    }
-
-    std.mem.sort([]const u8, keys.items, {}, struct {
-        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.lessThan(u8, lhs, rhs);
-        }
-    }.lessThan);
-
-    return try keys.toOwnedSlice(allocator);
-}
-
-fn sectionHeaderRow(allocator: std.mem.Allocator, columns: []const []const u8) ![]const u8 {
-    var row = try std.ArrayList(u8).initCapacity(allocator, 0);
-    defer row.deinit(allocator);
-
-    try row.appendSlice(allocator, "| ");
-    for (columns, 0..) |column, index| {
-        if (index > 0) {
-            try row.appendSlice(allocator, " | ");
-        }
-        try row.appendSlice(allocator, column);
-    }
-    try row.appendSlice(allocator, " |");
-
-    return try row.toOwnedSlice(allocator);
-}
-
-fn sectionSeparatorRow(allocator: std.mem.Allocator, columns: []const []const u8) ![]const u8 {
-    var row = try std.ArrayList(u8).initCapacity(allocator, 0);
-    defer row.deinit(allocator);
-
-    try row.appendSlice(allocator, "| ");
-    for (columns, 0..) |column, index| {
-        _ = column;
-        if (index > 0) {
-            try row.appendSlice(allocator, " | ");
-        }
-        try row.appendSlice(allocator, "---");
-    }
-    try row.appendSlice(allocator, " |");
-
-    return try row.toOwnedSlice(allocator);
-}
-
-fn sectionRowLine(allocator: std.mem.Allocator, columns: []const []const u8, row: std.json.ObjectMap) ![]const u8 {
-    var buffer = try std.ArrayList(u8).initCapacity(allocator, 0);
-    defer buffer.deinit(allocator);
-
-    try buffer.appendSlice(allocator, "| ");
-    for (columns, 0..) |column, index| {
-        if (index > 0) {
-            try buffer.appendSlice(allocator, " | ");
-        }
-
-        const raw = row.get(column) orelse .null;
-        const rendered = try renderJsonValue(allocator, raw);
-        defer allocator.free(rendered);
-        const escaped = try escapeTableCell(allocator, rendered);
-        defer allocator.free(escaped);
-        try buffer.appendSlice(allocator, escaped);
-    }
-    try buffer.appendSlice(allocator, " |");
-
-    return try buffer.toOwnedSlice(allocator);
-}
-
-fn escapeTableCell(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    const escaped_pipes = try std.mem.replaceOwned(u8, allocator, text, "|", "\\|");
-    errdefer allocator.free(escaped_pipes);
-    const escaped_newlines = try std.mem.replaceOwned(u8, allocator, escaped_pipes, "\n", " ");
-    allocator.free(escaped_pipes);
-    return escaped_newlines;
-}
-
 fn getString(container: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = container.get(key) orelse return null;
     return if (value == .string) value.string else null;
@@ -932,15 +486,6 @@ fn getArray(container: std.json.ObjectMap, key: []const u8) ?std.json.Array {
 fn getObject(container: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
     const value = container.get(key) orelse return null;
     return if (value == .object) value.object else null;
-}
-
-fn getU64(container: std.json.ObjectMap, key: []const u8) ?u64 {
-    const value = container.get(key) orelse return null;
-
-    return switch (value) {
-        .integer => |integer| if (integer >= 0) @intCast(integer) else null,
-        else => null,
-    };
 }
 
 fn getStringList(container: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) ?[][]const u8 {
@@ -1114,7 +659,7 @@ test "renders epics and stories with core fields" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const parsed = try parseJsonValue(arena.allocator(), "{\"schemaVersion\":1,\"id\":\"epics\",\"title\":\"Delivery Plan\",\"epics\":[{\"id\":\"area-1\",\"title\":\"Core Area\",\"summary\":\"Core area summary.\",\"status\":\"in-progress\",\"tags\":[\"cli\"],\"testFocus\":\"Argument parsing\",\"dependencies\":[\"prereq-area\"],\"stories\":[{\"id\":\"item-1\",\"title\":\"Task One\",\"status\":\"planned\",\"priority\":1,\"risk\":\"low\",\"owner\":\"agent\",\"estimate\":\"2h\",\"tags\":[\"parser\"],\"dependencies\":[\"item-2\"],\"details\":[\"Detail one.\"],\"acceptanceCriteria\":[\"Criterion one.\"],\"unitTests\":[\"Test one.\"],\"filesLikelyTouched\":[\"src/mod.ts\"],\"commandsToRun\":[\"task test\"],\"artifacts\":[\"dist/matcha\"],\"notes\":[\"Note one.\"]}]}] }");
+    const parsed = try parseJsonValue(arena.allocator(), "{\"schemaVersion\":1,\"id\":\"epics\",\"title\":\"Delivery Plan\",\"epics\":[{\"id\":\"area-1\",\"title\":\"Core Area\",\"summary\":\"Core area summary.\",\"description\":\"Epic description.\",\"status\":\"in-progress\",\"dependencies\":[\"prereq-area\"],\"stories\":[{\"id\":\"item-1\",\"title\":\"Task One\",\"status\":\"planned\",\"risk\":\"low\",\"dependencies\":[\"item-2\"],\"description\":\"Story description.\",\"details\":[\"Detail one.\"],\"acceptanceCriteria\":[\"Criterion one.\"],\"unitTests\":[\"Test one.\"],\"filesLikelyTouched\":[\"src/mod.ts\"]}]}] }");
     defer parsed.deinit();
 
     const markdown = try renderPlanMarkdown(allocator, parsed.value);
@@ -1124,19 +669,15 @@ test "renders epics and stories with core fields" {
         "## Epics",
         "### area-1: Core Area",
         "Core area summary.",
+        "Epic description.",
         "- **Status:** in-progress",
-        "- **Tags:** cli",
-        "- **Test Focus:** Argument parsing",
         "- **Dependencies:** prereq-area",
         "#### Stories",
         "##### item-1: Task One",
         "- **Status:** planned",
-        "- **Priority:** 1",
         "- **Risk:** low",
-        "- **Owner:** agent",
-        "- **Estimate:** 2h",
-        "- **Tags:** parser",
         "- **Dependencies:** item-2",
+        "Story description.",
         "**Details:**",
         "- Detail one.",
         "**Acceptance Criteria:**",
@@ -1145,14 +686,6 @@ test "renders epics and stories with core fields" {
         "- Test one.",
         "**Files Likely Touched:**",
         "- src/mod.ts",
-        "**Commands to Run:**",
-        "```sh",
-        "task test",
-        "```",
-        "**Artifacts:**",
-        "- dist/matcha",
-        "**Notes:**",
-        "- Note one.",
     }) |expected| {
         try std.testing.expect(std.mem.indexOf(u8, markdown, expected) != null);
     }
@@ -1205,14 +738,14 @@ test "renders deterministic nested json values" {
     try std.testing.expect(a_pos < z_pos);
 }
 
-test "renders sections and section tables" {
+test "renders sections and items" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     const parsed = try parseJsonValue(
         arena.allocator(),
-        "{\"schemaVersion\":1,\"id\":\"sections\",\"title\":\"Section Plan\",\"sections\":[{\"id\":\"rules\",\"title\":\"Rules\",\"kind\":\"rules\",\"summary\":[\"Rule summary.\"],\"items\":[{\"title\":\"One\",\"text\":\"First rule.\",\"status\":\"draft\",\"priority\":1,\"tags\":[\"cli\"],\"ref\":\"item-1\"}]},{\"id\":\"arch\",\"title\":\"Architecture\",\"kind\":\"architecture\",\"columns\":[\"component\",\"responsibility\"],\"rows\":[{\"component\":\"Engine\",\"responsibility\":\"Logic\"},{\"component\":\"UI\",\"responsibility\":\"Display\"}]}] }",
+        "{\"schemaVersion\":1,\"id\":\"sections\",\"title\":\"Section Plan\",\"sections\":[{\"id\":\"rules\",\"title\":\"Rules\",\"kind\":\"rules\",\"summary\":[\"Rule summary.\"],\"items\":[{\"title\":\"One\",\"text\":\"First rule.\"}]},{\"id\":\"arch\",\"title\":\"Architecture\",\"items\":[{\"text\":\"Second rule.\"}]}] }",
     );
     defer parsed.deinit();
 
@@ -1224,44 +757,22 @@ test "renders sections and section tables" {
         "### rules: Rules",
         "- **Kind:** rules",
         "Rule summary.",
-        "- **One:** First rule. (draft) [priority 1] [cli] (ref: item-1)",
+        "- **One:** First rule.",
         "### arch: Architecture",
-        "- **Kind:** architecture",
-        "| component | responsibility |",
-        "| --- | --- |",
-        "| Engine | Logic |",
-        "| UI | Display |",
+        "- Second rule.",
     }) |expected| {
         try std.testing.expect(std.mem.indexOf(u8, markdown, expected) != null);
     }
 }
 
-test "renders inferred table columns and escaped table cells" {
+test "renders recommended order and exit criteria" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     const parsed = try parseJsonValue(
         arena.allocator(),
-        "{\"schemaVersion\":1,\"id\":\"inferred\",\"title\":\"Inferred Table Plan\",\"sections\":[{\"id\":\"t\",\"title\":\"Table\",\"kind\":\"rules\",\"rows\":[{\"a\":\"one | two\",\"b\":\"line\\nbreak\"},{\"b\":\"only b\",\"a\":\"only a\"}]}]}",
-    );
-    defer parsed.deinit();
-
-    const markdown = try renderPlanMarkdown(allocator, parsed.value);
-    defer allocator.free(markdown);
-
-    try std.testing.expect(std.mem.indexOf(u8, markdown, "| a | b |") != null);
-    try std.testing.expect(std.mem.indexOf(u8, markdown, "| one \\| two | line break |") != null);
-}
-
-test "renders workflows commands blockers recommended order and exit criteria" {
-    const allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const parsed = try parseJsonValue(
-        arena.allocator(),
-        "{\"schemaVersion\":1,\"id\":\"remainder\",\"title\":\"Remainder Plan\",\"workflows\":[{\"id\":\"flow\",\"title\":\"Flow\",\"kind\":\"ordered-steps\",\"steps\":[\"Simple step.\",{\"id\":\"step-2\",\"text\":\"Complex step.\",\"command\":\"task test\",\"expectedResults\":[\"Tests pass.\"],\"refs\":[\"item-1\"] ,\"status\":\"planned\"}]}],\"commands\":[{\"title\":\"Verify\",\"command\":\"task verify\",\"workingDirectory\":\"~/repos/matcha\",\"environment\":{\"HOME\":\"/tmp\"},\"expectedResults\":[\"Clean diff.\"],\"refs\":[\"item-4\"]}],\"blockers\":[{\"priority\":1,\"area\":\"Design\",\"requiredFix\":\"Decide CLI shape.\",\"status\":\"planned\",\"refs\":[\"item-2\"]}],\"recommendedOrder\":[{\"ref\":\"item-1\",\"reason\":\"Dispatch first.\"}],\"exitCriteria\":[\"All tests pass.\"]}",
+        "{\"schemaVersion\":1,\"id\":\"remainder\",\"title\":\"Remainder Plan\",\"recommendedOrder\":[{\"ref\":\"item-1\",\"reason\":\"Dispatch first.\"}],\"exitCriteria\":[\"All tests pass.\"]}",
     );
     defer parsed.deinit();
 
@@ -1269,34 +780,6 @@ test "renders workflows commands blockers recommended order and exit criteria" {
     defer allocator.free(markdown);
 
     for ([_][]const u8{
-        "## Workflows",
-        "### flow: Flow",
-        "- **Kind:** ordered-steps",
-        "**Steps:**",
-        "1. Simple step.",
-        "2. Complex step. (step-2) (planned)",
-        "   ```sh",
-        "   task test",
-        "   ```",
-        "   - Expected: Tests pass.",
-        "   - Refs: item-1",
-        "## Commands",
-        "### Verify",
-        "- **Working Directory:** `~/repos/matcha`",
-        "- **Environment:**",
-        "  - HOME=/tmp",
-        "```sh",
-        "task verify",
-        "```",
-        "**Expected Results:**",
-        "Clean diff.",
-        "**Refs:** item-4",
-        "## Blockers",
-        "### Blocker: Design",
-        "- **Priority:** 1",
-        "- **Required Fix:** Decide CLI shape.",
-        "- **Status:** planned",
-        "- **Refs:** item-2",
         "## Recommended Order",
         "1. **item-1**: Dispatch first.",
         "## Exit Criteria",

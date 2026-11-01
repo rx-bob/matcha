@@ -77,6 +77,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "CLI loop declarations are included when enabled",
             "usage includes embedded plan and map format instructions",
+            "plan read fixture output is stable and stdout-only",
             "loop CLI",
             "loop resume CLI",
             "configured CLI captures winning prompt",

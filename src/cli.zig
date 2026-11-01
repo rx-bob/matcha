@@ -1612,17 +1612,17 @@ test "plan read fixture output is stable and stdout-only" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const input_path = try std.fmt.allocPrint(allocator, "{s}/sample_plan.json", .{tmp.dir.path.?});
+    const input_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sample_plan.json", .{tmp.sub_path});
     defer allocator.free(input_path);
-    try tmp.dir.writeFile("sample_plan.json", plan_contents);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sample_plan.json", .data = plan_contents });
 
     var start_count: usize = 0;
     var initial_entry_iterator = tmp.dir.iterate();
-    while (try initial_entry_iterator.next()) |_| {
+    while (try initial_entry_iterator.next(std.testing.io)) |_| {
         start_count += 1;
     }
 
-    var stdout_buffer: [131072]u8 = undefined;
+    var stdout_buffer: [262144]u8 = undefined;
     var stderr_buffer: [128]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&stdout_buffer);
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
@@ -1645,7 +1645,7 @@ test "plan read fixture output is stable and stdout-only" {
 
     var final_entry_iterator = tmp.dir.iterate();
     var final_count: usize = 0;
-    while (try final_entry_iterator.next()) |_| {
+    while (try final_entry_iterator.next(std.testing.io)) |_| {
         final_count += 1;
     }
 

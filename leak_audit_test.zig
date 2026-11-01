@@ -21,7 +21,7 @@ test "markdown rendering releases partial allocations at every OOM point" {
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         arena.allocator(),
-        "{\"title\":\"Leak audit\",\"metadata\":{\"nested\":{\"a\":[1,\"x\"]}},\"sections\":[{\"title\":\"Rows\",\"columns\":[\"name\",\"count\"],\"rows\":[{\"name\":\"one\",\"count\":2}]}]}",
+        "{\"title\":\"Leak audit\",\"metadata\":{\"nested\":{\"a\":[1,\"x\"]}},\"sections\":[{\"title\":\"Items\",\"items\":[{\"title\":\"one\",\"text\":\"two\"}]}]}",
         .{},
     );
 
