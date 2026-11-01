@@ -1,4 +1,4 @@
-import type { JsonValue } from "../../src/plan.ts"
+import type { JsonValue } from "../../../src/plan.ts"
 
 export type ArtifactKind = "plan" | "map"
 

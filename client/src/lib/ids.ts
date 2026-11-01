@@ -28,15 +28,7 @@ export function formatJsonValue(value: JsonValue): string {
   return ""
 }
 
-export function tableColumns(section: PlanSection): string[] {
-  if (section.columns && section.columns.length > 0) {
-    return section.columns
-  }
-
-  if (section.rows && section.rows.length > 0) {
-    return Object.keys(section.rows[0])
-  }
-
+export function tableColumns(_section: PlanSection): string[] {
   return []
 }
 

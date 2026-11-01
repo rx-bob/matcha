@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.com/schemas/plan.schema.json",
   "title": "Plan",
-  "description": "Canonical structured plan format for epic/story implementation plans, operational plans, validation flows, and architecture breakdowns.",
+  "description": "Canonical structured plan format for epic/story implementation plans and architecture breakdowns.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "id", "title", "changedFiles"],
@@ -15,6 +15,13 @@
       "$ref": "#/$defs/slug"
     },
     "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "heroTitle": {
+      "$ref": "#/$defs/heroTitle"
+    },
+    "firstStorySummary": {
       "type": "string",
       "minLength": 1
     },
@@ -54,24 +61,6 @@
         "$ref": "#/$defs/epic"
       }
     },
-    "workflows": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/workflow"
-      }
-    },
-    "commands": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/command"
-      }
-    },
-    "blockers": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/blocker"
-      }
-    },
     "exitCriteria": {
       "$ref": "#/$defs/stringList"
     },
@@ -83,7 +72,7 @@
     },
     "changedFiles": {
       "type": "array",
-      "description": "One or many filetrees describing the files changed once the plan is complete. Rendered in a Changed Files section after the abstract and before epics.",
+      "description": "One or many filetrees describing the files changed once the plan is complete.",
       "items": {
         "$ref": "#/$defs/fileTree"
       }
@@ -93,6 +82,29 @@
     "slug": {
       "type": "string",
       "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$"
+    },
+    "heroTitle": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lead"],
+          "properties": {
+            "lead": {
+              "type": "string",
+              "minLength": 1
+            },
+            "accent": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
     },
     "status": {
       "type": "string",
@@ -150,7 +162,7 @@
     "section": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "title", "kind"],
+      "required": ["id", "title"],
       "properties": {
         "id": {
           "$ref": "#/$defs/slug"
@@ -163,7 +175,6 @@
           "type": "string",
           "enum": [
             "prose",
-            "table",
             "rules",
             "checklist",
             "ordered-steps",
@@ -181,18 +192,6 @@
           "items": {
             "$ref": "#/$defs/sectionItem"
           }
-        },
-        "rows": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": {
-              "$ref": "#/$defs/jsonValue"
-            }
-          }
-        },
-        "columns": {
-          "$ref": "#/$defs/stringList"
         }
       }
     },
@@ -208,19 +207,6 @@
         "text": {
           "type": "string",
           "minLength": 1
-        },
-        "status": {
-          "$ref": "#/$defs/status"
-        },
-        "priority": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "tags": {
-          "$ref": "#/$defs/stringList"
-        },
-        "ref": {
-          "$ref": "#/$defs/slug"
         }
       }
     },
@@ -236,6 +222,10 @@
           "type": "string",
           "minLength": 1
         },
+        "shortTitle": {
+          "type": "string",
+          "minLength": 1
+        },
         "summary": {
           "type": "string",
           "minLength": 1
@@ -243,14 +233,7 @@
         "description": {
           "type": "string",
           "minLength": 1,
-          "description": "Optional Markdown narrative block rendered after the epic summary and before its stories."
-        },
-        "tags": {
-          "$ref": "#/$defs/stringList"
-        },
-        "testFocus": {
-          "type": "string",
-          "minLength": 1
+          "description": "Optional Markdown narrative block rendered inside the epic's collapsible 'Design reference & examples' drawer."
         },
         "status": {
           "$ref": "#/$defs/status"
@@ -279,10 +262,20 @@
           "type": "string",
           "minLength": 1
         },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "risk": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"]
+        },
+        "dependencies": {
+          "$ref": "#/$defs/refList"
+        },
         "description": {
           "type": "string",
           "minLength": 1,
-          "description": "Optional Markdown narrative block rendered after the story title and before its Details section."
+          "description": "Optional Markdown narrative block rendered inside the story dialog's collapsible 'Design & source references' drawer."
         },
         "details": {
           "$ref": "#/$defs/stringList"
@@ -293,156 +286,8 @@
         "unitTests": {
           "$ref": "#/$defs/stringList"
         },
-        "dependencies": {
-          "$ref": "#/$defs/refList"
-        },
-        "status": {
-          "$ref": "#/$defs/status"
-        },
-        "tags": {
-          "$ref": "#/$defs/stringList"
-        },
-        "priority": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "risk": {
-          "type": "string",
-          "enum": ["low", "medium", "high", "critical"]
-        },
-        "owner": {
-          "type": ["string", "null"]
-        },
-        "estimate": {
-          "type": ["string", "number", "null"]
-        },
         "filesLikelyTouched": {
           "$ref": "#/$defs/stringList"
-        },
-        "commandsToRun": {
-          "$ref": "#/$defs/stringList"
-        },
-        "artifacts": {
-          "$ref": "#/$defs/stringList"
-        },
-        "notes": {
-          "$ref": "#/$defs/stringList"
-        }
-      }
-    },
-    "workflow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "title", "kind", "steps"],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/slug"
-        },
-        "title": {
-          "type": "string",
-          "minLength": 1
-        },
-        "kind": {
-          "type": "string",
-          "enum": ["ordered-steps", "checklist", "validation", "smoke-test", "migration"]
-        },
-        "steps": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "oneOf": [
-              {
-                "type": "string",
-                "minLength": 1
-              },
-              {
-                "$ref": "#/$defs/workflowStep"
-              }
-            ]
-          }
-        }
-      }
-    },
-    "workflowStep": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["text"],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/slug"
-        },
-        "text": {
-          "type": "string",
-          "minLength": 1
-        },
-        "command": {
-          "type": "string",
-          "minLength": 1
-        },
-        "expectedResults": {
-          "$ref": "#/$defs/stringList"
-        },
-        "status": {
-          "$ref": "#/$defs/status"
-        },
-        "refs": {
-          "$ref": "#/$defs/refList"
-        }
-      }
-    },
-    "command": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["title", "command"],
-      "properties": {
-        "title": {
-          "type": "string",
-          "minLength": 1
-        },
-        "command": {
-          "type": "string",
-          "minLength": 1
-        },
-        "workingDirectory": {
-          "type": "string",
-          "minLength": 1
-        },
-        "environment": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "expectedResults": {
-          "$ref": "#/$defs/stringList"
-        },
-        "refs": {
-          "$ref": "#/$defs/refList"
-        }
-      }
-    },
-    "blocker": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["priority", "area", "requiredFix"],
-      "properties": {
-        "priority": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "area": {
-          "type": "string",
-          "minLength": 1
-        },
-        "requiredFix": {
-          "type": "string",
-          "minLength": 1
-        },
-        "status": {
-          "$ref": "#/$defs/status"
-        },
-        "refs": {
-          "$ref": "#/$defs/refList"
         }
       }
     },

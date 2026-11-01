@@ -1285,7 +1285,7 @@ test "blocker strikes count only consecutive reports" {
     try std.testing.expectEqual(@as(u8, 0), state.value.blocked_strikes);
 }
 
-test "three consecutive blocker reports stop the loop" {
+test "consecutive blocker reports stop the loop" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1297,7 +1297,8 @@ test "three consecutive blocker reports stop the loop" {
     defer environment.deinit();
     var output = std.Io.Writer.Allocating.init(allocator);
     defer output.deinit();
-    var fake = FakeRunner{ .store = &store, .script = &.{ .worker_blocked, .worker_blocked, .worker_blocked } };
+    const script = [_]FakeStep{.worker_blocked} ** store_mod.max_blocked_strikes;
+    var fake = FakeRunner{ .store = &store, .script = &script };
     defer fake.deinit(allocator);
     const exit_code = try run(.{
         .allocator = allocator,
@@ -1308,13 +1309,13 @@ test "three consecutive blocker reports stop the loop" {
         .stdout = &output.writer,
     }, .{ .backend = .codex, .verify_enabled = false, .prompt = "Do it." });
     try std.testing.expectEqual(ExitCode.failure, exit_code);
-    try std.testing.expectEqual(@as(usize, 3), fake.calls.items.len);
+    try std.testing.expectEqual(@as(usize, store_mod.max_blocked_strikes), fake.calls.items.len);
     const id = try store.resolveLatestLoopId();
     defer allocator.free(id.?);
     var state = try store.loadState(id.?);
     defer state.deinit();
     try std.testing.expectEqual(store_mod.LoopStatus.blocked, state.value.status);
-    try std.testing.expectEqual(@as(u8, 3), state.value.blocked_strikes);
+    try std.testing.expectEqual(@as(u8, store_mod.max_blocked_strikes), state.value.blocked_strikes);
 }
 
 test "max turns runs one budget wrap-up and ends budget-limited" {
@@ -1782,9 +1783,9 @@ const FakeRunner = struct {
                 state.completion_summary = "All requested checks pass.";
             },
             .worker_blocked => {
-                state.blocked_strikes = @min(state.blocked_strikes +| 1, 3);
+                state.blocked_strikes = @min(state.blocked_strikes +| 1, store_mod.max_blocked_strikes);
                 state.last_blocker_summary = "Need another path.";
-                state.status = if (state.blocked_strikes >= 3) .blocked else .active;
+                state.status = if (state.blocked_strikes >= store_mod.max_blocked_strikes) .blocked else .active;
             },
             .worker_budget_wrapup => {},
             .worker_retry_fail, .worker_interrupted => unreachable,

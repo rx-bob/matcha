@@ -235,6 +235,12 @@ test "theme assets are non-empty and in CLI order" {
 test "format documents are available without file IO" {
     try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "schemaVersion") != null);
     try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "Output exactly one JSON object") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "\"heroTitle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "\"firstStorySummary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "\"shortTitle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "\"workflows\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "\"commandsToRun\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, llm_output_format.contents, "\"blockers\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, llm_uml_output_format.contents, "diagramKind") != null);
     try std.testing.expect(std.mem.indexOf(u8, llm_uml_output_format.contents, "Output exactly one JSON object") != null);
 }
@@ -272,7 +278,7 @@ test "embedded loop prompts are non-empty, registered, and contain required guar
     try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "{{ budget_section }}") != null);
     try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "{{ verifier_section }}") != null);
     try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "<verifier_rejection>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "{{ blocked_strikes }}/3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "{{ blocked_strikes }}/50") != null);
     try std.testing.expect(std.mem.indexOf(u8, loop_initial.contents, "matcha loop update") != null);
     try std.testing.expect(std.mem.indexOf(u8, loop_continuation.contents, "matcha loop update") != null);
     try std.testing.expect(std.mem.indexOf(u8, loop_verifier.contents, "matcha loop verify --pass") != null);

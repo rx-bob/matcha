@@ -4,6 +4,8 @@ const options = @import("loop_options.zig");
 
 pub const LoopStatus = enum { active, verifying, complete, paused, blocked, budget_limited };
 
+pub const max_blocked_strikes: u8 = 50;
+
 pub const LoopState = struct {
     // Version 1 is the original persisted shape. New loops write version 2;
     // optional fields retain defaults so historical state remains readable.

@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .root_module = cli_loop_module,
         .filters = &.{
             "CLI loop declarations are included when enabled",
+            "usage includes embedded plan and map format instructions",
             "loop CLI",
             "loop resume CLI",
             "configured CLI captures winning prompt",

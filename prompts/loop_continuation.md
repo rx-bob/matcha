@@ -36,9 +36,9 @@ Completion audit:
 - Only then report completion with `matcha loop update --status complete --summary "..."`.
 
 Blocked audit:
-- Current consecutive blocker reports: {{ blocked_strikes }}/3.
+- Current consecutive blocker reports: {{ blocked_strikes }}/50.
 - Do not report blocked on the first failure. Record a blocker only after examining the evidence and attempting an alternative safe path.
-- Treat equivalent blockers as the same condition even when wording or the proposed next step changes. The supervisor counts three consecutive reports before marking the loop blocked.
+- Treat equivalent blockers as the same condition even when wording or the proposed next step changes. The supervisor counts 50 consecutive reports before marking the loop blocked.
 - A blocker is not a reason to shrink the objective. If a turn is blocked, call `matcha loop update --status blocked --summary "..."` with the actual condition, attempted paths, and evidence. Never use blocked merely because work is hard, slow, uncertain, or incomplete.
 
 {{ verifier_section }}

@@ -6,8 +6,14 @@ The JSON object must follow this compact plan format:
   "schemaVersion": 1,
   "id": "short-stable-slug",
   "title": "Plan title",
+  "heroTitle": {
+    "lead": "Headline lead",
+    "accent": "italicized accent phrase."
+  },
+  "firstStorySummary": "One-sentence pitch for the first story in recommendedOrder, shown in the Overview Recommended start card.",
   "project": "project-name",
   "status": "planned",
+  "scope": "One-sentence scope summary shown as the hero lede.",
   "summary": [
     "One to three short paragraphs explaining the plan's objective, current context, and main approach."
   ],
@@ -38,13 +44,15 @@ The JSON object must follow this compact plan format:
     {
       "id": "E1",
       "title": "Epic title",
+      "shortTitle": "Compact epic index label",
       "summary": "What this epic delivers.",
-      "description": "Optional Markdown narrative block rendered after the epic summary and before its stories. Use Markdown for headings, lists, code, and links.",
+      "description": "Optional Markdown narrative rendered inside the epic's collapsible 'Design reference & examples' drawer. Use Markdown for headings, fenced code blocks, lists, and local file links.",
       "stories": [
         {
           "id": "E1.S1",
           "title": "Story title",
-          "description": "Optional Markdown narrative block rendered after the story title and before the details section. Use Markdown for headings, lists, code, and links.",
+          "risk": "medium",
+          "description": "Optional Markdown narrative rendered inside the story reader modal's collapsible 'Design & source references' drawer. Link local files as [Label — line 42, `fn foo`](/abs/or/rel/path/to/file.zig).",
           "details": [
             "Concrete implementation work to perform."
           ],
@@ -53,7 +61,26 @@ The JSON object must follow this compact plan format:
           ],
           "unitTests": [
             "Specific unit, integration, smoke, or manual test to add or run."
+          ],
+          "filesLikelyTouched": [
+            "src/main.zig"
           ]
+        }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "architecture-decisions",
+      "title": "Architecture & decisions",
+      "kind": "architecture",
+      "summary": [
+        "Optional short introductory paragraph for this section."
+      ],
+      "items": [
+        {
+          "title": "Decision or rule name",
+          "text": "Concrete explanation."
         }
       ]
     }
@@ -84,34 +111,34 @@ Rules:
 - recommendedOrder should reference story IDs, not epic IDs, unless the plan truly only has epic-level sequencing.
 - exitCriteria should describe the final proof that the entire plan succeeded.
 - changedFiles is required. Every plan must list the files that will be changed, using the FileTree shape below.
+- Format local file references in Markdown fields ("epic.description", "story.description", "metadata") as Markdown links such as [Runtime entry — line 42, `fn run`](/abs/path/to/file.zig) or [src/cli.zig](src/cli.zig). The UI automatically renders local paths (/Users/..., ./..., ../..., ~...) as click-to-copy buttons and wraps fenced code blocks with a language/copy toolbar.
 
 Optional fields may be included when useful:
 
 Top-level optional fields:
+- "heroTitle": string or { "lead": string, "accent"?: string }. Customizes the Overview hero headline (with "accent" rendered in italic accent color). When omitted, the UI splits "title" automatically.
+- "firstStorySummary": string. Customizes the body copy of the Overview "Recommended start" card. When omitted, the UI extracts the first sentence of the first recommended story's details or description.
 - "generatedAt": ISO-8601 date-time string.
-- "scope": short text describing the plan scope.
-- "metadata": object with extra context.
-- "sections": typed non-story content such as architecture notes, rules, data models, tables, or requirements.
-- "workflows": ordered validation, migration, smoke-test, or rollout steps.
-- "commands": commands to run.
-- "blockers": known blocking fixes.
+- "scope": short text describing the plan scope (displayed as the hero lede).
+- "metadata": object with extra context (rendered in the Architecture & decisions view).
+- "sections": typed non-story decision/architecture cards rendered in the Architecture & decisions view.
 
 Epic optional fields:
-- "description": Markdown string. Longer narrative block rendered after the epic summary and before its stories. Use Markdown for headings, lists, code, and links. Does not replace "summary"; "summary" is the short pitch, "description" is the detailed narrative.
-- "tags": array of short strings.
-- "testFocus": short string.
+- "shortTitle": short 2–4 word label used in the Overview epic index list. Falls back to "title" when omitted.
+- "summary": short pitch shown on the epic card header and Overview epic index.
+- "description": Markdown string rendered inside the epic card's collapsible "Design reference & examples" drawer. Use this for target code examples, design notes, and reference links.
+- "status": one of "draft", "planned", "ready", "in-progress", "blocked", "complete", "archived".
 - "dependencies": array of referenced epic or story IDs.
 
 Story optional fields:
-- "description": Markdown string. Longer narrative block rendered after the story title and before its "details" section. Use Markdown for headings, lists, code, and links. Does not replace "details"; "details" is the concrete implementation bullet list, "description" is the broader narrative.
-- "tags": array of short strings.
-- "dependencies": array of referenced story IDs.
-- "priority": positive integer.
+- "status": one of "draft", "planned", "ready", "in-progress", "blocked", "complete", "archived".
 - "risk": one of "low", "medium", "high", "critical".
-- "filesLikelyTouched": array of paths or module names.
-- "commandsToRun": array of commands.
-- "artifacts": array of produced artifacts.
-- "notes": array of short notes.
+- "dependencies": array of referenced story IDs.
+- "description": Markdown string rendered inside the story reader modal's collapsible "Design & source references" drawer. Use this for links to existing source files, line numbers, and design targets rather than duplicating implementation steps from "details".
+- "details": array of concrete implementation steps.
+- "acceptanceCriteria": array of observable completion checks.
+- "unitTests": array of tests to add or run.
+- "filesLikelyTouched": array of repo-relative paths or module names.
 
 Use this shape for optional sections:
 
@@ -119,6 +146,9 @@ Use this shape for optional sections:
   "id": "design-rules",
   "title": "Design Rules",
   "kind": "rules",
+  "summary": [
+    "Optional section summary paragraph."
+  ],
   "items": [
     {
       "title": "Rule name",
@@ -129,7 +159,6 @@ Use this shape for optional sections:
 
 Allowed section kinds:
 - "prose"
-- "table"
 - "rules"
 - "checklist"
 - "ordered-steps"
@@ -137,44 +166,6 @@ Allowed section kinds:
 - "data-model"
 - "requirements"
 - "notes"
-
-Use this shape for optional workflows:
-
-{
-  "id": "validation-order",
-  "title": "Validation Order",
-  "kind": "validation",
-  "steps": [
-    "Run the fastest local verification first.",
-    "Run the end-to-end smoke test.",
-    "Run the real production-like validation last."
-  ]
-}
-
-Allowed workflow kinds:
-- "ordered-steps"
-- "checklist"
-- "validation"
-- "smoke-test"
-- "migration"
-
-Use this shape for optional commands:
-
-{
-  "title": "Run tests",
-  "command": "task test",
-  "expectedResults": [
-    "All tests pass."
-  ]
-}
-
-Use this shape for optional blockers:
-
-{
-  "priority": 1,
-  "area": "Compilation",
-  "requiredFix": "Fix the compile error before running integration tests."
-}
 
 Use this shape for required changedFiles:
 

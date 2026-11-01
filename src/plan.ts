@@ -19,9 +19,15 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue }
 
+export type HeroTitle =
+  | NonEmptyString
+  | {
+      lead: NonEmptyString
+      accent?: NonEmptyString
+    }
+
 export type SectionKind =
   | "prose"
-  | "table"
   | "rules"
   | "checklist"
   | "ordered-steps"
@@ -32,17 +38,12 @@ export type SectionKind =
 
 export type StoryRisk = "low" | "medium" | "high" | "critical"
 
-export type WorkflowKind =
-  | "ordered-steps"
-  | "checklist"
-  | "validation"
-  | "smoke-test"
-  | "migration"
-
 export interface Plan {
   schemaVersion: PositiveInteger
   id: Slug
   title: NonEmptyString
+  heroTitle?: HeroTitle
+  firstStorySummary?: NonEmptyString
   project?: NonEmptyString
   generatedAt?: string
   scope?: NonEmptyString
@@ -51,9 +52,6 @@ export interface Plan {
   metadata?: Record<string, JsonValue>
   sections?: PlanSection[]
   epics?: Epic[]
-  workflows?: Workflow[]
-  commands?: PlanCommand[]
-  blockers?: Blocker[]
   exitCriteria?: NonEmptyString[]
   recommendedOrder?: RecommendedOrderItem[]
   changedFiles: FileTree[]
@@ -62,85 +60,38 @@ export interface Plan {
 export interface PlanSection {
   id: Slug
   title: NonEmptyString
-  kind: SectionKind
+  kind?: SectionKind
   summary?: NonEmptyString[]
   items?: SectionItem[]
-  rows?: Array<Record<string, JsonValue>>
-  columns?: NonEmptyString[]
 }
 
 export interface SectionItem {
   text: NonEmptyString
   title?: NonEmptyString
-  status?: PlanStatus
-  priority?: PositiveInteger
-  tags?: NonEmptyString[]
-  ref?: Slug
 }
 
 export interface Epic {
   id: Slug
   title: NonEmptyString
-  stories: Story[]
+  shortTitle?: NonEmptyString
   summary?: NonEmptyString
   description?: NonEmptyString
-  tags?: NonEmptyString[]
-  testFocus?: NonEmptyString
   status?: PlanStatus
   dependencies?: Slug[]
+  stories: Story[]
 }
 
 export interface Story {
   id: Slug
   title: NonEmptyString
+  status?: PlanStatus
+  risk?: StoryRisk
+  dependencies?: Slug[]
   description?: NonEmptyString
   details?: NonEmptyString[]
   acceptanceCriteria?: NonEmptyString[]
   unitTests?: NonEmptyString[]
-  dependencies?: Slug[]
-  status?: PlanStatus
-  tags?: NonEmptyString[]
-  priority?: PositiveInteger
-  risk?: StoryRisk
-  owner?: string | null
-  estimate?: string | number | null
   filesLikelyTouched?: NonEmptyString[]
-  commandsToRun?: NonEmptyString[]
-  artifacts?: NonEmptyString[]
-  notes?: NonEmptyString[]
-}
-
-export interface Workflow {
-  id: Slug
-  title: NonEmptyString
-  kind: WorkflowKind
-  steps: Array<NonEmptyString | WorkflowStep>
-}
-
-export interface WorkflowStep {
-  text: NonEmptyString
-  id?: Slug
-  command?: NonEmptyString
-  expectedResults?: NonEmptyString[]
-  status?: PlanStatus
-  refs?: Slug[]
-}
-
-export interface PlanCommand {
-  title: NonEmptyString
-  command: NonEmptyString
-  workingDirectory?: NonEmptyString
-  environment?: Record<string, string>
-  expectedResults?: NonEmptyString[]
-  refs?: Slug[]
-}
-
-export interface Blocker {
-  priority: PositiveInteger
-  area: NonEmptyString
-  requiredFix: NonEmptyString
-  status?: PlanStatus
-  refs?: Slug[]
 }
 
 export interface RecommendedOrderItem {

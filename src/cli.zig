@@ -556,9 +556,9 @@ fn updateLoop(store: *const loop_store.Store, id: []const u8, options: loop_opti
                 try stderr.print("Cannot record blocker for loop {s} from status {s}\n", .{ id, @tagName(state.status) });
                 return .failure;
             }
-            state.blocked_strikes = @min(state.blocked_strikes +| 1, 3);
+            state.blocked_strikes = @min(state.blocked_strikes +| 1, loop_store.max_blocked_strikes);
             state.last_blocker_summary = options.summary;
-            if (state.blocked_strikes >= 3) {
+            if (state.blocked_strikes >= loop_store.max_blocked_strikes) {
                 state.status = .blocked;
             } else {
                 state.status = .active;
@@ -568,7 +568,7 @@ fn updateLoop(store: *const loop_store.Store, id: []const u8, options: loop_opti
     state.updated_at_ms = @intCast(@max(0, std.Io.Clock.real.now(store.io).toMilliseconds()));
     store.saveState(state) catch |err| return reportLoopStoreError(err, id, stderr);
     if (options.status == .blocked and state.status == .active) {
-        try stdout.print("Blocker recorded (strike {d}/3); loop remains active—attempt an alternative path.\n", .{state.blocked_strikes});
+        try stdout.print("Blocker recorded (strike {d}/{d}); loop remains active—attempt an alternative path.\n", .{ state.blocked_strikes, loop_store.max_blocked_strikes });
     } else {
         try stdout.print("Loop {s} status: {s}\n", .{ id, @tagName(state.status) });
     }
@@ -1417,9 +1417,15 @@ test "usage includes embedded plan and map format instructions" {
     try std.testing.expectEqual(ExitCode.ok, code);
     try std.testing.expect(std.mem.indexOf(u8, output, "matcha usage for LLMs") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Plan input format:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "  Plan input format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "  Output exactly one JSON object and nothing else.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"heroTitle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"firstStorySummary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"shortTitle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"workflows\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"commandsToRun\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"blockers\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Map input format:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "  Map input format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"diagramKind\"") != null);
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
 }
 
@@ -2514,14 +2520,14 @@ test "loop CLI help, list, show, update, and verify callbacks" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_buffer[0..stdout.end], "implemented core") != null);
 
     var strike: u8 = 1;
-    while (strike <= 3) : (strike += 1) {
+    while (strike <= loop_store.max_blocked_strikes) : (strike += 1) {
         stdout = .fixed(&stdout_buffer);
         stderr = .fixed(&stderr_buffer);
         code = try runArgsWithLoopStoreRoot(&.{ "loop", "update", state.id, "--status", "blocked", "--summary", "blocked step" }, std.testing.io, &stdout, &stderr, store_root);
         try std.testing.expectEqual(ExitCode.ok, code);
         var loaded = try store.loadState(state.id);
         defer loaded.deinit();
-        try std.testing.expectEqual(if (strike == 3) loop_store.LoopStatus.blocked else loop_store.LoopStatus.active, loaded.value.status);
+        try std.testing.expectEqual(if (strike == loop_store.max_blocked_strikes) loop_store.LoopStatus.blocked else loop_store.LoopStatus.active, loaded.value.status);
         try std.testing.expectEqual(strike, loaded.value.blocked_strikes);
     }
 
