@@ -1,39 +1,47 @@
 <script lang="ts">
   import type { FileTree } from "../../../../src/plan.ts"
   import FileTreeNodeView from "./FileTreeNodeView.svelte"
+  import { countFileStats } from "../../lib/fileTreeHelpers"
 
-  export let changedFiles: FileTree[]
+  export let changedFiles: FileTree[] = []
+
+  $: stats = countFileStats(changedFiles)
+
+  function handleExpandAll(): void {
+    if (typeof document !== "undefined") {
+      const folders = document.querySelectorAll<HTMLDetailsElement>("#view-files .folder")
+      folders.forEach((f) => {
+        f.open = true
+      })
+    }
+  }
+
+  function handleCollapseAll(): void {
+    if (typeof document !== "undefined") {
+      const folders = document.querySelectorAll<HTMLDetailsElement>("#view-files .folder")
+      folders.forEach((f) => {
+        f.open = f.dataset.depth === "0"
+      })
+    }
+  }
 </script>
 
-<section class="document-section" id="changed-files">
-  <header class="section-header">
-    <h1 class="section-title">Changed Files</h1>
-    <p class="page-subtitle">Files added or modified by this plan.</p>
-  </header>
+<div class="files-toolbar">
+  <span class="file-count">
+    {stats.total} proposed files <span aria-hidden="true">·</span>
+    {stats.newCount} new <span aria-hidden="true">·</span>
+    {stats.modCount} modified
+  </span>
+  <div class="files-actions">
+    <button type="button" data-expand-files on:click={handleExpandAll}>Expand all</button>
+    <button type="button" data-collapse-files on:click={handleCollapseAll}>Collapse all</button>
+  </div>
+</div>
 
+<div class="file-tree" aria-label="Proposed implementation files and mirrored tests">
   {#each changedFiles as tree}
-    <div class="ft-tree">
-      {#if tree.label}
-        <h2 class="ft-tree-label">{tree.label}</h2>
-      {/if}
-      <FileTreeNodeView node={tree.root} depth={0} />
-    </div>
+    {#if tree.root}
+      <FileTreeNodeView node={tree.root} parentPath="" depth={0} />
+    {/if}
   {/each}
-</section>
-
-<style>
-  .ft-tree {
-    margin-bottom: 1.5rem;
-  }
-
-  .ft-tree:last-child {
-    margin-bottom: 0;
-  }
-
-  .ft-tree-label {
-    font-size: 1rem;
-    font-weight: 700;
-    color: var(--ink);
-    margin: 0 0 0.5rem;
-  }
-</style>
+</div>

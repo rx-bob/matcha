@@ -12,6 +12,7 @@
     applyEvaTheme,
   } from "./lib/theme"
   import { resolveViewForHash } from "./lib/overviewHelpers"
+  import { initClipboardDelegation } from "./lib/clipboard"
 
   export let plan: Plan
 
@@ -224,6 +225,7 @@
 
     window.addEventListener("keydown", onWindowKeydown)
     document.addEventListener("click", onDocumentClick)
+    const cleanupClipboard = initClipboardDelegation()
 
     if (sidebarElement) {
       sidebarElement.inert = isMobile && !isNavOpen
@@ -234,6 +236,7 @@
       window.removeEventListener("hashchange", syncHash)
       window.removeEventListener("keydown", onWindowKeydown)
       document.removeEventListener("click", onDocumentClick)
+      cleanupClipboard()
       if (typeof document !== "undefined") {
         document.body.classList.remove("nav-open")
         document.body.style.overflow = ""
@@ -453,3 +456,5 @@
     <PlanPage {plan} {currentView} />
   </main>
 </div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

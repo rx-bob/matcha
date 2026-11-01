@@ -1,219 +1,47 @@
 <script lang="ts">
-  import type { FileTreeNode, FileNodeStatus } from "../../../../src/plan.ts"
-  import { storyDomId } from "../../lib/ids.ts"
-  import { Folder, FolderOpen, File, ChevronRight, ChevronDown } from "@lucide/svelte"
+  import type { FileTreeNode } from "../../../../src/plan.ts"
+  import { computeChildPath } from "../../lib/fileTreeHelpers"
 
   export let node: FileTreeNode
-  export let depth: number = 0
+  export let parentPath = ""
+  export let depth = 0
 
-  let collapsed = false
-
-  function toggle() {
-    collapsed = !collapsed
-  }
-
-  function hasStatusInChildren(node: FileTreeNode): boolean {
-    for (const child of node.children ?? []) {
-      if (child.status) return true
-      if (child.type === "folder" && hasStatusInChildren(child)) return true
-    }
-    return false
-  }
-
-  function statusBadgeClass(status: FileNodeStatus | undefined): string {
-    if (status === "new") return "ft-badge ft-badge-new"
-    if (status === "modified") return "ft-badge ft-badge-modified"
-    return ""
-  }
-
-  function statusLabel(status: FileNodeStatus | undefined): string {
-    if (status === "new") return "New"
-    if (status === "modified") return "Modified"
-    return ""
-  }
-
+  $: currentPath = computeChildPath(parentPath, node.name, node.path)
   $: isFolder = node.type === "folder"
-  $: showDescendantDot = isFolder && !collapsed && hasStatusInChildren(node)
 </script>
 
-<div class="ft-node" style="--ft-depth: {depth}">
-  {#if isFolder}
-    <div
-      class="ft-row ft-folder-row"
-      role="button"
-      tabindex="0"
-      aria-expanded={!collapsed}
-      on:click={toggle}
-      on:keydown={(e) => e.key === "Enter" || e.key === " " ? toggle() : null}
-    >
-      <span class="ft-toggle">
-        {#if collapsed}
-          <ChevronRight size={14} />
-        {:else}
-          <ChevronDown size={14} />
-        {/if}
-      </span>
-      <span class="ft-icon ft-icon-folder">
-        {#if collapsed}
-          <Folder size={16} />
-        {:else}
-          <FolderOpen size={16} />
-        {/if}
-      </span>
-      <span class="ft-name">{node.name}</span>
-      {#if hasStatusInChildren(node)}
-        <span class="ft-descendant-dot" title="contains changes"></span>
-      {/if}
+{#if isFolder}
+  <details class="folder" open data-depth={depth} data-path={currentPath}>
+    <summary>
+      <svg class="folder-icon" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+        <path
+          d="M2.5 5.5A1.5 1.5 0 0 1 4 4h4l2 2h6A1.5 1.5 0 0 1 17.5 7.5v8A1.5 1.5 0 0 1 16 17H4a1.5 1.5 0 0 1-1.5-1.5Z"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.4"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <span class="folder-name">{node.name}</span>
+    </summary>
+    <div class="folder-children">
+      {#each node.children ?? [] as child}
+        <svelte:self node={child} parentPath={currentPath} depth={depth + 1} />
+      {/each}
     </div>
-    {#if !collapsed}
-      <div class="ft-children">
-        {#each node.children ?? [] as child}
-          <svelte:self node={child} depth={depth + 1} />
-        {/each}
-      </div>
+  </details>
+{:else}
+  <div class="file-row" data-path={currentPath}>
+    <code class="file-name" title={currentPath}>{node.name}</code>
+    {#if node.status}
+      <span class="file-status {node.status}">{node.status}</span>
     {/if}
-  {:else}
-    <div class="ft-row ft-file-row">
-      <span class="ft-toggle ft-toggle-leaf"></span>
-      <span class="ft-icon ft-icon-file">
-        <File size={16} />
+    {#if node.stories && node.stories.length > 0}
+      <span class="file-stories">
+        {#each node.stories as storyId}
+          <a href="#{storyId}" class="story-link"><code>{storyId}</code></a>
+        {/each}
       </span>
-      <span class="ft-name">{node.name}</span>
-      {#if node.status}
-        <span class={statusBadgeClass(node.status)}>{statusLabel(node.status)}</span>
-      {/if}
-      {#if node.stories && node.stories.length > 0}
-        <span class="ft-stories">(Stories:{#each node.stories as storyId, i}&nbsp;<a class="ft-story-link" href={"#" + storyDomId(storyId)}>{storyId}</a>{#if i < node.stories.length - 1},{/if}{/each})</span>
-      {/if}
-    </div>
-  {/if}
-</div>
-
-<style>
-  .ft-node {
-    --ft-indent: 1.25rem;
-  }
-
-  .ft-row {
-    display: flex;
-    align-items: center;
-    gap: 0.375rem;
-    padding-left: calc(var(--ft-depth) * var(--ft-indent));
-    min-height: 1.75rem;
-    cursor: default;
-    user-select: none;
-    border-radius: 0.25rem;
-  }
-
-  .ft-folder-row {
-    cursor: pointer;
-  }
-
-  .ft-folder-row:hover {
-    background: var(--soft);
-  }
-
-  .ft-folder-row:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: -2px;
-  }
-
-  .ft-toggle {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1rem;
-    height: 1rem;
-    flex-shrink: 0;
-    color: var(--subtle);
-  }
-
-  .ft-toggle-leaf {
-    width: 1rem;
-    flex-shrink: 0;
-  }
-
-  .ft-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-
-  .ft-icon-folder {
-    color: var(--primary);
-  }
-
-  .ft-icon-file {
-    color: var(--muted);
-  }
-
-  .ft-name {
-    font-size: 0.8125rem;
-    color: var(--ink);
-    white-space: nowrap;
-  }
-
-  .ft-folder-row .ft-name {
-    font-weight: 600;
-  }
-
-  .ft-file-row .ft-name {
-    font-weight: 400;
-  }
-
-  .ft-descendant-dot {
-    display: inline-block;
-    width: 0.4rem;
-    height: 0.4rem;
-    border-radius: 50%;
-    background: var(--primary);
-    margin-left: 0.25rem;
-    flex-shrink: 0;
-  }
-
-  .ft-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.625rem;
-    font-weight: 700;
-    border-radius: 0.25rem;
-    padding: 0.05rem 0.3rem;
-    line-height: 1.4;
-    margin-left: 0.25rem;
-    flex-shrink: 0;
-  }
-
-  .ft-badge-new {
-    background: color-mix(in srgb, var(--primary) 18%, transparent);
-    color: var(--primary);
-    border: 1px solid color-mix(in srgb, var(--primary) 35%, transparent);
-  }
-
-  .ft-badge-modified {
-    background: color-mix(in srgb, var(--muted) 18%, transparent);
-    color: var(--muted);
-    border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent);
-  }
-
-  .ft-stories {
-    font-size: 0.6875rem;
-    color: var(--subtle);
-    margin-left: 0.25rem;
-    flex-shrink: 0;
-  }
-
-  .ft-story-link {
-    color: var(--primary);
-    text-decoration: none;
-  }
-
-  .ft-story-link:hover {
-    text-decoration: underline;
-  }
-
-  .ft-children {
-    /* children rendered with own depth via svelte:self */
-  }
-</style>
+    {/if}
+  </div>
+{/if}

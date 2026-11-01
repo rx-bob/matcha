@@ -24,9 +24,7 @@
   <header class="page-heading">
     <h1>Project files</h1>
   </header>
-  {#if plan.changedFiles && plan.changedFiles.length > 0}
-    <FileTreeSection changedFiles={plan.changedFiles} />
-  {/if}
+  <FileTreeSection changedFiles={plan.changedFiles ?? []} />
 </section>
 
 <SectionsSection sections={plan.sections} hidden={currentView !== "context"} />
