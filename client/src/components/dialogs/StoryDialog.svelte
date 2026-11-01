@@ -5,7 +5,7 @@
         <code id="story-dialog-id"></code>
         <span id="story-dialog-risk" class="risk-badge"></span>
       </div>
-      <h2 id="story-dialog-title" tabindex="-1"></h2>
+      <h2 id="story-dialog-title" tabindex="-1">Story</h2>
     </div>
     <button type="button" id="close-story" class="story-dialog-close" aria-label="Close story">
       <svg aria-hidden="true"><use href="#i-close" /></svg>

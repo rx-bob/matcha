@@ -1,16 +1,20 @@
+import coralFavicon from "../../../assets/favicon-coral.png?inline"
+import chonkFavicon from "../../../assets/favicon-chonk.png?inline"
+import evaFavicon from "../../../assets/favicon-eva-01.png?inline"
+
 export const planDesignStorageKey = "matcha-plan-design"
 export const evaThemeStorageKey = "matcha-eva-theme"
 
-export type PlanDesign = "coral" | "mistral" | "eva-01"
+export type PlanDesign = "coral" | "chonk" | "eva-01"
 export type EvaTheme = "dark" | "light"
 
 export const defaultPlanDesign: PlanDesign = "coral"
 export const defaultEvaTheme: EvaTheme = "dark"
 
-export const planDesigns: readonly PlanDesign[] = ["mistral", "coral", "eva-01"] as const
+export const planDesigns: readonly PlanDesign[] = ["chonk", "coral", "eva-01"] as const
 
 export function isPlanDesign(value: string | null | undefined): value is PlanDesign {
-  return value === "coral" || value === "mistral" || value === "eva-01"
+  return value === "coral" || value === "chonk" || value === "eva-01"
 }
 
 export function isEvaTheme(value: string | null | undefined): value is EvaTheme {
@@ -18,6 +22,8 @@ export function isEvaTheme(value: string | null | undefined): value is EvaTheme 
 }
 
 export function readStoredPlanDesign(storageKey = planDesignStorageKey): PlanDesign {
+  const initial = typeof document !== "undefined" ? document.documentElement.dataset.initialDesign : undefined
+  if (isPlanDesign(initial)) return initial
   try {
     if (typeof localStorage !== "undefined") {
       const saved = localStorage.getItem(storageKey)
@@ -37,7 +43,12 @@ export function writeStoredPlanDesign(design: PlanDesign, storageKey = planDesig
   } catch {}
 }
 
-export function readStoredEvaTheme(storageKey = evaThemeStorageKey): EvaTheme {
+function getEvaThemeStorageKey(): string {
+  return (typeof document !== "undefined" && document.documentElement.dataset.evaThemeStorageKey) || evaThemeStorageKey
+}
+
+export function readStoredEvaTheme(storageKey = getEvaThemeStorageKey()): EvaTheme {
+  const initial = typeof document !== "undefined" ? document.documentElement.dataset.initialEvaTheme : undefined
   try {
     if (typeof localStorage !== "undefined") {
       const saved = localStorage.getItem(storageKey)
@@ -46,10 +57,10 @@ export function readStoredEvaTheme(storageKey = evaThemeStorageKey): EvaTheme {
       }
     }
   } catch {}
-  return defaultEvaTheme
+  return isEvaTheme(initial) ? initial : defaultEvaTheme
 }
 
-export function writeStoredEvaTheme(theme: EvaTheme, storageKey = evaThemeStorageKey): void {
+export function writeStoredEvaTheme(theme: EvaTheme, storageKey = getEvaThemeStorageKey()): void {
   try {
     if (typeof localStorage !== "undefined") {
       localStorage.setItem(storageKey, theme)
@@ -57,20 +68,16 @@ export function writeStoredEvaTheme(theme: EvaTheme, storageKey = evaThemeStorag
   } catch {}
 }
 
-export function getFaviconSvg(design: PlanDesign): string {
-  const coral = design === "coral"
-  const mistral = design === "mistral"
-  const rx = coral ? 10 : mistral ? 4 : 0
-  const bg = coral ? "#f5f3ef" : mistral ? "#0b0b12" : "#0d0d13"
-  const fill = coral ? "#ff806e" : mistral ? "#ff8200" : "#bdff39"
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect width="40" height="40" rx="${rx}" fill="${bg}"/><path d="M10 28c0-5 8-4 10-9V11c0-6 9-6 9 0h5l-6 4v9c0 6-12 10-18 4Z" fill="${fill}"/></svg>`
+export function getFaviconUrl(design: PlanDesign): string {
+  return design === "coral" ? coralFavicon : design === "chonk" ? chonkFavicon : evaFavicon
 }
 
 export function updateFavicon(design: PlanDesign): void {
   if (typeof document === "undefined") return
   const iconLink = document.querySelector('link[rel="icon"]') as HTMLLinkElement | null
   if (iconLink) {
-    iconLink.href = "data:image/svg+xml," + encodeURIComponent(getFaviconSvg(design))
+    iconLink.type = "image/png"
+    iconLink.href = getFaviconUrl(design)
   }
 }
 
@@ -85,7 +92,7 @@ export function applyPlanDesign(
   const theme: "dark" | "light" =
     validDesign === "coral"
       ? "light"
-      : validDesign === "mistral"
+      : validDesign === "chonk"
         ? "dark"
         : validEvaTheme
 

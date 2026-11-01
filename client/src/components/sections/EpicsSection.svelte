@@ -1,30 +1,25 @@
 <script lang="ts">
   import type { Epic } from "../../../../src/plan.ts"
   import MarkdownText from "../ui/MarkdownText.svelte"
-  import {
-    extractAvailableRisks,
-    filterEpicsAndStories,
-    type StoryFilterState,
-  } from "../../lib/epicsHelpers"
+  import { filterEpicsAndStories } from "../../lib/epicsHelpers"
   import { showToast } from "../../lib/toast"
   import { onMount } from "svelte"
   import { CLEAR_STORY_FILTERS_EVENT } from "../../lib/router"
 
   export let epics: Epic[] | undefined = []
+  export let onNavigate: (hash: string) => void
 
   let searchQuery = ""
-  let selectedRisk = "all"
 
   $: allEpics = epics ?? []
-  $: availableRisks = extractAvailableRisks(allEpics)
-  $: filterState = filterEpicsAndStories(allEpics, searchQuery, selectedRisk)
+  $: filterState = filterEpicsAndStories(allEpics, searchQuery)
   $: countText =
     filterState.visibleStories === filterState.totalStories
       ? `${filterState.totalStories} stories`
       : `${filterState.visibleStories} of ${filterState.totalStories} stories`
 
   function handleFilter(): void {
-    filterState = filterEpicsAndStories(allEpics, searchQuery, selectedRisk)
+    filterState = filterEpicsAndStories(allEpics, searchQuery)
   }
 
   function handleCollapseStories(): void {
@@ -40,7 +35,6 @@
   onMount(() => {
     const clear = (): void => {
       searchQuery = ""
-      selectedRisk = "all"
     }
     window.addEventListener(CLEAR_STORY_FILTERS_EVENT, clear)
     return () => window.removeEventListener(CLEAR_STORY_FILTERS_EVENT, clear)
@@ -48,7 +42,6 @@
 
   function handleClearFilters(): void {
     searchQuery = ""
-    selectedRisk = "all"
     handleFilter()
     if (typeof document !== "undefined") {
       const input = document.getElementById("story-filter") as HTMLInputElement | null
@@ -69,20 +62,28 @@
       type="search"
       id="story-filter"
       placeholder="Filter stories…"
-      aria-label="Filter implementation stories"
+      aria-label="Filter stories"
       bind:value={searchQuery}
       on:input={handleFilter}
     />
   </label>
   <select
-    id="risk-filter"
-    aria-label="Filter by risk"
-    bind:value={selectedRisk}
-    on:change={handleFilter}
+    id="epic-story-picker"
+    aria-label="Go to epic or story"
+    on:change={(event) => {
+      const id = event.currentTarget.value
+      event.currentTarget.value = ""
+      if (id) onNavigate(`#${encodeURIComponent(id)}`)
+    }}
   >
-    <option value="all">All risk levels</option>
-    {#each availableRisks as r}
-      <option value={r}>{r[0].toUpperCase() + r.slice(1)} risk</option>
+    <option value="">Go to epic or story…</option>
+    {#each allEpics as epic (epic.id)}
+      <optgroup label={`${epic.id} — ${epic.shortTitle || epic.title}`}>
+        <option value={epic.id}>View epic: {epic.title}</option>
+        {#each epic.stories as story (story.id)}
+          <option value={story.id}>↳ {story.id} — {story.title}</option>
+        {/each}
+      </optgroup>
     {/each}
   </select>
   <span class="filter-count" id="filter-count" aria-live="polite">{countText}</span>
@@ -243,3 +244,13 @@
     </div>
   </article>
 {/each}
+
+<style>
+  #epic-story-picker {
+    flex: 0 1 24rem;
+    width: 24rem;
+    min-width: 0;
+    max-width: 100%;
+    text-overflow: ellipsis;
+  }
+</style>

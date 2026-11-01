@@ -18,7 +18,10 @@ export async function copyText(text: string, label = "Copied to clipboard"): Pro
     helper.value = text
     helper.style.cssText = "position:fixed;left:-9999px;top:0"
     const previousFocus = document.activeElement as HTMLElement | null
-    document.body.appendChild(helper)
+    // Content outside the topmost modal is inert, including temporary copy inputs.
+    const container = previousFocus?.closest("dialog[open]") ?? document.body
+    container.appendChild(helper)
+    helper.focus()
     helper.select()
     let copied = false
     try {

@@ -10,7 +10,7 @@ import {
   writeStoredPlanDesign,
   readStoredEvaTheme,
   writeStoredEvaTheme,
-  getFaviconSvg,
+  getFaviconUrl,
   updateFavicon,
   applyPlanDesign,
   applyEvaTheme,
@@ -58,9 +58,9 @@ describe("theme and design system", () => {
       },
     }
 
-    // @ts-expect-error global mock
+    // @ts-expect-error Partial DOM fixture for theme state tests.
     globalThis.document = {
-      documentElement: docElement,
+      documentElement: docElement as unknown as HTMLElement,
       querySelector: (selector: string) => {
         if (selector === 'link[rel="icon"]') {
           return mockIconLink
@@ -68,6 +68,33 @@ describe("theme and design system", () => {
         return null
       },
     }
+  })
+
+  it("uses explicit sample design overrides instead of saved preferences", () => {
+    mockStorage[planDesignStorageKey] = "coral"
+    mockStorage[evaThemeStorageKey] = "dark"
+    mockDataset.initialDesign = "eva-01"
+    mockDataset.initialEvaTheme = "light"
+    mockDataset.evaThemeStorageKey = "matcha-eva-theme:preview-light"
+    expect(readStoredPlanDesign()).toBe("eva-01")
+    expect(readStoredEvaTheme()).toBe("light")
+    expect(mockStorage[planDesignStorageKey]).toBe("coral")
+    expect(mockStorage[evaThemeStorageKey]).toBe("dark")
+  })
+
+  it("remembers color changes in each preview without overwriting another preview's default", () => {
+    mockDataset.initialEvaTheme = "dark"
+    mockDataset.evaThemeStorageKey = "matcha-eva-theme:preview-dark"
+    expect(readStoredEvaTheme()).toBe("dark")
+    applyEvaTheme("light")
+    expect(readStoredEvaTheme()).toBe("light")
+    mockDataset.initialEvaTheme = "light"
+    mockDataset.evaThemeStorageKey = "matcha-eva-theme:preview-light"
+    expect(readStoredEvaTheme()).toBe("light")
+    applyEvaTheme("dark")
+    expect(readStoredEvaTheme()).toBe("dark")
+    mockDataset.evaThemeStorageKey = "matcha-eva-theme:preview-dark"
+    expect(readStoredEvaTheme()).toBe("light")
   })
 
   describe("defaults and guards", () => {
@@ -80,7 +107,7 @@ describe("theme and design system", () => {
 
     it("validates plan designs", () => {
       expect(isPlanDesign("coral")).toBe(true)
-      expect(isPlanDesign("mistral")).toBe(true)
+      expect(isPlanDesign("chonk")).toBe(true)
       expect(isPlanDesign("eva-01")).toBe(true)
       expect(isPlanDesign("unknown")).toBe(false)
       expect(isPlanDesign(null)).toBe(false)
@@ -99,8 +126,8 @@ describe("theme and design system", () => {
   describe("storage persistence", () => {
     it("reads stored plan design with fallback to coral", () => {
       expect(readStoredPlanDesign()).toBe("coral")
-      writeStoredPlanDesign("mistral")
-      expect(readStoredPlanDesign()).toBe("mistral")
+      writeStoredPlanDesign("chonk")
+      expect(readStoredPlanDesign()).toBe("chonk")
       localStorage.setItem(planDesignStorageKey, "invalid")
       expect(readStoredPlanDesign()).toBe("coral")
     })
@@ -115,28 +142,18 @@ describe("theme and design system", () => {
   })
 
   describe("favicon generation", () => {
-    it("generates design-specific dynamic svg favicons", () => {
-      const coralSvg = getFaviconSvg("coral")
-      expect(coralSvg).toContain("rx=\"10\"")
-      expect(coralSvg).toContain("fill=\"#f5f3ef\"")
-      expect(coralSvg).toContain("fill=\"#ff806e\"")
-
-      const mistralSvg = getFaviconSvg("mistral")
-      expect(mistralSvg).toContain("rx=\"4\"")
-      expect(mistralSvg).toContain("fill=\"#0b0b12\"")
-      expect(mistralSvg).toContain("fill=\"#ff8200\"")
-
-      const evaSvg = getFaviconSvg("eva-01")
-      expect(evaSvg).toContain("rx=\"0\"")
-      expect(evaSvg).toContain("fill=\"#0d0d13\"")
-      expect(evaSvg).toContain("fill=\"#bdff39\"")
+    it("embeds a distinct mascot PNG for each design", () => {
+      const icons = ["coral", "chonk", "eva-01"].map(design => getFaviconUrl(design as "coral" | "chonk" | "eva-01"))
+      expect(new Set(icons).size).toBe(3)
+      for (const icon of icons) expect(icon).toMatch(/^data:image\/png;base64,iVBOR/)
     })
 
-    it("updates existing link[rel=icon] href in DOM", () => {
+    it("updates the favicon when the selected design changes", () => {
       mockIconLink = { rel: "icon", href: "" }
-      updateFavicon("coral")
-      expect(mockIconLink.href).toContain("data:image/svg+xml")
-      expect(decodeURIComponent(mockIconLink.href)).toContain("rx=\"10\"")
+      for (const design of ["coral", "chonk", "eva-01"] as const) {
+        updateFavicon(design)
+        expect(mockIconLink.href).toBe(getFaviconUrl(design))
+      }
     })
   })
 
@@ -150,13 +167,13 @@ describe("theme and design system", () => {
       expect(localStorage.getItem(planDesignStorageKey)).toBe("coral")
     })
 
-    it("applies mistral design forcing dark theme", () => {
-      const result = applyPlanDesign("mistral", "light")
-      expect(result.design).toBe("mistral")
+    it("applies chonk design forcing dark theme", () => {
+      const result = applyPlanDesign("chonk", "light")
+      expect(result.design).toBe("chonk")
       expect(result.theme).toBe("dark")
-      expect(mockDataset.design).toBe("mistral")
+      expect(mockDataset.design).toBe("chonk")
       expect(mockDataset.theme).toBe("dark")
-      expect(localStorage.getItem(planDesignStorageKey)).toBe("mistral")
+      expect(localStorage.getItem(planDesignStorageKey)).toBe("chonk")
     })
 
     it("applies eva-01 with specified evaTheme", () => {

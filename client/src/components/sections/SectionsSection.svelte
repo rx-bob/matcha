@@ -7,7 +7,7 @@
 
 <section class="page-view" id="view-context" data-view="context" {hidden}>
   <header class="page-heading">
-    <h1>Decisions &amp; architecture</h1>
+    <h1>Decisions</h1>
   </header>
 
   {#each sections as section}
@@ -20,7 +20,9 @@
         {/if}
       </div>
       {#if section.summary}
-        <p class="context-summary">{section.summary}</p>
+        {#each section.summary as paragraph}
+          <p class="context-summary">{paragraph}</p>
+        {/each}
       {/if}
       <div class="context-items">
         {#each section.items || [] as item}

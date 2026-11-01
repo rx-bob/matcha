@@ -39,6 +39,14 @@ tasks:
     cmds:
       - zig build run -- plan
 
+  run-plan-designs:
+    desc: Generate sample plans for Coral, Chonk, and EVA dark/light with a comparison index
+    deps:
+      - build-client
+    cmds:
+      - task: run-plan
+      - node client/scripts/generate-plan-designs.cjs
+
   run-map:
     desc: Run sample map
     cmds:
@@ -57,6 +65,7 @@ tasks:
       - tsconfig.json
       - vite.config.ts
       - src/**/*
+      - ../assets/*.png
     generates:
       - ../plan.js
       - ../plan-components.css

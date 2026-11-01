@@ -31,6 +31,7 @@ describe("clipboard", () => {
       createElement: () => ({
         style: {},
         value: "",
+        focus: () => {},
         select: () => {},
         remove: () => {},
       }),
@@ -62,6 +63,21 @@ describe("clipboard", () => {
 
     expect(writeTextMock).toHaveBeenCalledWith("/my/path/file.goose")
     expect(mockToast.textContent).toBe("Local reference path copied")
+    expect(mockToast.hidden).toBe(false)
+  })
+
+  it("places the legacy copy input inside the active modal", async () => {
+    writeTextMock.mockRejectedValue(new Error("denied"))
+    const appendChild = vi.fn()
+    const closest = vi.fn().mockReturnValue({ appendChild })
+    Object.assign(document, {
+      activeElement: { closest, isConnected: false },
+      execCommand: vi.fn().mockReturnValue(true),
+    })
+    await copyText("/modal/reference")
+    expect(closest).toHaveBeenCalledWith("dialog[open]")
+    expect(appendChild).toHaveBeenCalled()
+    expect(document.execCommand).toHaveBeenCalledWith("copy")
     expect(mockToast.hidden).toBe(false)
   })
 

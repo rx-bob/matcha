@@ -21,25 +21,34 @@ pub fn defaultOutput(target: RenderTarget) []const u8 {
     };
 }
 
-const plan_favicon_url = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23f5f3ef'/%3E%3Cpath d='M10 28c0-5 8-4 10-9V11c0-6 9-6 9 0h5l-6 4v9c0 6-12 10-18 4Z' fill='%23ff806e'/%3E%3C/svg%3E";
+fn faviconDataUrl(comptime png: []const u8) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var encoded: [std.base64.standard.Encoder.calcSize(png.len)]u8 = undefined;
+        break :blk "data:image/png;base64," ++ std.base64.standard.Encoder.encode(&encoded, png);
+    };
+}
+
+const coral_favicon_url = faviconDataUrl(@embedFile("../assets/favicon-coral.png"));
+const chonk_favicon_url = faviconDataUrl(@embedFile("../assets/favicon-chonk.png"));
+const eva_favicon_url = faviconDataUrl(@embedFile("../assets/favicon-eva-01.png"));
 
 const plan_boot_script =
     \\<script>
     \\  (function() {
     \\    try {
     \\      var root = document.documentElement;
-    \\      var savedDesign = localStorage.getItem('matcha-plan-design');
-    \\      var designs = ['coral', 'mistral', 'eva-01'];
+    \\      var savedDesign = root.dataset.initialDesign || localStorage.getItem('matcha-plan-design');
+    \\      var designs = ['coral', 'chonk', 'eva-01'];
     \\      var design = (savedDesign && designs.indexOf(savedDesign) !== -1) ? savedDesign : 'coral';
     \\      root.dataset.design = design;
-    \\      var savedTheme = localStorage.getItem('matcha-eva-theme');
-    \\      var theme = design === 'coral' ? 'light' : design === 'mistral' ? 'dark' : (savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : 'dark');
+    \\      var savedTheme = localStorage.getItem(root.dataset.evaThemeStorageKey || 'matcha-eva-theme');
+    \\      if (savedTheme !== 'light' && savedTheme !== 'dark') savedTheme = root.dataset.initialEvaTheme;
+    \\      var theme = design === 'coral' ? 'light' : design === 'chonk' ? 'dark' : (savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : 'dark');
     \\      root.dataset.theme = theme;
     \\      var fav = document.getElementById('dynamic-favicon');
     \\      if (fav) {
-    \\        var c = design === 'coral';
-    \\        var m = design === 'mistral';
-    \\        fav.href = 'data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 40 40\'%3E%3Crect width=\'40\' height=\'40\' rx=\'' + (c ? 10 : m ? 4 : 0) + '\' fill=\'' + (c ? '%23f5f3ef' : m ? '%230b0b12' : '%230d0d13') + '\'/%3E%3Cpath d=\'M10 28c0-5 8-4 10-9V11c0-6 9-6 9 0h5l-6 4v9c0 6-12 10-18 4Z\' fill=\'' + (c ? '%23ff806e' : m ? '%23ff8200' : '%23bdff39') + '\'/%3E%3C/svg%3E';
+    \\        fav.href = fav.getAttribute('data-favicon-' + design);
     \\      }
     \\    } catch (e) {}
     \\  })();
@@ -58,15 +67,8 @@ pub fn writePlanHtml(io: std.Io, output_path: []const u8, title: []const u8, pay
     try file.writeStreamingAll(io, "</title>\n");
     try file.writeStreamingAll(io, "  <meta charset=\"UTF-8\">\n");
     try file.writeStreamingAll(io, "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
-    try file.writeStreamingAll(io, "  <link rel=\"icon\" id=\"dynamic-favicon\" type=\"image/svg+xml\" href=\"");
-    try file.writeStreamingAll(io, plan_favicon_url);
-    try file.writeStreamingAll(io, "\">\n");
-    try file.writeStreamingAll(io, "  ");
-    try file.writeStreamingAll(io, plan_boot_script);
-    try file.writeStreamingAll(io, "\n");
-
     // Critical for serve_catalog.zig prefix classification:
-    // Emit plan-data and window.PLAN_DATA BEFORE the inlined plan.css stylesheet
+    // Emit plan-data before the embedded favicon images and plan.css stylesheet
     // so id="plan-data" always falls well within classify_prefix_bytes (64 KB).
     try file.writeStreamingAll(io, "  <script type=\"application/json\" id=\"plan-data\">\n");
     try writeEmbeddedJson(io, file, payload);
@@ -74,6 +76,19 @@ pub fn writePlanHtml(io: std.Io, output_path: []const u8, title: []const u8, pay
     try file.writeStreamingAll(io, "  <script>\n");
     try file.writeStreamingAll(io, "    window.PLAN_DATA = JSON.parse(document.getElementById(\"plan-data\").textContent);\n");
     try file.writeStreamingAll(io, "  </script>\n");
+
+    try file.writeStreamingAll(io, "  <link rel=\"icon\" id=\"dynamic-favicon\" type=\"image/png\" href=\"");
+    try file.writeStreamingAll(io, coral_favicon_url);
+    try file.writeStreamingAll(io, "\" data-favicon-coral=\"");
+    try file.writeStreamingAll(io, coral_favicon_url);
+    try file.writeStreamingAll(io, "\" data-favicon-chonk=\"");
+    try file.writeStreamingAll(io, chonk_favicon_url);
+    try file.writeStreamingAll(io, "\" data-favicon-eva-01=\"");
+    try file.writeStreamingAll(io, eva_favicon_url);
+    try file.writeStreamingAll(io, "\">\n");
+    try file.writeStreamingAll(io, "  ");
+    try file.writeStreamingAll(io, plan_boot_script);
+    try file.writeStreamingAll(io, "\n");
 
     try file.writeStreamingAll(io, "  <style>");
     try writeStyle(io, file, &assets.plan_css);
@@ -221,7 +236,7 @@ test "plan HTML render emits required markers and title" {
     var file = try tmp.dir.openFile(std.testing.io, "plan.html", .{});
     defer file.close(std.testing.io);
 
-    const html = try file.readToEndAlloc(std.testing.io, allocator, 1024 * 1024);
+    const html = try file.readToEndAlloc(std.testing.io, allocator, 2 * 1024 * 1024);
     defer allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "<title>Plan Fixture</title>") != null);
@@ -230,6 +245,9 @@ test "plan HTML render emits required markers and title" {
     try std.testing.expect(std.mem.indexOf(u8, html, "id=\"plan-data\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "window.PLAN_DATA") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "id=\"dynamic-favicon\"") != null);
+    inline for (.{ "coral", "chonk", "eva-01" }) |design| {
+        try std.testing.expect(std.mem.indexOf(u8, html, "data-favicon-" ++ design ++ "=\"data:image/png;base64,") != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, html, "matcha-plan-design") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "matcha-eva-theme") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "\"extra_field\":\"kept\"") != null);
@@ -266,7 +284,7 @@ test "plan HTML renderer escapes script-like JSON" {
     var file = try tmp.dir.openFile(std.testing.io, "plan.html", .{});
     defer file.close(std.testing.io);
 
-    const html = try file.readToEndAlloc(std.testing.io, allocator, 1024 * 1024);
+    const html = try file.readToEndAlloc(std.testing.io, allocator, 2 * 1024 * 1024);
     defer allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "\\u003c/script\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e") != null);

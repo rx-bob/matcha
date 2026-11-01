@@ -134,11 +134,6 @@ export function createRouter(host: RouterHost): Router {
   }
 
   function go(hash: string): void {
-    const card = storyCardOf(targetForHash(hash))
-    if (card) {
-      showStory(card)
-      return
-    }
     if (location.hash !== hash) history.pushState(null, "", hash)
     void route(hash)
   }
@@ -150,7 +145,7 @@ export function createRouter(host: RouterHost): Router {
     const opener = eventTarget.closest<HTMLElement>("[data-open-story]")
     if (opener) {
       const card = document.getElementById(opener.dataset.openStory ?? "")
-      if (card) showStory(card, opener)
+      if (card) go(`#${card.id}`)
       return
     }
 

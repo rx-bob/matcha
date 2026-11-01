@@ -49,7 +49,7 @@ export function buildFileIdMap(trees: FileTree[]): Map<string, string> {
   let index = 0
 
   function traverse(node: FileTreeNode, parentPath: string): void {
-    const path = computeChildPath(parentPath, node.name, node.path)
+    const path = computeChildPath(parentPath, node.name)
     if (node.type === "file") {
       if (!ids.has(path)) ids.set(path, fileDomId(index++))
       return

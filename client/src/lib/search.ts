@@ -28,7 +28,7 @@ function collectFiles(trees: FileTree[], fileIds: Map<string, string>): SearchIt
   const items: SearchItem[] = []
 
   function traverse(node: FileTreeNode, parentPath: string): void {
-    const path = computeChildPath(parentPath, node.name, node.path)
+    const path = computeChildPath(parentPath, node.name)
     if (node.type === "file") {
       const id = fileIds.get(path)
       if (!id) return

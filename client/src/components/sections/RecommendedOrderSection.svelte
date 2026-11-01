@@ -20,7 +20,7 @@
 
 <section class="page-view" id="view-order" data-view="order" {hidden}>
   <header class="page-heading">
-    <h1>Recommended order</h1>
+    <h1>Optimal Order</h1>
   </header>
 
   <ol class="order-list">

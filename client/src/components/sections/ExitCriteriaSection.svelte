@@ -5,7 +5,7 @@
 
 <section class="page-view" id="view-criteria" data-view="criteria" {hidden}>
   <header class="page-heading">
-    <h1>Release criteria</h1>
+    <h1>Achievables</h1>
   </header>
 
   <ol class="criteria-list">

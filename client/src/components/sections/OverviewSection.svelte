@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Plan } from "../../../../src/plan"
-  import MistralHeroArt from "../ui/MistralHeroArt.svelte"
+  import ChonkHeroArt from "../ui/ChonkHeroArt.svelte"
   import {
     splitHeroTitle,
     countProposedFiles,
@@ -12,7 +12,6 @@
   export let hidden = false
 
   $: hero = splitHeroTitle(plan.title, plan.heroTitle, plan.project)
-  $: statusPill = plan.status ? plan.status.charAt(0).toUpperCase() + plan.status.slice(1) : "Planned"
   $: description = plan.scope || (plan.summary && plan.summary.length > 0 ? plan.summary[0] : "")
   $: epics = plan.epics || []
   $: epicsCount = epics.length
@@ -25,9 +24,6 @@
 <section class="page-view hero" id="view-overview" data-view="overview" {hidden}>
   <div class="eva-hero">
     <div class="page-heading">
-      <div class="heading-top">
-        <span class="status-pill">{statusPill}</span>
-      </div>
       <h1>
         {hero.lead}
         {#if hero.accent}
@@ -43,7 +39,7 @@
       <strong class="plate-number">01</strong>
     </div>
 
-    <MistralHeroArt />
+    <ChonkHeroArt />
   </div>
 
   <div class="plan-counts" aria-label="Plan at a glance">
@@ -56,7 +52,7 @@
   <div class="overview-grid">
     <section>
       <div class="section-heading">
-        <h2>Implementation</h2>
+        <h2>Epics &amp; Stories</h2>
         <a href="#epics">View all stories <svg aria-hidden="true"><use href="#i-arrow" /></svg></a>
       </div>
       <div class="epic-index">

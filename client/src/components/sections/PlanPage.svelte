@@ -9,20 +9,21 @@
 
   export let plan: Plan
   export let currentView = "overview"
+  export let onNavigate: (hash: string) => void
 </script>
 
 <OverviewSection {plan} hidden={currentView !== "overview"} />
 
 <section class="page-view" id="view-epics" data-view="epics" hidden={currentView !== "epics"}>
   <header class="page-heading">
-    <h1>Implementation plan</h1>
+    <h1>Epics &amp; Stories</h1>
   </header>
-  <EpicsSection epics={plan.epics} />
+  <EpicsSection epics={plan.epics} {onNavigate} />
 </section>
 
 <section class="page-view" id="view-files" data-view="files" hidden={currentView !== "files"}>
   <header class="page-heading">
-    <h1>Project files</h1>
+    <h1>Changing Files</h1>
   </header>
   <FileTreeSection changedFiles={plan.changedFiles ?? []} />
 </section>

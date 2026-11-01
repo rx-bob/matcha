@@ -50,7 +50,7 @@ class FakeElement {
 }
 
 class FakeBody extends FakeElement {
-  override cloneNode(): FakeBody {
+  cloneNode(): FakeBody {
     return new FakeBody()
   }
 }

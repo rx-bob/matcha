@@ -22,6 +22,7 @@ Matcha is now a Zig CLI. Use `task` for day-to-day operations:
 ```sh
 task run -- help
 task run-plan        # writes dist/plan.html from sample_plan.json
+task run-plan-designs # all designs + comparison index at dist/plan-designs/index.html
 task run-map         # writes dist/map.html from sample_map.json
 task run -- serve .  # serves generated artifacts from the current directory
 task test            # runs Zig unit tests
@@ -36,6 +37,21 @@ task build-client
 
 `task build-client` produces `plan.js`, `plan.css`, `plan-components.css`, `map.js`, `map.css`, `serve.js`,
 and `serve.css` at the repo root. The Zig CLI injects these assets when rendering HTML output.
+
+Browser acceptance checks run against the generated standalone sample plan:
+
+```sh
+task build-client
+task run-plan
+cd client
+npx playwright install chromium
+npm run test:browser
+```
+
+The suite checks navigation/history, themes, search, clipboard fallbacks, HTML/JSON downloads,
+PDF printing, and mobile focus behavior. Screenshots, the PDF, and results are saved to
+`/tmp/matcha-browser-evidence` (override with `MATCHA_BROWSER_OUTPUT`). The local reference
+prototype at `references/ui/chonk.html` is used for comparison screenshots.
 
 ## Usage
 

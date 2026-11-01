@@ -46,11 +46,11 @@ export type ViewId = (typeof VIEW_IDS)[number]
 
 export const VIEW_TITLES: Record<ViewId, string> = {
   overview: "Overview",
-  epics: "Implementation",
-  files: "Project files",
-  context: "Architecture & decisions",
-  order: "Delivery order",
-  criteria: "Release criteria",
+  epics: "Epics & Stories",
+  files: "Changing Files",
+  context: "Decisions",
+  order: "Optimal Order",
+  criteria: "Achievables",
 }
 
 const HASH_ALIASES: Record<string, string> = {

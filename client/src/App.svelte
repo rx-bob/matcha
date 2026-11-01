@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte"
   import type { Plan } from "../../src/plan.ts"
   import SvgSprite from "./components/ui/SvgSprite.svelte"
+  import MatchaBrand from "./components/ui/MatchaBrand.svelte"
   import PlanPage from "./components/sections/PlanPage.svelte"
   import StoryDialog from "./components/dialogs/StoryDialog.svelte"
   import SearchDialog from "./components/dialogs/SearchDialog.svelte"
@@ -39,8 +40,7 @@
 
   function selectDesign(design: PlanDesign): void {
     currentDesign = design
-    const result = applyPlanDesign(design, currentEvaTheme)
-    currentEvaTheme = result.theme === "dark" || result.theme === "light" ? result.theme : currentEvaTheme
+    applyPlanDesign(design, currentEvaTheme)
   }
 
   function selectEvaTheme(theme: EvaTheme): void {
@@ -98,7 +98,7 @@
     searchDialog?.open()
   }
 
-  function exportPlan(type: "html" | "json" | "print"): void {
+  function exportPlan(type: "html" | "json"): void {
     closeExport()
     const filenameBase = projectName.toLowerCase().replace(/[^a-z0-9_-]/g, "-")
 
@@ -106,6 +106,8 @@
       download(`${filenameBase}-plan.json`, JSON.stringify(plan, null, 2), "application/json")
     } else if (type === "html") {
       const clone = document.documentElement.cloneNode(true) as HTMLElement
+      // Remount from the embedded payload so exported pages start with clean UI state.
+      clone.querySelector("#plan-root")?.replaceChildren()
       const cloneBody = clone.querySelector("body")
       if (cloneBody) {
         cloneBody.classList.remove("nav-open")
@@ -124,8 +126,6 @@
       if (feedback) feedback.hidden = true
       clone.querySelectorAll(".spotlight").forEach((node) => node.classList.remove("spotlight"))
       download(`${filenameBase}-plan.html`, "<!DOCTYPE html>\n" + clone.outerHTML, "text/html;charset=utf-8")
-    } else if (type === "print") {
-      window.print()
     }
   }
 
@@ -273,15 +273,7 @@
     <svg><use href="#i-close" /></svg>
   </button>
 
-  <a href="#overview" class="brand" aria-label="{projectName} overview">
-    <span class="brandmark">
-      <svg viewBox="0 0 34 38" aria-hidden="true">
-        <path d="M6 28c0-4 5-4 9-8 2-2 2-5 2-8V9c0-7 10-7 10 0l5 2-6 3v10c0 7-13 10-20 4Z" />
-        <path d="M9 25c2 2 6 1 8-1M14 32l-1 4m7-5 1 5M24 8h.1" />
-      </svg>
-    </span>
-    <span class="brand-type">{projectName}</span>
-  </a>
+  <MatchaBrand />
 
   <nav aria-label="Plan sections">
     <a
@@ -302,7 +294,7 @@
 
     >
       <svg aria-hidden="true"><use href="#i-layers" /></svg>
-      <span>Implementation</span>
+      <span>Epics &amp; Stories</span>
     </a>
     <a
       href="#files"
@@ -312,7 +304,7 @@
 
     >
       <svg aria-hidden="true"><use href="#i-folder" /></svg>
-      <span>Project files</span>
+      <span>Changing Files</span>
     </a>
     <div class="nav-divider" aria-hidden="true"></div>
     <a
@@ -323,7 +315,7 @@
 
     >
       <svg aria-hidden="true"><use href="#i-book" /></svg>
-      <span>Architecture & decisions</span>
+      <span>Decisions</span>
     </a>
     <a
       href="#order"
@@ -333,7 +325,7 @@
 
     >
       <svg aria-hidden="true"><use href="#i-order" /></svg>
-      <span>Delivery order</span>
+      <span>Optimal Order</span>
     </a>
     <a
       href="#criteria"
@@ -343,18 +335,18 @@
 
     >
       <svg aria-hidden="true"><use href="#i-check" /></svg>
-      <span>Release criteria</span>
+      <span>Achievables</span>
     </a>
   </nav>
 
   <div class="sidebar-foot">
     <div class="design-switch" role="group" aria-label="Design theme">
       <button
-        data-design-choice="mistral"
-        aria-pressed={currentDesign === "mistral"}
-        on:click={() => selectDesign("mistral")}
+        data-design-choice="chonk"
+        aria-pressed={currentDesign === "chonk"}
+        on:click={() => selectDesign("chonk")}
       >
-        Mistral
+        Chonk
       </button>
       <button
         data-design-choice="coral"
@@ -368,7 +360,7 @@
         aria-pressed={currentDesign === "eva-01"}
         on:click={() => selectDesign("eva-01")}
       >
-        Eva
+        Eva-01
       </button>
     </div>
 
@@ -456,16 +448,13 @@
           <button data-export="json" on:click={() => exportPlan("json")}>
             <svg aria-hidden="true"><use href="#i-code" /></svg>Export plan data
           </button>
-          <button data-export="print" on:click={() => exportPlan("print")}>
-            <svg aria-hidden="true"><use href="#i-print" /></svg>Print / save as PDF
-          </button>
         </div>
       </div>
     </div>
   </header>
 
   <main class="content" id="main-content" tabindex="-1">
-    <PlanPage {plan} {currentView} />
+    <PlanPage {plan} {currentView} onNavigate={router.go} />
   </main>
 </div>
 
