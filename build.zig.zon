@@ -7,8 +7,6 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "llm_output_format.txt",
-        "llm_uml_output_format.txt",
         "assets",
         "examples",
         "schemas",

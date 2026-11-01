@@ -48,12 +48,12 @@ pub const serve_css: TextAsset = .{
 
 pub const llm_output_format: TextAsset = .{
     .name = "llm_output_format.txt",
-    .contents = @embedFile("../llm_output_format.txt"),
+    .contents = @embedFile("../schemas/llm_output_format.txt"),
 };
 
 pub const llm_uml_output_format: TextAsset = .{
     .name = "llm_uml_output_format.txt",
-    .contents = @embedFile("../llm_uml_output_format.txt"),
+    .contents = @embedFile("../schemas/llm_uml_output_format.txt"),
 };
 
 pub const loop_initial: TextAsset = .{

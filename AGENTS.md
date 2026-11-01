@@ -23,8 +23,8 @@ CLI injects into those HTML files.
 | `assets/plan.css`                          | Hand-authored base plan design stylesheet embedded by the CLI.                                                |
 | `schemas/plan.schema.json`                 | Canonical plan input schema.                                                                                  |
 | `schemas/uml.schema.json`                  | Canonical UML input schema.                                                                                   |
-| `llm_output_format.txt`                    | Prompt output format for plans.                                                                               |
-| `llm_uml_output_format.txt`                | Prompt output format for UML diagrams.                                                                        |
+| `schemas/llm_output_format.txt`            | Prompt output format for plans.                                                                               |
+| `schemas/llm_uml_output_format.txt`        | Prompt output format for UML diagrams.                                                                        |
 | `examples/sample_plan.json`                | Example plan input used by the CLI and tests.                                                                 |
 | `examples/sample_map.json`                 | Example map input used by the CLI and tests.                                                                  |
 | `themes/`                                  | Color-theme CSS files (e.g. `catppuccin-latte.css`).                                                          |
@@ -73,8 +73,8 @@ task install  # install dist/matcha to ~/.local/bin
 ## Where to start when changing things
 
 - New CLI command or output behavior: `src/cli.zig`.
-- Plan data shape: `schemas/plan.schema.json` + `llm_output_format.txt`.
-- UML data shape: `schemas/uml.schema.json` + `llm_uml_output_format.txt`.
+- Plan data shape: `schemas/plan.schema.json` + `schemas/llm_output_format.txt`.
+- UML data shape: `schemas/uml.schema.json` + `schemas/llm_uml_output_format.txt`.
 - Plan UI: `client/src/App.svelte` and `client/src/components/`.
 - Map UI: `client/src/MapApp.svelte` and `client/src/map.ts`.
 - Client build output consumed by CLI: `client/package.json` copies build outputs to `assets/client/`.
