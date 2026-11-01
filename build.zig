@@ -182,6 +182,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{
             "markdown rendering releases partial allocations",
+            "toon rendering releases partial allocations",
             "prompt rendering releases allocations",
             "route encoding and parsing release allocations",
             "home path expansion releases allocations",

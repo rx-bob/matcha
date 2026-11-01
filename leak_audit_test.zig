@@ -1,5 +1,6 @@
 const std = @import("std");
 const markdown = @import("src/render_markdown.zig");
+const toon = @import("src/render_toon.zig");
 const prompts = @import("src/loop_prompts.zig");
 const routes = @import("src/serve_routes.zig");
 const path = @import("src/path.zig");
@@ -29,6 +30,36 @@ test "markdown rendering releases partial allocations at every OOM point" {
     for (0..256) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         if (markdown.renderPlanMarkdown(failing.allocator(), parsed.value)) |output| {
+            failing.allocator().free(output);
+            saw_success = true;
+        } else |_| {}
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (saw_success and !failing.has_induced_failure) break;
+    }
+    try std.testing.expect(saw_success);
+}
+
+test "toon rendering releases partial allocations at every OOM point" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        "{\"title\":\"Leak audit\",\"metadata\":{\"nested\":{\"a\":[1,\"x\"]}}," ++
+            "\"sections\":[{\"title\":\"Items\",\"items\":[{\"title\":\"one\",\"text\":\"two\"}]}]," ++
+            "\"rows\":[" ++
+            "{\"id\":1,\"customer\":{\"name\":\"Ada\",\"country\":\"DK\"},\"total\":99}," ++
+            "{\"id\":2,\"customer\":{\"name\":\"Bob\",\"country\":\"UK\"},\"total\":149}]," ++
+            "\"servers\":{\"alpha\":{\"host\":\"a\",\"port\":1},\"beta\":{\"host\":\"b\",\"port\":2}}," ++
+            "\"mixed\":[1,[2,3],{\"a\":1},{\"t\":[{\"x\":1},{\"x\":2}]}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var saw_success = false;
+    for (0..1024) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (toon.renderPlanToon(failing.allocator(), parsed.value)) |output| {
             failing.allocator().free(output);
             saw_success = true;
         } else |_| {}

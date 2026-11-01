@@ -7,10 +7,10 @@
 
 ## What is Matcha?
 
-Matcha is a CLI for structured agent workflows. Instead of drowning in endless markdown files and half-broken chat UIs, Matcha gives you the best of both worlds:
+Matcha is a CLI for structured agent workflows. No markdown nonesense or half-broken chat UIs just:
 
 - **Self-contained interactive HTML** for humans to review, search, and navigate.
-- **Clean, noise-free Markdown & persistent execution loops** for coding agents (`codex`, `droid`, `agy`).
+- **Clean, noise-free TOON & persistent execution loops** for coding agents (`codex`, `droid`, `agy`).
 
 ## Installation
 
@@ -24,13 +24,13 @@ Installs `matcha` to `~/.local/bin` (override with `MATCHA_INSTALL_DIR`). Requir
 
 ### Planning
 
-Render structured JSON plans into standalone HTML artifacts, extract clean Markdown for your agent, or serve generated plans on your local network:
+Render structured JSON plans into standalone HTML artifacts, extract clean TOON for your agent, or serve generated plans on your local network:
 
 ```sh
 # Render a plan JSON into a self-contained HTML file
 matcha plan --input plan.json --output plan.html
 
-# Convert a plan (JSON or generated HTML) back into clean Markdown
+# Convert a plan (JSON or generated HTML) back into clean TOON
 matcha plan read plan.html > plan.md
 matcha plan read plan.html | codex
 

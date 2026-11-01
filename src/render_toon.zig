@@ -8,6 +8,20 @@ pub const RenderError = error{
 
 pub const MAX_DEPTH: usize = 256;
 
+pub const FieldNode = struct {
+    name: []const u8,
+    children: ?[]FieldNode,
+
+    pub fn deinit(self: *const FieldNode, allocator: std.mem.Allocator) void {
+        if (self.children) |children| {
+            for (children) |*child| {
+                child.deinit(allocator);
+            }
+            allocator.free(children);
+        }
+    }
+};
+
 const ToonWriter = struct {
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -33,6 +47,14 @@ const ToonWriter = struct {
         switch (value) {
             .array => |array| try self.writeArray(key, array, depth),
             .object => |object| {
+                if (try extractKeyedTabularFields(self.allocator, &object)) |fields| {
+                    defer freeFields(self.allocator, fields);
+                    try self.beginLine(depth);
+                    try self.writeHeader(object.count(), key, fields, true);
+                    try self.writeKeyedEntryRows(object, fields, depth + 1);
+                    return;
+                }
+
                 try self.beginLine(depth);
                 try self.writeEncodedKey(key);
                 try self.out.append(self.allocator, ':');
@@ -65,19 +87,23 @@ const ToonWriter = struct {
 
         if (allPrimitives(array.items)) {
             try self.beginLine(depth);
-            if (key) |name| {
-                try self.writeEncodedKey(name);
-            }
-            try self.out.print(self.allocator, "[{d}]:", .{array.items.len});
+            try self.writeHeader(array.items.len, key, null, false);
             try self.writeInlineValues(array.items);
             return;
         }
 
-        try self.beginLine(depth);
-        if (key) |name| {
-            try self.writeEncodedKey(name);
+        if (allObjects(array.items)) {
+            if (try extractTabularFields(self.allocator, array.items)) |fields| {
+                defer freeFields(self.allocator, fields);
+                try self.beginLine(depth);
+                try self.writeHeader(array.items.len, key, fields, false);
+                try self.writeTabularRows(array.items, fields, depth + 1);
+                return;
+            }
         }
-        try self.out.print(self.allocator, "[{d}]:", .{array.items.len});
+
+        try self.beginLine(depth);
+        try self.writeHeader(array.items.len, key, null, false);
         for (array.items) |item| {
             try self.writeListItem(item, depth + 1);
         }
@@ -90,13 +116,10 @@ const ToonWriter = struct {
             .array => |array| {
                 try self.beginLine(depth);
                 try self.out.appendSlice(self.allocator, "- ");
-                if (array.items.len == 0) {
-                    try self.out.appendSlice(self.allocator, "[]");
-                } else if (allPrimitives(array.items)) {
-                    try self.out.print(self.allocator, "[{d}]:", .{array.items.len});
+                try self.writeHeader(array.items.len, null, null, false);
+                if (allPrimitives(array.items)) {
                     try self.writeInlineValues(array.items);
                 } else {
-                    try self.out.print(self.allocator, "[{d}]:", .{array.items.len});
                     for (array.items) |item| {
                         try self.writeListItem(item, depth + 1);
                     }
@@ -123,6 +146,34 @@ const ToonWriter = struct {
         const first_key = first.key_ptr.*;
         const first_value = first.value_ptr.*;
 
+        if (first_value == .array) {
+            const array = first_value.array;
+            if (array.items.len > 0 and allObjects(array.items)) {
+                if (try extractTabularFields(self.allocator, array.items)) |fields| {
+                    defer freeFields(self.allocator, fields);
+                    try self.beginLine(depth);
+                    try self.out.appendSlice(self.allocator, "- ");
+                    try self.writeHeader(array.items.len, first_key, fields, false);
+                    try self.writeTabularRows(array.items, fields, depth + 2);
+                    try self.writeRemainingFields(&iterator, depth + 1);
+                    return;
+                }
+            }
+        }
+
+        if (first_value == .object) {
+            const first_object = first_value.object;
+            if (try extractKeyedTabularFields(self.allocator, &first_object)) |fields| {
+                defer freeFields(self.allocator, fields);
+                try self.beginLine(depth);
+                try self.out.appendSlice(self.allocator, "- ");
+                try self.writeHeader(first_object.count(), first_key, fields, true);
+                try self.writeKeyedEntryRows(first_object, fields, depth + 2);
+                try self.writeRemainingFields(&iterator, depth + 1);
+                return;
+            }
+        }
+
         switch (first_value) {
             .array => |array| {
                 try self.beginLine(depth);
@@ -130,13 +181,14 @@ const ToonWriter = struct {
                 try self.writeEncodedKey(first_key);
                 if (array.items.len == 0) {
                     try self.out.appendSlice(self.allocator, ": []");
-                } else if (allPrimitives(array.items)) {
-                    try self.out.print(self.allocator, "[{d}]:", .{array.items.len});
-                    try self.writeInlineValues(array.items);
                 } else {
-                    try self.out.print(self.allocator, "[{d}]:", .{array.items.len});
-                    for (array.items) |item| {
-                        try self.writeListItem(item, depth + 2);
+                    try self.writeHeader(array.items.len, null, null, false);
+                    if (allPrimitives(array.items)) {
+                        try self.writeInlineValues(array.items);
+                    } else {
+                        for (array.items) |item| {
+                            try self.writeListItem(item, depth + 2);
+                        }
                     }
                 }
             },
@@ -158,8 +210,106 @@ const ToonWriter = struct {
             },
         }
 
+        try self.writeRemainingFields(&iterator, depth + 1);
+    }
+
+    fn writeRemainingFields(self: *ToonWriter, iterator: *std.json.ObjectMap.Iterator, depth: usize) RenderError!void {
         while (iterator.next()) |entry| {
-            try self.writeKeyValuePair(entry.key_ptr.*, entry.value_ptr.*, depth + 1);
+            try self.writeKeyValuePair(entry.key_ptr.*, entry.value_ptr.*, depth);
+        }
+    }
+
+    fn writeHeader(
+        self: *ToonWriter,
+        length: usize,
+        key: ?[]const u8,
+        fields: ?[]const FieldNode,
+        keyed: bool,
+    ) RenderError!void {
+        if (key) |name| {
+            try self.writeEncodedKey(name);
+        }
+
+        if (keyed) {
+            try self.out.print(self.allocator, "[{d}:]", .{length});
+        } else {
+            try self.out.print(self.allocator, "[{d}]", .{length});
+        }
+
+        if (fields) |field_list| {
+            try self.out.append(self.allocator, '{');
+            try self.writeFieldSegment(field_list);
+            try self.out.append(self.allocator, '}');
+        }
+
+        try self.out.append(self.allocator, ':');
+    }
+
+    fn writeFieldSegment(self: *ToonWriter, fields: []const FieldNode) RenderError!void {
+        for (fields, 0..) |field, index| {
+            if (index > 0) {
+                try self.out.append(self.allocator, ',');
+            }
+            try self.writeEncodedKey(field.name);
+            if (field.children) |children| {
+                try self.out.append(self.allocator, '{');
+                try self.writeFieldSegment(children);
+                try self.out.append(self.allocator, '}');
+            }
+        }
+    }
+
+    fn writeTabularRows(
+        self: *ToonWriter,
+        rows: []const std.json.Value,
+        fields: []const FieldNode,
+        depth: usize,
+    ) RenderError!void {
+        for (rows) |row| {
+            try self.writeTabularRow(row, fields, depth);
+        }
+    }
+
+    fn writeTabularRow(
+        self: *ToonWriter,
+        value: std.json.Value,
+        fields: []const FieldNode,
+        depth: usize,
+    ) RenderError!void {
+        const row = switch (value) {
+            .object => |object| object,
+            else => unreachable,
+        };
+
+        var leaves = try std.ArrayList(std.json.Value).initCapacity(self.allocator, 0);
+        defer leaves.deinit(self.allocator);
+        try collectRowLeaves(self.allocator, &row, fields, &leaves);
+
+        try self.beginLine(depth);
+        try self.writeJoinedValues(leaves.items);
+    }
+
+    fn writeKeyedEntryRows(
+        self: *ToonWriter,
+        object: std.json.ObjectMap,
+        fields: []const FieldNode,
+        depth: usize,
+    ) RenderError!void {
+        var iterator = object.iterator();
+        while (iterator.next()) |entry| {
+            const row = switch (entry.value_ptr.*) {
+                .object => |entry_object| entry_object,
+                else => unreachable,
+            };
+
+            var leaves = try std.ArrayList(std.json.Value).initCapacity(self.allocator, 0);
+            defer leaves.deinit(self.allocator);
+            try collectRowLeaves(self.allocator, &row, fields, &leaves);
+
+            try self.beginLine(depth);
+            try self.writeEncodedKey(entry.key_ptr.*);
+            try self.out.appendSlice(self.allocator, ": ");
+            try self.writeJoinedValues(leaves.items);
         }
     }
 
@@ -167,6 +317,10 @@ const ToonWriter = struct {
         if (values.len == 0) return;
 
         try self.out.append(self.allocator, ' ');
+        try self.writeJoinedValues(values);
+    }
+
+    fn writeJoinedValues(self: *ToonWriter, values: []const std.json.Value) RenderError!void {
         for (values, 0..) |value, index| {
             if (index > 0) {
                 try self.out.append(self.allocator, ',');
@@ -235,9 +389,24 @@ pub fn renderPlanToon(allocator: std.mem.Allocator, plan_value: std.json.Value) 
     errdefer out.deinit(allocator);
 
     var writer = ToonWriter{ .out = &out, .allocator = allocator };
-    try writer.writeObject(plan_value.object, 0);
+
+    if (try extractKeyedTabularFields(allocator, &plan_value.object)) |fields| {
+        defer freeFields(allocator, fields);
+        try writer.beginLine(0);
+        try writer.writeHeader(plan_value.object.count(), null, fields, true);
+        try writer.writeKeyedEntryRows(plan_value.object, fields, 1);
+    } else {
+        try writer.writeObject(plan_value.object, 0);
+    }
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn freeFields(allocator: std.mem.Allocator, fields: []FieldNode) void {
+    for (fields) |*field| {
+        field.deinit(allocator);
+    }
+    allocator.free(fields);
 }
 
 fn validateDepth(depth: usize) RenderError!void {
@@ -246,9 +415,166 @@ fn validateDepth(depth: usize) RenderError!void {
     }
 }
 
+pub fn extractTabularFields(
+    allocator: std.mem.Allocator,
+    rows: []const std.json.Value,
+) RenderError!?[]FieldNode {
+    if (rows.len == 0) return null;
+
+    const objects = try allocator.alloc(*const std.json.ObjectMap, rows.len);
+    defer allocator.free(objects);
+
+    for (rows, 0..) |*row, index| {
+        switch (row.*) {
+            .object => |*object| objects[index] = object,
+            else => return null,
+        }
+    }
+
+    return extractFieldsFromObjects(allocator, objects, 0);
+}
+
+pub fn extractKeyedTabularFields(
+    allocator: std.mem.Allocator,
+    object: *const std.json.ObjectMap,
+) RenderError!?[]FieldNode {
+    if (object.count() < 2) return null;
+
+    const entry_objects = try allocator.alloc(*const std.json.ObjectMap, object.count());
+    defer allocator.free(entry_objects);
+
+    var iterator = object.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |entry| {
+        switch (entry.value_ptr.*) {
+            .object => |*entry_object| {
+                if (entry_object.count() == 0) return null;
+                entry_objects[index] = entry_object;
+            },
+            else => return null,
+        }
+        index += 1;
+    }
+
+    return extractFieldsFromObjects(allocator, entry_objects, 0);
+}
+
+fn extractFieldsFromObjects(
+    allocator: std.mem.Allocator,
+    objects: []const *const std.json.ObjectMap,
+    depth: usize,
+) RenderError!?[]FieldNode {
+    const first_keys = objects[0].keys();
+    if (first_keys.len == 0) return null;
+
+    for (objects) |object| {
+        if (object.count() != first_keys.len) return null;
+        for (first_keys) |key| {
+            if (!object.contains(key)) return null;
+        }
+    }
+
+    const column_values = try allocator.alloc(*const std.json.Value, objects.len);
+    defer allocator.free(column_values);
+
+    const fields = try allocator.alloc(FieldNode, first_keys.len);
+    var built: usize = 0;
+    errdefer {
+        for (fields[0..built]) |*field| {
+            field.deinit(allocator);
+        }
+        allocator.free(fields);
+    }
+
+    for (first_keys) |key| {
+        for (objects, 0..) |object, index| {
+            column_values[index] = object.getPtr(key).?;
+        }
+
+        const column = try classifyColumn(allocator, key, column_values, depth);
+        if (column == null) {
+            for (fields[0..built]) |*field| {
+                field.deinit(allocator);
+            }
+            allocator.free(fields);
+            return null;
+        }
+
+        fields[built] = column.?;
+        built += 1;
+    }
+
+    return fields;
+}
+
+fn classifyColumn(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    values: []const *const std.json.Value,
+    depth: usize,
+) RenderError!?FieldNode {
+    var all_primitive = true;
+    for (values) |value| {
+        if (!isPrimitive(value.*)) {
+            all_primitive = false;
+            break;
+        }
+    }
+    if (all_primitive) {
+        return FieldNode{ .name = name, .children = null };
+    }
+
+    if (depth >= MAX_DEPTH) return null;
+
+    const objects = try allocator.alloc(*const std.json.ObjectMap, values.len);
+    defer allocator.free(objects);
+
+    for (values, 0..) |value, index| {
+        switch (value.*) {
+            .object => |*object| {
+                if (object.count() == 0) return null;
+                objects[index] = object;
+            },
+            else => return null,
+        }
+    }
+
+    const children = try extractFieldsFromObjects(allocator, objects, depth + 1);
+    if (children == null) return null;
+
+    return FieldNode{ .name = name, .children = children.? };
+}
+
+fn collectRowLeaves(
+    allocator: std.mem.Allocator,
+    row: *const std.json.ObjectMap,
+    fields: []const FieldNode,
+    leaves: *std.ArrayList(std.json.Value),
+) RenderError!void {
+    for (fields) |field| {
+        const value = row.getPtr(field.name).?;
+
+        if (field.children) |children| {
+            switch (value.*) {
+                .object => |*nested| try collectRowLeaves(allocator, nested, children, leaves),
+                else => unreachable,
+            }
+        } else {
+            try leaves.append(allocator, value.*);
+        }
+    }
+}
+
 fn allPrimitives(values: []const std.json.Value) bool {
     for (values) |value| {
         if (!isPrimitive(value)) return false;
+    }
+    return true;
+}
+
+fn allObjects(values: []const std.json.Value) bool {
+    for (values) |value| {
+        if (value != .object) return false;
     }
     return true;
 }
@@ -518,4 +844,173 @@ test "encodes simple and nested objects and inline primitive arrays" {
     );
 
     try std.testing.expectError(RenderError.NotAnObject, renderPlanToon(allocator, .{ .integer = 1 }));
+}
+
+test "encodes tabular arrays and nested field groups" {
+    const allocator = std.testing.allocator;
+
+    const users = try renderJson(
+        allocator,
+        "{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}",
+    );
+    defer allocator.free(users);
+    try std.testing.expectEqualStrings(
+        "users[2]{id,name}:\n  1,Alice\n  2,Bob",
+        users,
+    );
+
+    const orders = try renderJson(
+        allocator,
+        "{\"orders\":[" ++
+            "{\"id\":1,\"customer\":{\"name\":\"Ada\",\"country\":\"DK\"},\"total\":99}," ++
+            "{\"id\":2,\"customer\":{\"name\":\"Bob\",\"country\":\"UK\"},\"total\":149}]}",
+    );
+    defer allocator.free(orders);
+    try std.testing.expectEqualStrings(
+        "orders[2]{id,customer{name,country},total}:\n  1,Ada,DK,99\n  2,Bob,UK,149",
+        orders,
+    );
+
+    const reordered = try renderJson(
+        allocator,
+        "{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"name\":\"Bob\",\"id\":2}]}",
+    );
+    defer allocator.free(reordered);
+    try std.testing.expectEqualStrings(
+        "users[2]{id,name}:\n  1,Alice\n  2,Bob",
+        reordered,
+    );
+}
+
+test "encodes keyed tabular objects at field and root positions" {
+    const allocator = std.testing.allocator;
+
+    const servers = try renderJson(
+        allocator,
+        "{\"servers\":{" ++
+            "\"alpha\":{\"host\":\"a.example.com\",\"port\":8080}," ++
+            "\"beta\":{\"host\":\"b.example.com\",\"port\":9090}}}",
+    );
+    defer allocator.free(servers);
+    try std.testing.expectEqualStrings(
+        "servers[2:]{host,port}:\n  alpha: a.example.com,8080\n  beta: b.example.com,9090",
+        servers,
+    );
+
+    const root = try renderJson(
+        allocator,
+        "{\"alice\":{\"age\":30,\"city\":\"Berlin\"},\"bob\":{\"age\":25,\"city\":\"Oslo\"}}",
+    );
+    defer allocator.free(root);
+    try std.testing.expectEqualStrings(
+        "[2:]{age,city}:\n  alice: 30,Berlin\n  bob: 25,Oslo",
+        root,
+    );
+}
+
+test "encodes list items and object list items with §10 first-field rules" {
+    const allocator = std.testing.allocator;
+
+    const mixed = try renderJson(allocator, "{\"items\":[1,[2,3],{\"a\":1}]}");
+    defer allocator.free(mixed);
+    try std.testing.expectEqualStrings(
+        "items[3]:\n  - 1\n  - [2]: 2,3\n  - a: 1",
+        mixed,
+    );
+
+    const empty_objects = try renderJson(allocator, "{\"items\":[{},{}]}");
+    defer allocator.free(empty_objects);
+    try std.testing.expectEqualStrings("items[2]:\n  -\n  -", empty_objects);
+
+    const primitive_arrays = try renderJson(allocator, "{\"matrix\":[[1,2],[3,4]]}");
+    defer allocator.free(primitive_arrays);
+    try std.testing.expectEqualStrings(
+        "matrix[2]:\n  - [2]: 1,2\n  - [2]: 3,4",
+        primitive_arrays,
+    );
+
+    const empty_inner_arrays = try renderJson(allocator, "{\"items\":[[],[]]}");
+    defer allocator.free(empty_inner_arrays);
+    try std.testing.expectEqualStrings(
+        "items[2]:\n  - [0]:\n  - [0]:",
+        empty_inner_arrays,
+    );
+
+    const siblings = try renderJson(
+        allocator,
+        "{\"items\":[{\"name\":\"a\",\"tags\":[\"x\",\"y\"],\"meta\":{\"k\":1},\"rest\":true}," ++
+            "{\"name\":\"b\"}]}",
+    );
+    defer allocator.free(siblings);
+    try std.testing.expectEqualStrings(
+        "items[2]:\n" ++
+            "  - name: a\n" ++
+            "    tags[2]: x,y\n" ++
+            "    meta:\n" ++
+            "      k: 1\n" ++
+            "    rest: true\n" ++
+            "  - name: b",
+        siblings,
+    );
+
+    const nested_array = try renderJson(
+        allocator,
+        "{\"items\":[{\"rows\":[[1,2],[3,4]],\"x\":1}]}",
+    );
+    defer allocator.free(nested_array);
+    try std.testing.expectEqualStrings(
+        "items[1]:\n" ++
+            "  - rows[2]:\n" ++
+            "      - [2]: 1,2\n" ++
+            "      - [2]: 3,4\n" ++
+            "    x: 1",
+        nested_array,
+    );
+
+    const tabular_first = try renderJson(
+        allocator,
+        "{\"items\":[{\"users\":[{\"id\":1,\"name\":\"A\"},{\"id\":2,\"name\":\"B\"}],\"note\":\"n\"}]}",
+    );
+    defer allocator.free(tabular_first);
+    try std.testing.expectEqualStrings(
+        "items[1]:\n" ++
+            "  - users[2]{id,name}:\n" ++
+            "      1,A\n" ++
+            "      2,B\n" ++
+            "    note: n",
+        tabular_first,
+    );
+
+    const keyed_first = try renderJson(
+        allocator,
+        "{\"items\":[{\"servers\":{\"a\":{\"host\":\"h\",\"port\":1},\"b\":{\"host\":\"i\",\"port\":2}},\"note\":\"n\"},{\"other\":1}]}",
+    );
+    defer allocator.free(keyed_first);
+    try std.testing.expectEqualStrings(
+        "items[2]:\n" ++
+            "  - servers[2:]{host,port}:\n" ++
+            "      a: h,1\n" ++
+            "      b: i,2\n" ++
+            "    note: n\n" ++
+            "  - other: 1",
+        keyed_first,
+    );
+}
+
+test "enforces max nesting depth" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var value: std.json.Value = .{ .integer = 1 };
+    for (0..MAX_DEPTH + 2) |_| {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(allocator, "n", value);
+        value = .{ .object = object };
+    }
+
+    try std.testing.expectError(
+        RenderError.MaxDepthExceeded,
+        renderPlanToon(std.testing.allocator, value),
+    );
 }
