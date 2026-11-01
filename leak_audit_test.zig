@@ -1,5 +1,4 @@
 const std = @import("std");
-const markdown = @import("src/render_markdown.zig");
 const toon = @import("src/render_toon.zig");
 const prompts = @import("src/loop_prompts.zig");
 const routes = @import("src/serve_routes.zig");
@@ -15,29 +14,6 @@ const loop_summary = @import("src/loop_summary.zig");
 const loop_store = @import("src/loop_store.zig");
 
 fn ignoreStreamEvent(_: ?*anyopaque, _: stream.NormalizedEvent) void {}
-
-test "markdown rendering releases partial allocations at every OOM point" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        arena.allocator(),
-        "{\"title\":\"Leak audit\",\"metadata\":{\"nested\":{\"a\":[1,\"x\"]}},\"sections\":[{\"title\":\"Items\",\"items\":[{\"title\":\"one\",\"text\":\"two\"}]}]}",
-        .{},
-    );
-
-    var saw_success = false;
-    for (0..256) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        if (markdown.renderPlanMarkdown(failing.allocator(), parsed.value)) |output| {
-            failing.allocator().free(output);
-            saw_success = true;
-        } else |_| {}
-        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-        if (saw_success and !failing.has_induced_failure) break;
-    }
-    try std.testing.expect(saw_success);
-}
 
 test "toon rendering releases partial allocations at every OOM point" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

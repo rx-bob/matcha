@@ -11,7 +11,7 @@ const errors = @import("errors.zig");
 const path = @import("path.zig");
 const json_input = @import("json_input.zig");
 const render_html = @import("render_html.zig");
-const render_markdown = @import("render_markdown.zig");
+const render_toon = @import("render_toon.zig");
 const plan_read = @import("plan_read.zig");
 const serve_options = @import("serve_options.zig");
 const serve = @import("serve.zig");
@@ -850,18 +850,22 @@ fn runPlanReadCommand(
     };
     defer document.deinit();
 
-    const markdown = render_markdown.renderPlanMarkdown(std.heap.page_allocator, document.data) catch |err| switch (err) {
-        render_markdown.RenderError.NotAnObject => {
+    const toon = render_toon.renderPlanToon(std.heap.page_allocator, document.data) catch |err| switch (err) {
+        render_toon.RenderError.NotAnObject => {
             try stderr.print("Invalid plan document: expected JSON object\n", .{});
             return .failure;
         },
-        render_markdown.RenderError.OutOfMemory => {
+        render_toon.RenderError.OutOfMemory => {
+            return .failure;
+        },
+        render_toon.RenderError.MaxDepthExceeded => {
+            try stderr.print("Invalid plan document: maximum nesting depth exceeded\n", .{});
             return .failure;
         },
     };
-    defer std.heap.page_allocator.free(markdown);
+    defer std.heap.page_allocator.free(toon);
 
-    try stdout.print("{s}\n", .{markdown});
+    try stdout.print("{s}\n", .{toon});
     return .ok;
 }
 
@@ -1236,7 +1240,7 @@ pub fn writeHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\Plan commands:
         \\  matcha plan --help              Show detailed help for plan rendering
-        \\  matcha plan read <path>         Print a matcha plan as Markdown to stdout
+        \\  matcha plan read <path>         Print a matcha plan as TOON to stdout
         \\
         \\Map commands:
         \\  matcha map --help               Show detailed help for map rendering
@@ -1270,7 +1274,7 @@ pub fn writePlanHelp(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  -o, --output <path>   HTML file to write
         \\
         \\Read subcommand:
-        \\  matcha plan read <path>  Print a matcha plan as Markdown to stdout. The path can be
+        \\  matcha plan read <path>  Print a matcha plan as TOON to stdout. The path can be
         \\                        raw plan JSON or a matcha-generated plan HTML file.
         \\
         \\Plan input format:
@@ -1311,8 +1315,8 @@ pub fn writeUsageGuide(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\Commands:
         \\  matcha plan --input path/to/plan.json --output path/to/plan.html
         \\  matcha map --input path/to/map.json --output path/to/map.html
-        \\  matcha plan read path/to/plan.json          Print Markdown to stdout
-        \\  matcha plan read path/to/plan.html          Read a matcha-generated plan HTML back as Markdown
+        \\  matcha plan read path/to/plan.json          Print TOON to stdout
+        \\  matcha plan read path/to/plan.html          Read a matcha-generated plan HTML back as TOON
         \\  matcha loop --help                         Run or inspect a persistent loop
         \\  matcha loop resume --last                  Resume the most recent paused loop
         \\
@@ -1332,12 +1336,12 @@ pub fn writeUsageGuide(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  3. Save that JSON to a file.
         \\  4. Run the matching matcha command with --input and --output.
         \\  5. Do not put Markdown fences or commentary in the JSON input file.
-        \\  6. To read an existing plan as Markdown, run `matcha plan read <path>`.
-        \\  7. No --output option exists for plan read; redirect stdout (`> plan.md`) or pipe it.
+        \\  6. To read an existing plan as TOON, run `matcha plan read <path>`.
+        \\  7. No --output option exists for plan read; redirect stdout (`> plan.toon`) or pipe it.
         \\  8. Resume a paused autonomous loop with `matcha loop resume [<id>|--last]`; use
         \\     `--objective "..."` to replace its objective when resuming.
         \\
-        \\Reading plans as Markdown:
+        \\Reading plans as TOON:
         \\  Use `matcha plan read` when you need to consume an existing plan without parsing JSON or
         \\  scraping rendered HTML. The command is deterministic, offline, and writes to stdout only.
         \\
@@ -1368,7 +1372,7 @@ test "command module imports all CLI responsibility modules" {
     try std.testing.expectEqualStrings("plan.js", assets.plan_js.name);
     try std.testing.expect(path.isHomeRelative("~/sample_plan.json"));
     try std.testing.expectEqualStrings("dist/plan.html", render_html.defaultOutput(.plan));
-    try std.testing.expectEqualStrings("# ", render_markdown.headingPrefix(.plan));
+    try std.testing.expectEqual(@as(usize, 256), render_toon.MAX_DEPTH);
 }
 
 test "root help aliases print help" {
@@ -1385,6 +1389,7 @@ test "root help aliases print help" {
         try std.testing.expectEqual(ExitCode.ok, code);
         try std.testing.expect(std.mem.indexOf(u8, output, "matcha plan --help") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "matcha map --help") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "Print a matcha plan as TOON to stdout") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "help, --help, -h") != null);
         try std.testing.expectEqual(@as(usize, 0), stderr.end);
     }
@@ -1416,6 +1421,7 @@ test "usage includes embedded plan and map format instructions" {
 
     try std.testing.expectEqual(ExitCode.ok, code);
     try std.testing.expect(std.mem.indexOf(u8, output, "matcha usage for LLMs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Reading plans as TOON:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Plan input format:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "  Output exactly one JSON object and nothing else.") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"heroTitle\"") != null);
@@ -1494,8 +1500,8 @@ test "plan read accepts raw JSON input path" {
     const output = stdout_buffer[0..stdout.end];
 
     try std.testing.expectEqual(ExitCode.ok, code);
-    try std.testing.expect(std.mem.indexOf(u8, output, "# Raw JSON Plan") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "- **Schema Version:** 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "title: Raw JSON Plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "schemaVersion: 1") != null);
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
 }
 
@@ -1522,7 +1528,8 @@ test "plan read accepts generated plan HTML input path" {
     const output = stdout_buffer[0..stdout.end];
 
     try std.testing.expectEqual(ExitCode.ok, code);
-    try std.testing.expect(std.mem.indexOf(u8, output, "# HTML Fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "title: HTML Fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "schemaVersion: 1") != null);
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
 }
 
@@ -1590,16 +1597,16 @@ test "plan read fixture output is stable and stdout-only" {
     const sample_plan_path = try std.fmt.allocPrint(allocator, "{s}/sample_plan.json", .{cwd});
     defer allocator.free(sample_plan_path);
 
-    const expected_path = try std.fmt.allocPrint(allocator, "{s}/testdata/sample_plan.md", .{cwd});
+    const expected_path = try std.fmt.allocPrint(allocator, "{s}/testdata/sample_plan.toon", .{cwd});
     defer allocator.free(expected_path);
 
-    const expected_markdown = try std.Io.Dir.cwd().readFileAlloc(
+    const expected_toon = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
         expected_path,
         allocator,
         .limited(1024 * 1024),
     );
-    defer allocator.free(expected_markdown);
+    defer allocator.free(expected_toon);
 
     const plan_contents = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -1627,13 +1634,13 @@ test "plan read fixture output is stable and stdout-only" {
     var stdout: std.Io.Writer = .fixed(&stdout_buffer);
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
 
-    try std.testing.expect(expected_markdown.len < stdout_buffer.len);
+    try std.testing.expect(expected_toon.len < stdout_buffer.len);
 
     const first_code = try runArgs(&.{ "plan", "read", input_path }, std.testing.io, &stdout, &stderr);
     const first_output = stdout_buffer[0..stdout.end];
     try std.testing.expectEqual(ExitCode.ok, first_code);
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
-    try std.testing.expectEqualStrings(expected_markdown, first_output);
+    try std.testing.expectEqualStrings(expected_toon, first_output);
 
     stdout.end = 0;
     stderr.end = 0;
@@ -1688,6 +1695,7 @@ test "render command help aliases print subcommand help" {
     try std.testing.expectEqual(ExitCode.ok, plan_code);
     try std.testing.expect(std.mem.indexOf(u8, plan_output, "matcha plan") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan_output, "Plan input format:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_output, "Print a matcha plan as TOON to stdout") != null);
 
     stdout = .fixed(&stdout_buffer);
     stderr = .fixed(&stderr_buffer);

@@ -4,7 +4,7 @@ pub const errors = @import("errors.zig");
 pub const path = @import("path.zig");
 pub const json_input = @import("json_input.zig");
 pub const render_html = @import("render_html.zig");
-pub const render_markdown = @import("render_markdown.zig");
+pub const render_toon = @import("render_toon.zig");
 pub const serve_options = @import("serve_options.zig");
 pub const serve_catalog = @import("serve_catalog.zig");
 pub const serve_routes = @import("serve_routes.zig");
@@ -32,6 +32,6 @@ test "root imports CLI modules without dependency cycles" {
     try std.testing.expectEqualStrings("map.css", assets.map_css.name);
     try std.testing.expect(path.hasParentDirectory("dist/map.html"));
     try std.testing.expectEqualStrings("sample_map.json", render_html.defaultInput(.map));
-    try std.testing.expectEqualStrings("# ", render_markdown.headingPrefix(.plan));
+    try std.testing.expectEqual(@as(usize, 256), render_toon.MAX_DEPTH);
     try std.testing.expectEqual(@as(u16, 27004), serve_options.default_port);
 }

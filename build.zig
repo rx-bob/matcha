@@ -104,16 +104,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_ownership_tests = b.addRunArtifact(ownership_tests);
 
-    const markdown_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/render_markdown.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    const run_markdown_tests = b.addRunArtifact(markdown_tests);
-
     const toon_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/render_toon.zig"),
@@ -144,7 +134,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_cli_loop_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_ownership_tests.step);
-    test_step.dependOn(&run_markdown_tests.step);
     test_step.dependOn(&run_toon_tests.step);
     test_step.dependOn(&run_workflow_tests.step);
 
@@ -181,7 +170,6 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
         .filters = &.{
-            "markdown rendering releases partial allocations",
             "toon rendering releases partial allocations",
             "prompt rendering releases allocations",
             "route encoding and parsing release allocations",

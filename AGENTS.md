@@ -14,7 +14,7 @@ CLI injects into those HTML files.
 | `src/main.zig`                             | Zig CLI entrypoint.                                                                                           |
 | `src/cli.zig`                              | `runArgs` and command dispatch for `help`, `version`, `plan`, and `map` commands.                               |
 | `src/render_html.zig`                       | HTML render path for plan and map outputs.                                                                     |
-| `src/render_markdown.zig`                   | Markdown renderer used by `plan read`.                                                                          |
+| `src/render_toon.zig`                       | TOON renderer used by `plan read`.                                                                             |
 | `src/plan_read.zig`                        | Input parsing and extraction for `plan read`.                                                                   |
 | `client/`                                  | Svelte/Vite client. Builds `plan.js`/`plan.css` and `map.js`/`map.css`.                                       |
 | `client/src/main.ts`                       | Plan client entrypoint; mounts `App.svelte` into `dist/plan.html`.                                            |

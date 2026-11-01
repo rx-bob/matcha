@@ -1,0 +1,791 @@
+schemaVersion: 1
+id: goosetest-first-release
+title: "goosetest: First-Release Implementation Plan"
+heroTitle:
+  lead: First
+  accent: release.
+firstStorySummary: Establish the compiler baseline and style rules before shaping the public API.
+project: goosetest
+status: planned
+generatedAt: "2026-10-26T22:54:02+01:00"
+scope: "A Goose-native assertion runtime and automatic test runner with strict unit mirrors, separate integration suites, explicit lifecycle semantics, and style-guide compliance."
+summary[3]: Build goosetest from the reference POCs in ./poc using discovered test_* functions as the primary authoring model. Unit tests mirror src/ into test/; integration/ contains cross-module tests without a mirror requirement. This layout was explicitly selected by the user.,"Deliver working slices: an importable runtime, read-only project discovery, one-command compilation/execution, fixture and selection semantics, readable diagnostics, and self-hosted verification with a representative pretty-goose consumer. Reuse the POC ideas while replacing silent truncation, brittle line scanning, and discarded exit codes.","Use /Users/bob/repos/pretty-goose/docs/styleguide.md as the normative code/design guide. Keep the runtime standard-library-only and isolate the minimal native CLI adapter required by the installed compiler. The scope is a maintainable first release, not the POC’s full list of aspirational features. Concrete API, file-layout, lifecycle, command, and console references appear in the epic descriptions, starting at E1; every story links to the relevant original POC/style-guide sources."
+metadata:
+  projectRoot: /Users/bob/repos/goosetest
+  planInput: /private/tmp/goosetest_plan_2026-10-26_22-46-04_references.json
+  requestedOutputDirectory: /Users/bob/clankers/goosetest/plans
+  sourceReferences[7]: /Users/bob/repos/goosetest/poc/junit_runner_poc.goose,/Users/bob/repos/goosetest/poc/example_project/goosetest.goose,/Users/bob/repos/goosetest/poc/goosetest_poc.goose,/Users/bob/repos/goosetest/poc/goosetest_contained_poc.goose,/Users/bob/repos/pretty-goose/docs/styleguide.md,/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/docs/packages.md,/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/stdlib/os.goose
+  planningAssumptions[4]: No implementation is requested by this breakdown turn; all listed source changes are proposed future work.,Initial executable support targets the verified macOS arm64 environment. Runtime design remains platform-independent; other platform adapters require later explicit work.,The compiler baseline stays at the locally verified v2026.3 release. No dependency on newly documented UFCS or defer behavior is assumed.,The plan does not modify or migrate the real pretty-goose repository.
+  actualOutput: /private/tmp/plan_goosetest_first_release_2026-10-26_22-46-04.html
+  canonicalPlan: /Users/bob/clankers/goosetest/plans/plan_goosetest_first_release_2026-10-26_22-46-04.html
+  revisedAt: "2026-10-26T23:06:10+01:00"
+  designReferences: "See E1 for the public test API, E2 for layout/listing, E3 for test-root/commands, E4 for lifecycle/integration, E5 for assertion signatures/output, and E6 for the source-to-story map."
+sections[6]:
+  - id: scope-decisions
+    title: Scope and decisions
+    kind: rules
+    items[6]{title,text}:
+      Primary authoring model,"Top-level namespaced fn test_*(t: goosetest::Test&, optional_fixture) declarations; optional fresh Fixture and named hooks. No per-test manual registration."
+      Directory contract,"src/ and test/ are a strict bidirectional unit mirror. integration/ has independent *_test.goose suites. test_support/ holds helper modules. Intentionally invalid fixture source uses a data suffix, not .goose, until materialized in a disposable project."
+      One-time consumer root,"goosetest_root.goose holds ordinary Goose package declarations, imports generated orchestration, and returns its result. The generator never reconstructs a production root or rewrites package sources."
+      Execution and failure,Sequential native compilation/execution via goose build --debug. Framework assertions recover at explicit boundaries; fatal runtime errors fail the whole run. Compile/run deadlines bound hung stages.
+      First-release metadata,"Only @DisplayName and @Disabled are supported. Unknown framework annotations are errors, including POC @Tag and @RepeatedTest until those features are deliberately added."
+      Explicit exclusions,"No benchmarks, metrics/telemetry, feature-flag infrastructure, shadow or A/B rollout, or smoke checks. Also defer parallel execution, expected-abort/contained workers, property testing, recursive deep diffs, parameterized/repeated tests, tags, snapshots, watch mode, coverage instrumentation, JUnit XML/TAP/JSON export, reporter plugins, and Windows support."
+  - id: evidence
+    title: Verified starting points and corrections to the POC
+    kind: notes
+    items[6]{title,text}:
+      Execution evidence,"After correcting the generator’s obsolete absolute docs/example_project path in a temporary copy, the generated suite ran with 3 passed, 1 failed, and 1 skipped, yet the shell status was 0. The inline and contained demos also calculate failure status without returning it."
+      Style evidence,"goosefmt check poc failed. The POC uses compressed statements, broad global declarations, and functions exceeding the guide’s intended limits. Shipping code and generated output need the actual style contract, not cosmetic cleanup alone."
+      Silent omissions,The scanner suppresses directory/file read errors and drops paths/cases at fixed caps; result spans can also be dropped. These are framework correctness defects because they can make incomplete test runs look successful.
+      Compiler version matters,A local compile probe rejects namespaced receiver UFCS that the current online reference supports. The installed local docs confirm the old lookup behavior. Use the verified baseline and small global bridges rather than assuming online syntax works locally.
+      Process API gap,"The installed stdlib/os.goose has file, environment, stream, clock, and directory operations but no subprocess API. A small audited native process boundary is necessary for a real one-command runner on this baseline."
+      Containment limits,"The contained-worker POC builds and catches expected aborts, but stack overflow, exit, and some native failures still terminate the program; foreign resources are not guaranteed to close. It is not a general sandbox or first-release isolation strategy."
+  - id: architecture
+    title: Architecture and durable contracts
+    kind: architecture
+    items[6]{title,text}:
+      Runtime package,"goosetest.goose is a facade over src/runtime/*.goose. Namespaced state and implementations own comparison, recovery boundaries, and results. Deliberate global bridges expose ergonomic assertion UFCS on the pinned compiler."
+      Discovery,Bounded filesystem walk → lexical scan → validated manifest → bidirectional mirror audit. Stable IDs and source locations are fixed here; selection never changes the audited inventory.
+      Generation and execution,Validated manifest → deterministic modules under goosetest_generated/ → existing goosetest_root.goose → compiler child → test child. Direct calls preserve static typing and long-distance return ancestry.
+      Result ownership,"Fixed records plus owned diagnostic bytes, with borrowed contexts when multiple growable tables coexist. No references into dead fixtures; no unbounded log accumulation; no silent record drops."
+      Reporting boundary,Structured outcomes feed a plain console renderer. The runtime need not print and has no knowledge of CLI flags. Export formats remain future consumers of the same model.
+      Platform boundary,"CLI-only native process/filesystem declarations live in one canonical module per interface. The package runtime does not link those adapters. Direct argv invocation, explicit cwd, deadlines, child reaping, and artifact ownership are the boundary’s responsibilities."
+  - id: exit-policy
+    title: Observable outcome policy
+    kind: rules
+    items[5]{title,text}:
+      Status 0,A nonempty selection completed with no case/hook failures. An explicitly disabled nonempty selection is valid and reports skips.
+      Status 1,One or more framework assertions or recoverable lifecycle hooks failed. Remaining cases execute unless --fail-fast was requested.
+      Status 2,"Usage, layout, discovery, compilation, generation, child-process, deadline, fatal runtime, or resource-limit error; also no discovered or selected cases. The output must say when the run is incomplete."
+      Interruption,"Forward cancellation to the owned child stage, reap it, and preserve a conventional nonzero interruption result. Cancellation never counts as a passing or merely skipped suite."
+      Cleanup contract,"After framework setup/body failure, attempt the corresponding cleanup through its own recoverable boundary. Preserve both causes when cleanup fails. No cleanup guarantee after runtime abort, exit, process death, or deadline termination."
+  - id: performance
+    title: Performance and memory rules
+    kind: rules
+    items[6]{title,text}:
+      "Linear scanning, ordered matching","Scan each source once, maintain cursor progress, sort path inventory once, and use a linear merge or bounded lookup for mirror matching. Avoid the POC’s nested source-by-test search."
+      Cold diagnostics,"Passing checks perform comparisons and counters only. Format values on failure into bounded storage, avoiding repeated copies and intermediate strings."
+      Static execution,"Compile the discovered program once per invocation with direct case calls. Do not add function-pointer registries, plugin dispatch, caching invalidation, or worker scheduling before there is a demonstrated need."
+      Named finite budgets,"Bound filesystem entries, path/file/total bytes, nesting, cases, failure records, diagnostic bytes, stage duration, and termination grace. Exercise limits with small injected values; pick documented production defaults after real fixtures fit."
+      Style is a design constraint,The 500-line file and 70-line function limits apply to generated code too. Split generated wrappers/dispatch accordingly rather than bypassing the rules with a huge main function.
+      Validation without performance theater,"Use structural complexity review and exact completeness tests across old capacity thresholds. Do not add benchmark suites, timing gates, dashboards, or telemetry."
+  - id: parallelism
+    title: Independent delivery areas
+    kind: ordered-steps
+    items[4]{title,text}:
+      Freeze small interfaces first,"E1 fixes Test/CaseResult/Failure ownership, and E2 fixes Manifest/CaseId/SourceLocation. Keep these records small and documented; do not design a generalized plugin protocol."
+      Independent tracks,"After E1.S1, discovery E2 and process adapter E3.S2 can proceed independently of runtime work. After E1.S4, rich diagnostics E5 can proceed using the explicit harness without waiting for generated execution."
+      Integration points,E3.S1 joins the runtime with discovery. E3.S3 adds the process adapter. E4 builds lifecycle behavior on that working runner. E6 joins finished behavior and external verification.
+      Ownership boundaries,"Assign discovery, native process execution, and runtime/reporting modules separately if implementation is later delegated. Do not have parallel workers independently redefine the common result or manifest records."
+epics[6]:
+  - id: E1
+    title: An importable runtime that passes and fails correctly
+    summary: "Deliver a small, executable test package before discovery exists. A separate example imports the actual package, runs multiple cases, and returns a reliable process status."
+    description: "<a id=\"framework-design-reference\"></a>\n\n### Framework design reference: what we are building\n\nThe examples below define the **intended first-release developer experience**. They are design targets for the stories, not claims that goosetest already implements these APIs. The linked POC files are existing reference implementations. Where the target differs, the change is called out explicitly.\n\nThe main influence is the repository’s **JUnit-style discovered-function POC**: ordinary named test functions, a fresh fixture per case, lifecycle hooks, hard/soft assertions, and useful expected/actual diagnostics. The inline describe DSL and contained-worker prototype remain reference material for deferred alternatives.\n\n- **Authoring:** [Auth test authoring example — line 12, `struct Fixture`](/Users/bob/repos/goosetest/poc/example_project/test/auth/token_test.goose) and [Permissions test and struct-diff example — line 30, `fn test_viewer_write_denied_demo_diff`](/Users/bob/repos/goosetest/poc/example_project/test/workspaces/permissions_test.goose).\n- **Runtime:** [Runtime recovery boundary — line 56, `fn run_case`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose), [Expected-first assertion implementation — line 161, `fn assert_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose), and [Soft assertion implementation — line 194, `fn check_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose).\n- **Discovery/generation:** [POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose) and [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose).\n- **Formatting and code shape:** [Normative Goose style guide](/Users/bob/repos/pretty-goose/docs/styleguide.md) is normative whenever the prototype conflicts with it.\n\n**Reference tour:** [unit-test API](#reference-unit-api) · [consumer layout](#reference-project-layout) · [test root and generation](#reference-test-root) · [fixture lifecycle](#reference-lifecycle) · [integration test](#reference-integration-api) · [assertion signatures](#reference-assertion-api) · [console output](#reference-console) · [source-to-story map](#reference-source-map).\n\n<a id=\"reference-unit-api\"></a>\n\n### Target unit-test file: test/auth/token_test.goose\n\n```goose\n// Verifies valid, malformed, and disabled token cases with a fresh fixture.\nnamespace auth_token_test;\n\nimport goosetest;\n\nimport src.auth.token;\n\nstruct Fixture {\n    header: const u8[:] = \"\",\n}\n\nfn before_each(f: Fixture&) {\n    f.header = \"Bearer tok_admin\";\n}\n\nfn after_each(f: Fixture&) {\n    f.header = \"\";\n}\n\n// @DisplayName(\"parses valid admin Bearer token into claims\")\nfn test_valid_admin_bearer(t: goosetest::Test&, f: Fixture&) {\n    let claims = auth_token::parse_bearer(f.header);\n    t.assert_true(claims.valid, \"admin token must be valid\");\n    t.assert_eq(1, claims.user_id);\n    t.assert_eq(\"admin\", claims.scope);\n}\n\n// @DisplayName(\"rejects malformed Authorization header\")\nfn test_malformed_header(t: goosetest::Test&) {\n    let claims = auth_token::parse_bearer(\"Basic abcdef\");\n    t.check_eq(false, claims.valid, \"Basic authentication is unsupported\");\n    t.assert_eq(0, claims.user_id);\n}\n\n// @Disabled(\"pending clock skew tolerance in token verification\")\nfn test_expired_token_clock_skew(t: goosetest::Test&) {\n    t.fail(\"not implemented\");\n}\n```\n\nThis is a complete target test file. It has no main function, registration list, test class, assertion macro, or manual runner construction. Tests explicitly import the modules they use. The first test receives a fresh fixture; the other two are fixture-free even though the file declares Fixture. The fixture hooks apply to the fixture-using case.\n\nThe hard `assert_*` family stops its current test or hook phase; `check_eq` records a failure and continues. The disabled case remains typechecked while its body and hooks remain unexecuted. `@DisplayName` affects display only; the function name remains part of the stable ID.\n\nChanges from the POC: the context is `goosetest::Test`; declarations follow the guide’s header/namespace/import order; `@Tag` and `@RepeatedTest` are deferred; diagnostic and exit-status defects are corrected. This file is delivered progressively: E1 establishes assertions, E3 establishes generated execution, and E4 completes hooks and metadata.\n\nExisting authoring reference: [Auth test authoring example — line 12, `struct Fixture`](/Users/bob/repos/goosetest/poc/example_project/test/auth/token_test.goose). Production behavior used here: [Auth production module — line 11, `fn parse_bearer`](/Users/bob/repos/goosetest/poc/example_project/src/auth/token.goose).\n\n**Normative review rule:** an implementer should be able to point to a target example and its source reference before changing the public API. If compiler evidence requires a different spelling, update this reference and the affected story criteria together rather than silently diverging.\n\n\nDelivery: a real package with observable pass/fail behavior. Later epics consume this runtime; they do not replace it. The short explicit harness is a package-API example and a bootstrap oracle, not the eventual user registration workflow."
+    dependencies: []
+    stories[4]:
+      - id: E1.S1
+        title: Pin the compiler contract and establish enforceable style
+        details[5]: "Use the locally verified Goose v2026.3 release as the initial baseline. Record its installation identity and supported commands; do not use goose --version, which this release rejects. Do not upgrade the compiler as part of this plan.","Add small compile fixtures for package-relative imports, const-generic inputs, generic long-distance returns, global bridge calls, and references into growable storage. Check the exact syntax before exposing an API.","Adopt the settings in /Users/bob/repos/pretty-goose/.goosefmt.toml and the normative rules in docs/styleguide.md from that repository. Use headers, namespace-before-import order, direct imports, snake_case names, 120 columns, at most 500 lines per file, and at most 70 lines per function.","Keep the public type namespaced as goosetest::Test. Use namespaced implementations and only the deliberate global assertion bridges needed for t.assert_eq(...) on this compiler. Keep execution helpers qualified and document possible same-name shadowing. All proposed source paths are initial module boundaries; split further only when the guide or a cohesive responsibility requires it.",Record the baseline platform as the available macOS arm64 environment. Keep the process adapter separate so another platform can be added later without changing the runtime API.
+        acceptanceCriteria[4]: The compatibility document names the supported release and explains why current online UFCS/defer behavior must not be assumed.,Compiler fixtures demonstrate a namespaced test calling the chosen assertion bridge and a hard assertion returning to the intended execution boundary.,The style configuration is explicit; new framework files pass the installed goosefmt check. Compiler-sensitive formatter defects are recorded with a reproducer rather than hidden by broad rule exclusions.,No source file depends on a sibling declaration solely through an accidental transitive import.
+        unitTests[2]: Compile positive fixtures and assert failure for an assertion called outside its required execution boundary.,Check that a bridge works inside two different user namespaces and that the documented shadowing case produces the expected compiler diagnostic.
+        filesLikelyTouched[4]: .goosefmt.toml,docs/compatibility.md,integration/compatibility_test.goose,integration/fixtures/compatibility/README.md
+        dependencies: []
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-unit-api).\n\n**Existing source references:**\n\n- [Normative Goose style guide](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n- [Style guide: namespaces and bridges — line 186, `### 3.2`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n- [Pinned compiler package/import contract — line 92, `**Only the root file declares packages.**`](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/docs/packages.md)\n\n**Retain or change:** Preserve the target test-call spelling while verifying the pinned compiler and applying the guide."
+      - id: E1.S2
+        title: Implement one-case execution and fundamental assertions
+        details[5]: "Create goosetest::Test and a qualified run_case boundary. The context represents the current case, not the entire CLI, manifest, and reporter combined.","Implement fail, assert_true, assert_false, assert_eq, assert_ne, and check_eq. Equality consistently takes expected before actual; check_eq records a failure and continues, while hard assertions stop the current phase.",Use the non-local return mechanism verified in E1.S1. Do not use built-in assert for ordinary test failures; reserve it for framework invariants.,Reset per-case state before every execution and calculate the final case outcome from all of its failures. A later successful check must never erase an earlier failure.,"Keep successful assertion paths free of message formatting. Format diagnostic values while their inputs are alive, using Goose format hooks."
+        acceptanceCriteria[4]: A hard failure prevents the next statement in that case and permits the following case to execute.,"Two failed soft checks both appear in the result, and the case is counted as failed once.","Scalar, string, and slice equality compile through the public API; expected and actual labels are never reversed.",A hand-written harness returns 0 for passing cases and 1 when any case fails.
+        unitTests[2]: "Use state sentinels to verify hard-stop, soft-continue, and next-case execution.","Exercise zero assertions, successful comparisons, and multiple failures without relying on console string parsing."
+        filesLikelyTouched[7]: goosetest.goose,src/runtime/context.goose,src/runtime/execution.goose,src/runtime/assertions.goose,test/runtime/context_test.goose,test/runtime/execution_test.goose,test/runtime/assertions_test.goose
+        dependencies[1]: E1.S1
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-assertion-api).\n\n**Existing source references:**\n\n- [Runtime recovery boundary — line 56, `fn run_case`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [Expected-first assertion implementation — line 161, `fn assert_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [Soft assertion implementation — line 194, `fn check_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n\n**Retain or change:** Carry forward hard-stop/soft-continue behavior and expected-first arguments; separate runtime state from printing."
+      - id: E1.S3
+        title: Own structured results and diagnostics with explicit bounds
+        details[6]: "Define small named records for case identity, case outcome, phase, failure spans, and totals. Represent pass, fail, skip, and runner error explicitly; keep filtered-out cases separate from skipped cases.",Keep stable metadata and diagnostic bytes in owner scopes that outlive reporting. Use offsets into bounded byte arenas for stored messages; never retain slices of a temporary formatted value.,"Respect Goose layout constraints: one resizable tail per owning struct. If results and bytes both grow, own them in driver locals and pass a borrowed context of references.","Introduce a named Limits record covering case records, failures, and diagnostic bytes. Check before appending; use a fixed, allocation-independent terminal diagnostic when storage is exhausted.","A limit breach is a runner error with status 2. Preserve already recorded failures, mark the run incomplete, and never return a successful result after dropping a record. These are framework-owned storage bounds; they do not sandbox allocations or work performed by tests or custom format hooks.",Keep result collection independent from terminal rendering. Do not introduce a reporter plugin interface or a serialized interchange format yet.
+        acceptanceCriteria[4]: A result remains valid after the test fixture and assertion arguments leave scope.,At-limit workloads complete; the next record or byte triggers a visible incomplete-run error without a panic or silent omission.,Totals reconcile with emitted case outcomes and do not count one failed case multiple times.,The runtime can run with no console renderer attached.
+        unitTests[2]: "Exercise tiny injected limits for case count, failure count, and message bytes.",Record messages from nested helper scopes and inspect them only after those helpers return.
+        filesLikelyTouched[6]: src/runtime/results.goose,src/runtime/diagnostics.goose,src/runtime/context.goose,test/runtime/context_test.goose,test/runtime/results_test.goose,test/runtime/diagnostics_test.goose
+        dependencies[1]: E1.S2
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-console).\n\n**Existing source references:**\n\n- [POC state and failure storage — line 19, `struct Test`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [Style guide: multiple growable collections — line 425, `### 4.6`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n- [Style guide: bounded control flow and storage — line 843, `### 7.8`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Replace the fixed failure-span cap with bounded, owned results that cannot silently disappear."
+      - id: E1.S4
+        title: Prove package consumption with a standalone example
+        details[4]: Make root goosetest.goose a small package facade importing runtime modules. Keep CLI-only dependencies and native process code out of the importable package.,Create a small example project with mirrored src and test files plus a temporary hand-written harness using the real package import. Do not copy the POC runtime into the example.,"Run a passing variant and a deliberately failing variant through an independent process-level checker. Preserve intentional negative cases as test data, not as default failing product examples.",Document the public assertion order and the difference between framework assertions and fatal Goose runtime checks.
+        acceptanceCriteria[5]: An application outside the package directory imports goosetest and compiles without relying on the framework repository as its import root.,The passing program exits 0; the deliberately failing program exits 1 and still executes a later case.,The runtime needs only Goose standard-library modules and the compiler runtime.,Example source passes the same style checks as framework source.,"The embedded unit-test API example is the authoring reference; after lifecycle stories land, it compiles against the real package without manual test registration."
+        unitTests[2]: Build and execute the example from its root and from another working directory using explicit paths.,Verify OS exit status independently of the framework summary text.
+        filesLikelyTouched[4]: examples/basic/goosetest_root.goose,examples/basic/src/calculator.goose,examples/basic/test/calculator_test.goose,integration/package_test.goose
+        dependencies[1]: E1.S3
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-unit-api).\n\n**Existing source references:**\n\n- [Auth test authoring example — line 12, `struct Fixture`](/Users/bob/repos/goosetest/poc/example_project/test/auth/token_test.goose)\n- [Permissions test and struct-diff example — line 30, `fn test_viewer_write_denied_demo_diff`](/Users/bob/repos/goosetest/poc/example_project/test/workspaces/permissions_test.goose)\n- [Pinned compiler package/import contract — line 92, `**Only the root file declares packages.**`](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/docs/packages.md)\n\n**Retain or change:** Make the embedded target files consume the real package; keep default examples passing."
+    shortTitle: Runtime foundation
+  - id: E2
+    title: Discover and audit a project without compiling it
+    summary: Deliver goosetest list and goosetest check-mirror. Users can inspect every discovered case and diagnose layout problems before execution is integrated.
+    description: "<a id=\"reference-project-layout\"></a>\n\n### Target consumer project layout\n\n```text\nworkspace/\n├── goosetest/                         # Framework checkout or installed package.\n└── my_app/\n    ├── main.goose                     # Production entry, if the app needs one.\n    ├── goosetest_root.goose           # Authored once; declares test packages.\n    ├── src/\n    │   ├── auth/token.goose\n    │   └── workspaces/permissions.goose\n    ├── test/                         # Exact unit mirror of src/.\n    │   ├── auth/token_test.goose\n    │   └── workspaces/permissions_test.goose\n    ├── integration/\n    │   └── access_flow_test.goose     # Cross-module tests; no source mirror.\n    ├── test_support/                 # Optional helper modules; not discovered.\n    └── goosetest_generated/           # Generated, ignored, never hand edited.\n        ├── runner.goose\n        ├── suite_0000.goose\n        └── ...                       # Additional bounded suite/dispatch files.\n```\n\nThe two production modules each have exactly one unit-test counterpart. The integration case may exercise both without requiring a fictitious source module. A root entry, the test root, test helpers, and generated files are outside the unit mirror. Nested integration fixture data must not masquerade as discovered `*_test.goose` files.\n\nSource modules for this reference scenario are the existing POC auth and permissions implementations. The first-release examples should format those implementations to the guide and use the real goosetest package rather than copy the POC runtime.\n\nSource references: [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose); [Auth production module — line 11, `fn parse_bearer`](/Users/bob/repos/goosetest/poc/example_project/src/auth/token.goose); [Permissions production module — line 12, `fn check_write_access`](/Users/bob/repos/goosetest/poc/example_project/src/workspaces/permissions.goose).\n\n<a id=\"reference-list-output\"></a>\n\n### Target discovery output and stable IDs\n\nThe case ID format is `<relative test path>::<namespace>::<function>`. Paths use forward slashes; display names never alter the ID. Here is an excerpt for the auth unit suite:\n\n```text\n$ goosetest list --project ./my_app --filter auth_token_test\nunit  test/auth/token_test.goose::auth_token_test::test_valid_admin_bearer\nunit  test/auth/token_test.goose::auth_token_test::test_malformed_header\nunit  test/auth/token_test.goose::auth_token_test::test_expired_token_clock_skew\n      disabled: pending clock skew tolerance in token verification\n3 selected cases: 2 executable, 1 disabled\n```\n\n`--filter` becomes available in E4.S4; E2.S4 initially lists all cases. Listing also includes the source declaration line; spacing and labels above are illustrative, while stable IDs and selection counts are contractual.\n\n```text\n$ goosetest check-mirror --project ./my_app\nMIRROR OK  src/auth/token.goose -> test/auth/token_test.goose\nMIRROR OK  src/workspaces/permissions.goose -> test/workspaces/permissions_test.goose\nUnit mirrors: 2 matched, 0 missing, 0 orphaned\n\n# If the permissions unit file is removed:\nMISSING TEST  src/workspaces/permissions.goose\n              expected test/workspaces/permissions_test.goose\n```\n\nThe valid audit returns 0; the missing mirror returns 2 before compilation. These are file-correspondence results, not code-coverage claims.\n\nDelivery: useful read-only commands. E2 can be developed independently of assertion implementation once shared path/diagnostic conventions are agreed; it has no dependency on native process execution."
+    dependencies: []
+    stories[4]:
+      - id: E2.S1
+        title: Walk source and test roots completely and deterministically
+        details[6]: "Walk src/, test/, and optional integration/ iteratively. Treat test_support/ as non-discovered helpers and goosetest_generated/ as framework-owned output outside the audited roots.",Validate path segments used in Goose dotted imports. Reject names the compiler cannot import rather than generating invalid code; permit the project root itself to contain spaces.,"Bound visited entries, nesting, path bytes, accumulated path bytes, per-file source bytes, and total scanned bytes through named limits. Report the offending path and limit.",Treat directory-list and file-read failures as errors. Missing src/ or test/ is an invalid unit-test project; an absent integration/ is valid.,"Reject symlink traversal under the scanned roots. The pinned standard library lacks lstat-style inspection, so add a narrow filesystem adapter with canonical extern declarations and main.build wiring here; E3 later extends it for artifact ownership. Inspect entry kinds without following links so cycles cannot be traversed. This adapter adds no third-party package.",Normalize relative separators and sort paths bytewise once. Do not use nested source-by-test linear searches.
+        acceptanceCriteria[4]: Discovery returns the same path sequence regardless of directory creation order.,More than the POC limits of 128 files or 64 directories can be handled within the configured bounds; no entry is silently omitted.,"Unreadable entries, invalid import segments, limit breaches, and cycles cannot produce a successful incomplete manifest.",The walker owns path storage for as long as any manifest record references it.
+        unitTests[2]: "Use temporary directory fixtures covering empty trees, nested files, spaces in the project path, unreadable entries, and a cycle.",Inject small limits and verify exact-bound success and one-over-bound failure.
+        filesLikelyTouched[10]: src/discovery/files.goose,src/discovery/paths.goose,src/discovery/model.goose,test/discovery/files_test.goose,test/discovery/paths_test.goose,test/discovery/model_test.goose,src/platform/filesystem.goose,native/filesystem.c,main.build,test/platform/filesystem_test.goose
+        dependencies: []
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-project-layout).\n\n**Existing source references:**\n\n- [POC directory walker — line 33, `fn walk_goose_files`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Style guide: bounded control flow and storage — line 843, `### 7.8`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n- [Pinned standard-library OS surface](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/stdlib/os.goose)\n\n**Retain or change:** Use the POC traversal as a behavioral starting point; replace ignored I/O errors and silent limits."
+      - id: E2.S2
+        title: Tokenize supported test declarations and preserve locations
+        details[7]: "Build a focused lexical scanner for identifiers, strings and escapes, raw strings, character literals, nested block comments, line comments, and delimiters. Reuse design lessons from pretty-goose without coupling to its whole formatter or importing its repository by absolute path.","Recognize one declared namespace per test file, top-level test_* functions, an optional Fixture struct, and named lifecycle hooks. Track brace depth so declarations inside strings, comments, or nested functions are not tests.","Record file, declaration line, namespace, function name, fixture participation, and hook signatures in a manifest. Use file path plus namespace plus function name as the stable case identity.","Support multiline signatures and optional inline on ordinary non-generic test functions. Reject unsupported generic, recursive, thread, foreign, or explicitly qualified test declarations with a source diagnostic.","Accept test functions with goosetest::Test& and an optional local Fixture&. Validate the supported hook forms without pretending to replace compiler type checking.",Parse immediately attached @DisplayName and @Disabled comments into optional manifest fields for E4. Reject malformed or unknown framework annotations; ordinary comments remain legal. Defer @Tag and @RepeatedTest explicitly.,"Use the concrete stable-ID spelling <relative test path>::<namespace>::<function> shown in the discovery reference; display names never affect identity."
+        acceptanceCriteria[5]: A test declaration appears exactly once even when its signature spans lines or follows ordinary documentation.,Fake fn test_* text in strings and comments never enters the manifest.,Malformed declarations and metadata report a path and line instead of silently disappearing.,Duplicate case identities and suite namespaces that would collide at compile time are rejected before generation.,Scanning advances monotonically and stops at the configured nesting and byte limits.
+        unitTests[2]: "Test escaped quotes, multiline raw strings, nested block comments, nested functions, and multiline parameters.",Check valid and invalid signatures and precise declaration line numbers with LF and CRLF input.
+        filesLikelyTouched[8]: src/discovery/lexer.goose,src/discovery/declarations.goose,src/discovery/annotations.goose,src/discovery/model.goose,test/discovery/model_test.goose,test/discovery/lexer_test.goose,test/discovery/declarations_test.goose,test/discovery/annotations_test.goose
+        dependencies: []
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-unit-api).\n\n**Existing source references:**\n\n- [POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Existing pretty-goose tokenizer — line 15, `struct Token`](/Users/bob/repos/pretty-goose/src/lexer.goose)\n- [Style guide: file/declaration structure — line 58, `### 2.1`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Recognize the shown declarations and comments lexically without making source formatting part of test discovery."
+      - id: E2.S3
+        title: Enforce unit-test mirrors while admitting integration suites
+        details[6]: "Require src/<path>/<name>.goose to correspond to test/<path>/<name>_test.goose and audit in both directions. Missing and orphaned unit files are errors, not informational warnings.",Discover integration/**/*_test.goose independently; integration tests may import multiple production modules and require no source counterpart.,"Require each discovered test file to have at least one valid test declaration. Allow shared test helpers only outside the audited test roots, in test_support/, so helper files do not masquerade as mirrors.","Keep root entry files, package facades, native code, and generated output outside the src/test mirror contract. Do not add exclusion globs or per-file exemptions in this release.",Audit the complete tree before applying any execution filter. Use sorted-path merge or a bounded lookup table for matching rather than the POC quadratic comparison.,"Report correspondence counts as mirror audit results, never as statement, branch, or behavioral coverage."
+        acceptanceCriteria[4]: A valid mirrored project plus a cross-module integration suite passes the audit.,"A missing source counterpart, missing unit counterpart, bad test filename, or empty test file fails with its expected relative path.",Selecting one test does not hide a mirror violation elsewhere in the project.,Renaming a source module produces both the useful missing-mirror and orphan-test diagnostics.
+        unitTests[2]: "Test exact matches, missing and orphaned pairs, similarly prefixed filenames, and integration-only additions.",Run the original POC sample and verify that src/workspaces/archive.goose is reported as missing a unit mirror.
+        filesLikelyTouched[5]: src/discovery/mirror.goose,src/discovery/model.goose,integration/discovery_test.goose,test/discovery/model_test.goose,test/discovery/mirror_test.goose
+        dependencies[2]: E2.S1,E2.S2
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-project-layout).\n\n**Existing source references:**\n\n- [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [POC design research — line 61, `## Part 2:`](/Users/bob/repos/goosetest/poc/goosetest_framework_research.md)\n\n**Retain or change:** Keep bidirectional unit mirroring and implement the separately agreed integration directory."
+      - id: E2.S4
+        title: Expose list and check-mirror through a small CLI
+        details[5]: "Add root main.goose as CLI wiring and focused argument parsing/dispatch modules. Define goosetest list, goosetest check-mirror, and --project PATH; default the project to the current directory.","List stable case IDs, test source locations, unit/integration kind, and any recognized disabled reason. Emit deterministic plain text without terminal-specific dependencies.","Return 0 on a valid audit/list, 2 on invalid arguments, invalid project structure, read errors, or discovery errors. Reserve 1 for executed test failures.",Both commands use the same manifest and mirror implementation that the execution command will consume. Neither invokes the compiler or writes generated source.,Add clear help text including the conventions and limits. Avoid adding a custom TOML/YAML settings parser for the first release.
+        acceptanceCriteria[4]: A user can list and audit the example project before the execution epic is implemented.,Unknown options and unsupported combinations return 2 with actionable help.,Repeated list calls on unchanged input produce byte-identical output.,List/check-mirror do not create artifacts or run project code.
+        unitTests[2]: Exercise CLI parsing and status codes using valid and invalid project fixtures.,Assert that read-only commands leave the project directory unchanged.
+        filesLikelyTouched[6]: main.goose,src/cli.goose,src/arguments.goose,integration/cli_test.goose,test/cli_test.goose,test/arguments_test.goose
+        dependencies[1]: E2.S3
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-list-output).\n\n**Existing source references:**\n\n- [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Style guide: Goose repository tooling — line 155, `### 2.7`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Expose the shown read-only commands and stable identities with no compilation side effects."
+    shortTitle: Project discovery
+  - id: E3
+    title: Compile and execute an entire project with one command
+    summary: "Deliver goosetest test with generated static calls, ordinary Goose package resolution, bounded compiler/runner subprocesses, and truthful exit status."
+    description: "<a id=\"reference-test-root\"></a>\n\n### Target one-time test root: my_app/goosetest_root.goose\n\n```goose\n// Declares test dependencies and invokes generated orchestration.\nimport goosetest from \"../goosetest\";\n\nimport goosetest_generated.runner;\n\nfn main() -> i32 {\n    return goosetest_generated::run_all();\n}\n```\n\nThis example assumes `my_app/` and the framework checkout are siblings as shown in the layout. A consumer using a published package replaces the source with its actual pinned repository reference. No repository URL is invented here. Extra application packages are declared in this root using ordinary Goose imports. An optional `goosetest_root.build` remains beside it for the compiler’s normal sidecar handling.\n\nThe root is authored once. Adding a test changes only a test file; generation refreshes the imported orchestration. Preserve the root’s exit value: returning `i32` here fixes the POC bug where a summary code is assigned and discarded.\n\nCompiler contract: [Pinned compiler package/import contract — line 92, `**Only the root file declares packages.**`](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/docs/packages.md). Existing generator: [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose). Existing summary status: [POC console summary — line 235, `fn summary`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose).\n\n<a id=\"reference-run-pipeline\"></a>\n\n### Target run flow and generated responsibility\n\n```text\ngoosetest test --project ./my_app\n  -> discover src/, test/, integration/\n  -> validate declarations and complete unit mirrors\n  -> select executable case IDs\n  -> write owned goosetest_generated/ modules\n  -> goose build --debug goosetest_root.goose\n  -> execute the newly built binary in the project directory\n  -> return 0 (pass), 1 (test/hook failure), or 2 (runner error)\n```\n\nGenerated code must contain statically visible calls to each discovered function under a `goosetest::run_case` boundary, including unreachable wrappers for disabled/filtered cases. It may split wrappers across multiple modules to satisfy the style limits. The exact generated helper names are implementation details; original source IDs, call-graph validity, and behavior are the contract.\n\nConcrete commands to support by the end of the plan:\n\n```sh\ngoosetest check-mirror --project ./my_app\ngoosetest list --project ./my_app\ngoosetest test --project ./my_app\ngoosetest test --project ./my_app --suite integration\ngoosetest test --project ./my_app --filter test_viewer_cannot_write --fail-fast\n```\n\nThe pipeline and commands are target behavior, not commands available in the current POC. The native subprocess adapter is new work: the existing scanner generates code but does not implement a safe process-launch stage.\n\nDelivery: fixture-free projects can run end to end. The stable test root is intentional one-time package wiring, not manual test registration. The small CLI native adapter is required by the pinned standard library, not an external dependency framework."
+    dependencies[2]: E1,E2
+    stories[4]:
+      - id: E3.S1
+        title: Generate suite code behind a stable Goose test root
+        details[6]: "Use a checked-in goosetest_root.goose at the consumer project root. It declares import goosetest from the chosen local directory or pinned repository, declares other packages, imports goosetest_generated.runner, and returns goosetest_generated::run_all() from main.",Keep the test root stable so its relative package imports and optional goosetest_root.build sidecar retain normal compiler semantics. Do not copy dependency declarations out of production main files or infer a package manager.,"Generate suite modules under goosetest_generated/ from the manifest. Use direct compile-time calls enclosed by the runtime boundary, not runtime function registries or escaping closures.",All generated files directly import the modules they reference. Escape path and display strings as Goose literals using a dedicated encoder; validate identifiers separately.,Generate one bounded case wrapper per test and hierarchical dispatch helpers. Split suite and dispatch modules so generated files and functions obey the same 500-line and 70-line limits at scale.,Preserve source metadata in generated calls so runtime diagnostics name original test files rather than only generator output. Start with fixture-free test signatures; E4 adds lifecycle behavior.
+        acceptanceCriteria[5]: The real example compiles through goosetest_root.goose and runs every discovered fixture-free case once in deterministic order.,Adding a valid test file requires no registration-list edit.,Local package imports remain correct when launched from another working directory and when the project root contains spaces.,A fixture with a native package or test-root sidecar compiles without rewriting its path semantics.,Generated code passes goosefmt check without running a formatter as part of normal test execution.
+        unitTests[2]: "Compile generated fixtures with local package imports, escaped labels, and many discovered cases.",Check deterministic emitted source and original-source attribution on a failing case.
+        filesLikelyTouched[8]: src/generation/runner.goose,src/generation/suites.goose,src/generation/literals.goose,goosetest_root.goose,examples/basic/goosetest_root.goose,test/generation/runner_test.goose,test/generation/suites_test.goose,test/generation/literals_test.goose
+        dependencies[2]: E1.S4,E2.S4
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-test-root).\n\n**Existing source references:**\n\n- [POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Pinned compiler package/import contract — line 92, `**Only the root file declares packages.**`](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/docs/packages.md)\n\n**Retain or change:** Generate static calls behind the authored test root; preserve compiler-native dependency resolution."
+      - id: E3.S2
+        title: Implement the minimal native process boundary
+        details[6]: "The installed os.goose provides filesystem and environment operations but no subprocess API. Add one canonical Goose FFI module and a CLI-only native implementation, compiled through main.build; keep the importable runtime pure Goose.","Launch argv arrays directly using the supported platform process API. Set the child working directory explicitly; never construct a shell command from project paths, compiler paths, or test metadata.","Return a named ProcessResult distinguishing normal exit, launch failure, signal termination, cancellation, and deadline expiry. Preserve useful native error details without exposing an opaque wait status as a test result.","Inherit standard streams initially. Avoid pipe capture, output buffering, and protocol parsers until required; this prevents a stalled pipe from hanging a test run.",Use finite stage deadlines and a bounded termination grace period. Use a monotonic clock and the platform process-group facilities to terminate and reap the stage on timeout or interruption.,"Keep extern declarations unique, with const slice/reference inputs where required. Support the available macOS arm64 platform first; document the boundary for future ports without claiming untested platform support."
+        acceptanceCriteria[5]: "Arguments containing spaces, quotes, dollar signs, and semicolons arrive literally in the child.",Missing executables and nonzero child exits are distinguishable.,A hung fixture terminates within its deadline plus the documented grace period and leaves no owned child process running.,Cancellation and signal termination never become a passing test result.,An application importing the runtime alone does not link the process adapter.
+        unitTests[2]: "Use purpose-built child fixtures for argv echo, selected exit codes, deliberate signal termination, and waiting indefinitely.","Exercise deadline expiry and interruption, checking child reaping from outside the adapter."
+        filesLikelyTouched[5]: main.build,src/platform/process.goose,native/process.c,integration/process_test.goose,test/platform/process_test.goose
+        dependencies[1]: E1.S1
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-run-pipeline).\n\n**Existing source references:**\n\n- [Pinned standard-library OS surface](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/stdlib/os.goose)\n- [Style guide: canonical foreign declarations — line 140, `### 2.6`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n- [Pinned compiler package/import contract — line 92, `**Only the root file declares packages.**`](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/docs/packages.md)\n\n**Retain or change:** This is new CLI work: the prototype does not supply a subprocess adapter, and the pinned OS module has no launch API."
+      - id: E3.S3
+        title: "Wire discovery, compilation, execution, and exit policy"
+        details[6]: "Implement goosetest test: validate CLI options, discover and audit, generate source, compile the stable test root, and run the resulting binary only after a successful build.",Use goose build --debug as the first-release execution path so native packages and runtime checks behave consistently. Expose --compiler PATH plus --compile-timeout-seconds and --run-timeout-seconds as ordinary execution options with finite documented defaults.,Set both child stages to the project working directory. Execute the newly built output using an exact path and prevent reuse of an old binary after a compilation failure.,"Define status 0 as a completed run with no failed cases, 1 as one or more ordinary test/hook failures, and 2 as discovery, compilation, artifact, process, timeout, or incomplete-run errors. Preserve conventional cancellation status if the parent is interrupted.",A run that discovers or selects zero cases is an error. A nonempty selection consisting entirely of explicitly disabled cases is a valid skipped run once E4 lands.,"Do not promise continuation after fatal Goose checks, exit calls, foreign crashes, or a hung test. These fail the run; per-case process isolation and contained-worker assertions remain outside this release."
+        acceptanceCriteria[5]: "One command returns the correct shell status for passing, assertion-failing, uncompilable, and runtime-crashing projects.",The next ordinary case executes after a framework assertion failure.,"The runner never starts when the audit, generation, or compiler stage fails.",No tests and no matching tests cannot produce a misleading green result.,Timeout messages identify whether compilation or execution exceeded its deadline.
+        unitTests[2]: "Run process-level fixtures for every status category, including a stale executable left beside a newly broken source tree.",Verify working-directory behavior with a test reading a project-relative resource.
+        filesLikelyTouched[7]: src/cli.goose,src/arguments.goose,src/execution/command.goose,integration/execution_test.goose,test/cli_test.goose,test/arguments_test.goose,test/execution/command_test.goose
+        dependencies[2]: E3.S1,E3.S2
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-run-pipeline).\n\n**Existing source references:**\n\n- [POC console summary — line 235, `fn summary`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Style guide: error propagation — line 674, `### 6.6`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Return the real status shown in the output reference instead of assigning and discarding it."
+      - id: E3.S4
+        title: Own generated artifacts without stale or destructive behavior
+        details[6]: Reserve goosetest_generated/ for framework artifacts with an ownership marker. Refuse to overwrite a preexisting unowned directory or a user-authored test root.,"Write generated source atomically, compare content to avoid needless rewrites, and keep deterministic filenames independent of timestamps.","Update the generated root only after all referenced suite files are ready. On interrupted generation, the next run must regenerate successfully before compiling; no cached result is trusted.",Remove obsolete generated files only when they are in the owned directory and listed by the previous generation manifest. Never recursively delete user paths.,Fail clearly on concurrent invocations targeting the same output directory using a narrow exclusive-ownership mechanism. Do not add a scheduler or parallel execution.,Add generated artifacts to repository ignore rules. Keep generated source after a failure for inspection; keep documentation clear that it is disposable.
+        acceptanceCriteria[4]: Deleting or renaming a test does not leave a stale generated call on the next run.,A second run with unchanged input produces the same source bytes and avoids rewriting unchanged source files.,"An unowned directory, read-only output location, or concurrent run produces status 2 with no user-file deletion.",A failed write cannot lead to execution of a stale successful binary.
+        unitTests[2]: "Simulate obsolete generated files, an interrupted generation, and a write failure in temporary project roots.",Attempt a concurrent invocation and verify that exactly one process owns generation.
+        filesLikelyTouched[8]: src/generation/artifacts.goose,src/platform/filesystem.goose,native/filesystem.c,main.build,.gitignore,integration/artifacts_test.goose,test/generation/artifacts_test.goose,test/platform/filesystem_test.goose
+        dependencies[1]: E3.S3
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-test-root).\n\n**Existing source references:**\n\n- [Pinned atomic file writer — line 12, `gs_os_write_file_atomic`](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/stdlib/os.goose)\n- [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Style guide: bounded control flow and storage — line 843, `### 7.8`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Replace the single unconditional prototype output write with explicit generated-directory ownership and atomic updates."
+    shortTitle: Compile & execute
+  - id: E4
+    title: "Fixtures, lifecycle hooks, disabled tests, and focused runs"
+    summary: "Deliver the POC authoring experience with precise failure semantics, including setup failures and disabled/filtered functions that remain valid in Goose’s call graph."
+    description: "<a id=\"reference-lifecycle\"></a>\n\n### Target fixture and lifecycle behavior\n\nUse the [complete auth test file](#reference-unit-api) as the ordinary fixture example. For a hook that needs framework assertions, the supported alternative is:\n\n```goose\nfn before_each(t: goosetest::Test&, f: Fixture&) {\n    f.header = \"Bearer tok_admin\";\n    t.assert_true(f.header.len > 0, \"fixture must provide a header\");\n}\n```\n\nThis replaces the fixture-only `before_each` in that file; do not define both forms. The fresh fixture must be safe to clean up even if setup stops partway through initialization.\n\n| Trigger | Required behavior |\n| --- | --- |\n| Normal fixture-using case | Default fixture → before_each → test body → after_each → final case result. |\n| Framework assertion fails in setup | Record setup failure → omit body → attempt after_each once → one failed case. |\n| Body and cleanup both fail | Keep both phase diagnostics → one failed case. |\n| Fixture-free case in the same file | Execute with Test only; do not construct Fixture or call fixture-specific hooks. |\n| before_all fails | Record suite error → skip its executable cases → attempt after_all → continue other suites. |\n| Disabled or filtered case | Typecheck its wrapper; do not execute its body, fixture construction, or per-case hooks. |\n| --fail-fast after ordinary failure | Finish current cleanup and suite cleanup, then stop additional bodies. |\n| Fatal runtime abort or timeout | Report an incomplete run; no cleanup promise. |\n\nExisting prototype orchestration: [POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose). Disabled-call-graph technique: [Disabled call-graph preservation — line 224, `Keep disabled test in`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose). The separate contained-worker prototype is deferred: [Deferred contained-worker alternative — line 46, `fn expect_abort`](/Users/bob/repos/goosetest/poc/goosetest_contained_poc.goose).\n\n<a id=\"reference-integration-api\"></a>\n\n### Target integration file: integration/access_flow_test.goose\n\n```goose\n// Verifies that token parsing and permission decisions agree across modules.\nnamespace access_flow_test;\n\nimport goosetest;\n\nimport src.auth.token;\nimport src.workspaces.permissions;\n\nfn test_viewer_token_cannot_write(t: goosetest::Test&) {\n    let header = \"Bearer tok_viewer\";\n    let claims = auth_token::parse_bearer(header);\n    let decision = workspaces_permissions::check_write_access(header);\n    t.assert_true(claims.valid);\n    t.assert_eq(claims.scope, decision.effective_role);\n    t.assert_false(decision.allowed);\n}\n```\n\nIntegration tests use the same Test API, assertions, metadata, and failure rules. Their distinction is discovery and layout: this case intentionally tests agreement between two modules and has no matching `src/access_flow.goose` requirement.\n\nDelivery: the main POC fixtures and disabled-test workflow are usable, with narrower and honest cleanup guarantees. Repetition, tags, nested describe blocks, parameterized cases, and arbitrary hook graphs are intentionally deferred."
+    dependencies[1]: E3.S3
+    stories[4]:
+      - id: E4.S1
+        title: "Run fresh fixtures with separate setup, test, and cleanup boundaries"
+        details[7]: Instantiate one default-initialized Fixture per selected case when its signature requests it. A file may mix fixture-free and fixture-using test functions; do not infer a function signature solely from the presence of a Fixture declaration.,"Support before_each(f: Fixture&) and after_each(f: Fixture&) from the POC, plus forms accepting goosetest::Test& first when a hook needs framework assertions. Reject ambiguous duplicate hook forms.","Execute setup, body, and cleanup through separate recoverable boundaries, each labeled with its phase. Cleanup receives the same fixture even after a framework setup or body failure.","If setup records any failure, skip the body but attempt cleanup once. Require the default fixture to be safe to clean up after partial initialization and document this contract.",A cleanup failure is appended alongside an existing failure; it never replaces the original cause. Report one failed case with multiple phase diagnostics.,Do not use a defer feature absent from the pinned compiler or claim cleanup after process termination or a fatal runtime abort.,"For mixed signatures, fixture construction and fixture-specific before_each/after_each hooks apply only to tests requesting Fixture&; a Test-only function runs without them, as shown in the lifecycle reference."
+        acceptanceCriteria[5]: Fixtures start with default state for every case and cannot leak mutations to the next case.,Setup failure prevents body execution but still reaches cleanup exactly once.,Body failure plus cleanup failure retains both diagnostics and counts one failed case.,A fixture-free function in the same file receives only its declared argument and compiles.,A fixture-free test beside fixture-using tests causes no fixture-construction or fixture-hook side effects.
+        unitTests[2]: "Record phase sentinels for pass, setup failure, body failure, cleanup failure, and combined failure.",Test a default/partially initialized fixture cleanup and a mixed-signature suite.
+        filesLikelyTouched[7]: src/generation/suites.goose,src/runtime/execution.goose,src/runtime/results.goose,integration/lifecycle_test.goose,test/runtime/execution_test.goose,test/runtime/results_test.goose,test/generation/suites_test.goose
+        dependencies[1]: E3.S3
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-lifecycle).\n\n**Existing source references:**\n\n- [Auth test authoring example — line 12, `struct Fixture`](/Users/bob/repos/goosetest/poc/example_project/test/auth/token_test.goose)\n- [POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Runtime recovery boundary — line 56, `fn run_case`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n\n**Retain or change:** Keep familiar hook names but use separate recovery boundaries and retain the original failure if cleanup also fails."
+      - id: E4.S2
+        title: Define suite-level setup and cleanup outcomes
+        details[5]: "Support before_all()/after_all() and optional goosetest::Test& forms for recoverable hook assertions. Do not introduce shared fixture objects or dependency injection.",Run suite hooks only for a suite with at least one selected executable case. An entirely disabled or entirely filtered suite has no lifecycle side effects.,"A failed before_all prevents that suite’s test bodies, records a suite-level failure, and marks otherwise executable selected cases as skipped because setup failed. Attempt after_all exactly once.",A failed after_all makes the run fail even if every case passed. Keep suite-hook failures separate from case totals and report their phase clearly.,"Define state lifetime and reset points so a previous suite failure cannot contaminate the next suite, and a successful later suite cannot erase the earlier error."
+        acceptanceCriteria[4]: Suite setup and cleanup run once around multiple selected cases in the expected order.,Before-all failure skips only that suite’s executable cases; another suite still executes.,After-all failure returns status 1 and is visible without fabricating an ordinary test case.,A suite with no executable selected cases runs neither suite hook.
+        unitTests[2]: Check phase order across two suites and the outcome of failing setup or cleanup.,Test empty executable selections and all-disabled suites after E4.S3 is integrated.
+        filesLikelyTouched[7]: src/generation/suites.goose,src/runtime/execution.goose,src/runtime/results.goose,integration/lifecycle_test.goose,test/runtime/execution_test.goose,test/runtime/results_test.goose,test/generation/suites_test.goose
+        dependencies[1]: E4.S1
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-lifecycle).\n\n**Existing source references:**\n\n- [POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Style guide: error propagation — line 674, `### 6.6`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Make the table’s suite-hook and no-executable-case behavior observable."
+      - id: E4.S3
+        title: Preserve disabled cases and display names safely
+        details[5]: "Implement the already scanned // @DisplayName(\"...\") and // @Disabled(\"reason\") metadata. Require a nonempty disabled reason and correctly decode supported string escapes.","Generate an unreachable, typechecked execution wrapper for every disabled test. Keep the run_case ancestor required by long-distance assertions even when the test will never execute.","Keep fixture construction and relevant hook references well typed within the unreachable path, without evaluating any of them at runtime.","Report disabled cases as skipped with their stable identity, optional display label, and reason. Display labels do not replace identity or make duplicate labels illegal.","Reject @Tag, @RepeatedTest, and other unsupported framework annotations with a direct explanation rather than accepting comments that have no effect."
+        acceptanceCriteria[4]: A disabled test with a framework assertion compiles and never changes a runtime sentinel.,"A type error inside a disabled test fails compilation, preserving the POC’s no-bit-rot behavior.","Quoted labels and reasons survive parsing, generation, and output without source injection or corruption.",A valid all-disabled selection exits 0 and reports the actual skip count.
+        unitTests[2]: "Compile disabled pass/fail assertions, deliberately type-invalid disabled bodies, and fixture signatures.",Verify that disabled suite-only selection runs neither construction side effects nor hooks.
+        filesLikelyTouched[7]: src/discovery/annotations.goose,src/generation/suites.goose,src/runtime/results.goose,integration/selection_test.goose,test/runtime/results_test.goose,test/discovery/annotations_test.goose,test/generation/suites_test.goose
+        dependencies[1]: E4.S2
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-unit-api).\n\n**Existing source references:**\n\n- [Disabled call-graph preservation — line 224, `Keep disabled test in`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Auth test authoring example — line 12, `struct Fixture`](/Users/bob/repos/goosetest/poc/example_project/test/auth/token_test.goose)\n\n**Retain or change:** Preserve disabled-case compilation and the explicit reason without executing the fixture."
+      - id: E4.S4
+        title: Select stable case IDs and stop early without skipping cleanup
+        details[5]: Add --filter TEXT as a literal substring match against stable case IDs and --suite unit|integration|all. Reuse the same selector for list and test; keep the default as all.,Audit and compile all discovered tests. A filter controls execution only; unselected tests stay in valid unreachable call paths so their assertions still typecheck.,"Add --fail-fast as an execution policy. After the current case fails, finish its cleanup and suite cleanup before stopping further case execution.","Keep excluded, disabled, setup-blocked, and fail-fast-not-run cases distinguishable. Do not inflate the skipped count with every case excluded by a filter.",Return status 2 for an explicit filter with zero matches and for a project with zero cases. Preserve status 1 when fail-fast stops after an ordinary failure.
+        acceptanceCriteria[4]: "The same filter selects identical IDs in list and test, independent of display-name changes.",An unselected malformed test still fails compilation and cannot silently rot.,Fail-fast runs current-case and suite cleanup exactly once and executes no subsequent body.,Selection output makes zero matches distinguishable from a nonempty disabled selection.
+        unitTests[2]: "Test unit/integration selection, literal special characters in filters, and zero-match status.",Verify call-graph validity for filtered assertions and cleanup order under fail-fast.
+        filesLikelyTouched[9]: src/arguments.goose,src/discovery/selection.goose,src/generation/runner.goose,src/generation/suites.goose,integration/selection_test.goose,test/arguments_test.goose,test/generation/runner_test.goose,test/generation/suites_test.goose,test/discovery/selection_test.goose
+        dependencies[1]: E4.S3
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-list-output).\n\n**Existing source references:**\n\n- [POC literal filter behavior — line 102, `fn matches_filter`](/Users/bob/repos/goosetest/poc/goosetest_poc.goose)\n- [Disabled call-graph preservation — line 224, `Keep disabled test in`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n\n**Retain or change:** Apply selection to stable IDs and keep filtered tests valid in the whole-program call graph."
+    shortTitle: Fixtures & lifecycle
+  - id: E5
+    title: Actionable assertions and readable failure reports
+    summary: Deliver useful expected/actual diagnostics and terminal output from structured results. This work can proceed against E1’s explicit harness while discovery and execution are built.
+    description: "<a id=\"reference-assertion-api\"></a>\n\n### Target assertion API at the call site\n\nThese are call-site signatures, not a second implementation. `message` is optional except for `fail`; the default is an empty user label while generated expected/actual details remain present.\n\n| Call | Behavior |\n| --- | --- |\n| `t.assert_true(condition, message)` | Require true; stop this phase on failure. |\n| `t.assert_false(condition, message)` | Require false; stop this phase on failure. |\n| `t.assert_eq(expected, actual, message)` | Compare scalar/string/slice values; expected comes first. |\n| `t.assert_ne(unexpected, actual, message)` | Require a different actual value. |\n| `t.check_eq(expected, actual, message)` | Record a failed comparison and continue. |\n| `t.assert_struct_eq(expected, actual, message)` | Show all mismatching top-level fields, then stop this phase. |\n| `t.assert_contains(expected_fragment, actual_text, message)` | Require the fragment to occur in the actual text. |\n| `t.assert_near(expected, actual, absolute_tolerance, message)` | Compare with the documented finite tolerance/NaN policy. |\n| `t.fail(message)` | Record an explicit failure and stop this phase. |\n\nThe global functions supporting `t.assert_*` are deliberately narrow bridges over namespaced implementations on the pinned compiler. Test authors do not need to understand that implementation detail. The API consistently uses the JUnit POC’s expected-first convention; the alternate inline POC uses actual-first in places and must not be copied unchanged.\n\nImplementation references: [Expected-first assertion implementation — line 161, `fn assert_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose); [Soft assertion implementation — line 194, `fn check_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose); [Top-level struct-field diff — line 209, `fn assert_struct_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose); [POC numeric comparison — line 214, `fn expect_near`](/Users/bob/repos/goosetest/poc/goosetest_poc.goose); [POC string containment — line 225, `fn expect_contains`](/Users/bob/repos/goosetest/poc/goosetest_poc.goose).\n\n<a id=\"reference-permission-test\"></a>\n\n### Target struct assertion: test/workspaces/permissions_test.goose\n\n```goose\n// Verifies permission decisions and shows field-level failure diagnostics.\nnamespace workspaces_permissions_test;\n\nimport goosetest;\n\nimport src.workspaces.permissions;\n\n// @DisplayName(\"grants write access to admin token\")\nfn test_admin_can_write(t: goosetest::Test&) {\n    let actual = workspaces_permissions::check_write_access(\"Bearer tok_admin\");\n    t.assert_true(actual.allowed);\n    t.assert_eq(\"admin\", actual.effective_role);\n}\n\n// @DisplayName(\"denies write access to viewer role\")\nfn test_viewer_cannot_write(t: goosetest::Test&) {\n    let actual = workspaces_permissions::check_write_access(\"Bearer tok_viewer\");\n    let expected = workspaces_permissions::AccessDecision {\n        allowed: false,\n        effective_role: \"viewer\",\n        reason: \"insufficient_role\",\n    };\n    t.assert_struct_eq(expected, actual, \"viewer write check\");\n}\n```\n\nThe shipped example above passes. To validate the failure renderer, a disposable negative fixture changes the viewer expectation to `allowed: true` and `reason: \"ok\"`, matching the intentional mismatch in the POC.\n\n<a id=\"reference-console\"></a>\n\n### Target console output: the same negative fixture\n\n```text\n$ goosetest test --project ./my_app\nauth_token_test\n  PASS  parses valid admin Bearer token into claims\n  PASS  rejects malformed Authorization header\n  SKIP  test_expired_token_clock_skew\n        pending clock skew tolerance in token verification\n\nworkspaces_permissions_test\n  PASS  grants write access to admin token\n  FAIL  denies write access to viewer role\n\naccess_flow_test\n  PASS  test_viewer_token_cannot_write\n\nFAIL test/workspaces/permissions_test.goose::workspaces_permissions_test::test_viewer_cannot_write\n  Test declaration: test/workspaces/permissions_test.goose:16\n  Phase: test\n  viewer write check\n    .allowed  expected: <true>  actual: <false>\n    .reason   expected: <ok>    actual: <insufficient_role>\n\nTests: 4 passed, 1 failed, 1 skipped\nSuite hook failures: 0\nExit status: 1\n```\n\nThe three suite groups are a reference layout; the final implementation uses the deterministic order defined by discovery. The six case outcomes and status are contractual. `Exit status: 1` shows the actual process result, not merely a printed number. Without the intentional negative mutation, the same project reports 5 passed, 0 failed, 1 skipped and returns 0.\n\nThe line shown is explicitly the test declaration location. Do not label it as the exact failing assertion line without compiler support. ASCII PASS/FAIL/SKIP is the portable baseline; terminal colors and box-drawing are unnecessary.\n\nOutput reference: [POC console summary — line 235, `fn summary`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose). Original intentional field mismatch: [Permissions test and struct-diff example — line 30, `fn test_viewer_write_denied_demo_diff`](/Users/bob/repos/goosetest/poc/example_project/test/workspaces/permissions_test.goose).\n\nDelivery: better diagnostics in an already runnable package. E5 has no dependency on scanner internals. E4 phase fields extend the common result model without requiring a different assertion API."
+    dependencies[1]: E1.S4
+    stories[3]:
+      - id: E5.S1
+        title: "Complete the small scalar, string, and collection assertion surface"
+        details[6]: "Build on the fundamental assertions with assert_contains and assert_near, maintaining expected-first ordering wherever two comparable values are involved.","Define float behavior explicitly: require a nonnegative finite tolerance, fail comparisons involving NaN, and handle equal infinities deliberately. Avoid the POC diff > eps form that can accidentally pass NaN.",Use the language’s equality for comparable slices/arrays and format their values with existing Goose hooks. Do not add generic custom comparator registries.,Attach an optional user message to failures without losing generated expected/actual information. Keep comparison and recording separate from output rendering.,"Bound framework-controlled scalar and collection rendering and all retained diagnostic bytes. Treat custom format hooks as user code: they may do arbitrary work, so do not promise a memory bound inside the hook. Cap what is retained when it returns, and document that stage timeouts cover a nonterminating hook just as they cover a nonterminating test.","Use assert_contains(expected_fragment, actual_text, message = \"\") and assert_near(expected, actual, absolute_tolerance, message = \"\") as shown in the target API; do not copy actual-first ordering from the inline prototype."
+        acceptanceCriteria[4]: "Common scalar, string, and collection failures show the expected and actual values with the correct labels.","Near comparisons cover zero tolerance, negative tolerance, NaN, equal/unequal infinities, and ordinary finite differences according to the documented contract.",A passing assertion does not format diagnostic values.,Oversized diagnostic values produce a visible limit outcome and cannot turn a failed assertion into a pass.
+        unitTests[2]: Test comparison boundaries and float special values directly against structured failures.,Use a custom format hook with a counter to verify formatting only on failure.
+        filesLikelyTouched[6]: src/runtime/assertions.goose,src/runtime/assertions_values.goose,src/runtime/diagnostics.goose,test/runtime/assertions_test.goose,test/runtime/diagnostics_test.goose,test/runtime/assertions_values_test.goose
+        dependencies[1]: E1.S4
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-assertion-api).\n\n**Existing source references:**\n\n- [Expected-first assertion implementation — line 161, `fn assert_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [POC numeric comparison — line 214, `fn expect_near`](/Users/bob/repos/goosetest/poc/goosetest_poc.goose)\n- [POC string containment — line 225, `fn expect_contains`](/Users/bob/repos/goosetest/poc/goosetest_poc.goose)\n- [Style guide: const-generic parameters — line 576, `### 5.6`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Use the listed signature order consistently; correct the inline prototype’s NaN and argument-order pitfalls."
+      - id: E5.S2
+        title: Report mismatching struct fields through compile-time reflection
+        details[5]: Implement assert_struct_eq using fields<T> and ordinary field equality. Report every differing top-level field in declaration order with expected and actual values.,"Describe the feature accurately as top-level field diffing. Do not promise recursive deep comparison, cyclic graph handling, or comparison of arbitrary uncomparable types.","For a nested comparable field, include its formatted value using the existing format hook; defer recursive path expansion.",Count the operation as one assertion and the containing case as one failure regardless of the number of differing fields.,Avoid repeated temporary strings and unnecessary copies. Use one bounded diagnostic builder and stop predictably if its capacity would be exceeded.
+        acceptanceCriteria[4]: The POC permissions mismatch reports both .allowed and .reason in deterministic order.,Equal structs pass; a single mismatch and multiple mismatches produce the correct field list.,Read-only expected values and mutable actual values are accepted according to the verified compiler contract.,Unsupported field comparisons receive an honest compiler diagnostic; the framework does not invent unsafe bytewise equality.
+        unitTests[2]: "Exercise fixed-size structs, slice fields, nested comparable structs, and a custom format hook.",Check that failure counts do not increase once per mismatching field.
+        filesLikelyTouched[5]: src/runtime/assertions_struct.goose,src/runtime/diagnostics.goose,examples/basic/test/calculator_test.goose,test/runtime/diagnostics_test.goose,test/runtime/assertions_struct_test.goose
+        dependencies[1]: E5.S1
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-permission-test).\n\n**Existing source references:**\n\n- [Top-level struct-field diff — line 209, `fn assert_struct_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [Permissions test and struct-diff example — line 30, `fn test_viewer_write_denied_demo_diff`](/Users/bob/repos/goosetest/poc/example_project/test/workspaces/permissions_test.goose)\n- [Style guide: compile-time reflection — line 837, `### 7.7`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Reproduce the two-field failure without promising recursive deep comparison."
+      - id: E5.S3
+        title: Render structured results with honest totals and locations
+        details[5]: "Add a console renderer with deterministic suite/case ordering, pass/fail/skip labels, a final totals summary, and a separate section for failures and suite-hook errors.","Show original test path and declaration line, stable ID, display name where present, phase, user message, and expected/actual details. Do not imply that a declaration line is the exact failing assertion line.",Keep terminal control characters in user-provided labels and messages escaped so output stays legible. Use a portable plain-text baseline; no terminal UI dependency or required color support.,Render one case outcome after its cleanup completes. Keep compiler output distinct from framework summaries and ensure runner errors say when execution was incomplete.,"Do not add timing dashboards, telemetry, result databases, JSON output, TAP, JUnit XML, or reporter plugins. Structured internal records are sufficient to support a later exporter."
+        acceptanceCriteria[5]: "A mixed suite reports reconciled passed, failed, skipped, and not-run counts without double-counting setup/cleanup errors.","The same result records render identically, independent of how they were collected.",Failure output points at the original test source and names setup/test/cleanup where relevant.,The renderer works with the E1 harness before CLI integration and with lifecycle results after E4.,"The six-case reference fixture reports 5 passed/1 skipped/status 0 normally, and 4 passed/1 failed/1 skipped/status 1 after the documented viewer-expectation mutation."
+        unitTests[2]: Check deterministic output for representative structured records and escaped control characters.,Run a mixed lifecycle suite and compare the final displayed counts to the actual records.
+        filesLikelyTouched[5]: src/reporting/console.goose,src/reporting/formatting.goose,integration/reporting_test.goose,test/reporting/console_test.goose,test/reporting/formatting_test.goose
+        dependencies[1]: E5.S2
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-console).\n\n**Existing source references:**\n\n- [POC console summary — line 235, `fn summary`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [Permissions test and struct-diff example — line 30, `fn test_viewer_write_denied_demo_diff`](/Users/bob/repos/goosetest/poc/example_project/test/workspaces/permissions_test.goose)\n\n**Retain or change:** Match the information and actual exit status in the embedded positive/negative output scenarios."
+    shortTitle: Assertions & reports
+  - id: E6
+    title: "Self-host, validate a real consumer, and document the release"
+    summary: "Deliver a framework that tests itself, demonstrates adoption using pretty-goose behavior, and has reproducible developer commands and documented limits."
+    description: "<a id=\"reference-source-map\"></a>\n\n### Reference map: retain, change, and defer\n\nThese references identify the concrete source material for implementation review. Function/section names are the durable navigation keys; line numbers describe the files inspected when this plan was revised. Links open the original files, and the target snippets remain embedded above so the plan can be read on its own.\n\n| Reference | Retain | Change or defer | Stories |\n| --- | --- | --- | --- |\n| [Auth test authoring example — line 12, `struct Fixture`](/Users/bob/repos/goosetest/poc/example_project/test/auth/token_test.goose) | Test functions, fresh fixture, lifecycle names, readable labels. | Apply namespace/import/style rules and the explicit failure contract; defer tags/repetitions. | E1.S4, E4.S1–S4 |\n| [Permissions test and struct-diff example — line 30, `fn test_viewer_write_denied_demo_diff`](/Users/bob/repos/goosetest/poc/example_project/test/workspaces/permissions_test.goose) | Expected-first struct comparison and named mismatching fields. | Default example passes; intentional failure belongs in a negative fixture. | E5.S2–S3 |\n| [Runtime recovery boundary — line 56, `fn run_case`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)<br>[Expected-first assertion implementation — line 161, `fn assert_eq`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose) | Static recovery boundary; hard versus soft assertions. | Namespaced context, narrow global bridges, bounded structured results, real process status. | E1.S1–S3 |\n| [POC directory walker — line 33, `fn walk_goose_files`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)<br>[POC discovery and lifecycle emission — line 126, `fn scan_and_emit_suite`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose) | Automatic discovery and static generated calls. | Replace line-prefix parsing and silent caps with lexical scanning, diagnostics, and complete manifests. | E2.S1–S4, E3.S1 |\n| [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose) | Project-relative unit correspondence and generated orchestration. | Separate integration area, stable authored root, owned generated files, actual compile/run stage. | E2.S3, E3.S1–S4 |\n| [Disabled call-graph preservation — line 224, `Keep disabled test in`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose) | Keep disabled tests under a valid assertion boundary for compilation. | Apply to filtered cases too; never execute their fixtures or hooks. | E4.S3–S4 |\n| [POC console summary — line 235, `fn summary`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose) | Grouped test outcomes, failure details, totals. | Separate rendering from runtime state; reconcile statuses and mark incomplete runs. | E5.S3, E6.S2 |\n| [Normative Goose style guide](/Users/bob/repos/pretty-goose/docs/styleguide.md) | Normative modularity, imports, naming, data layout, bounded execution, formatting. | Do not inherit style violations or unsupported compiler assumptions from the POC. | All epics |\n| [Pinned compiler package/import contract — line 92, `**Only the root file declares packages.**`](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/docs/packages.md)<br>[Pinned standard-library OS surface](/Users/bob/.local/share/goose/v2026.3/goose-v2026.3-macos-arm64/stdlib/os.goose) | Pinned import/sidecar semantics and verified standard-library operations. | Implement the missing CLI subprocess boundary rather than assume an API exists. | E1.S1, E3.S1–S2 |\n| [Existing pretty-goose behavioral tests — line 89, `fn test_statement_blocks`](/Users/bob/repos/pretty-goose/src/tests.goose)<br>[Existing pretty-goose tokenizer — line 15, `struct Token`](/Users/bob/repos/pretty-goose/src/lexer.goose) | Real grammar-sensitive formatter/lexer behavior and existing expected results. | Adapt in a disposable consumer fixture; do not mutate pretty-goose. | E2.S2, E6.S3 |\n| [Inline describe/property/benchmark prototype](/Users/bob/repos/goosetest/poc/goosetest_poc.goose) | Useful comparison for assertion helpers and filters. | Nested DSL, properties, and benchmarks are outside this plan. | E5.S1 reference only |\n| [Deferred contained-worker alternative — line 46, `fn expect_abort`](/Users/bob/repos/goosetest/poc/goosetest_contained_poc.goose) | Evidence that contained abort handling is possible on a native build. | Expected-abort API and generalized crash isolation remain outside this release. | No implementation story in this release |\n\n**Implementation review:** compare the new public examples with the embedded references, compile them against the real package, exercise the documented positive and negative outcomes, and keep the example strings aligned with the actual API. This is behavioral verification, not a screenshot-only approval step.\n\nDelivery: a defensible first release on the explicitly supported platform. Adoption is demonstrated in an isolated fixture; editing another repository is not an implicit part of this implementation plan."
+    dependencies[3]: E3.S4,E4.S4,E5.S3
+    stories[4]:
+      - id: E6.S1
+        title: Move framework tests onto its own discovery and runner
+        details[5]: Create a matching test/<path>/<name>_test.goose for every production .goose file under src/. Group each module’s edge cases and failure paths in its mirror.,Put cross-module and executable behavior under integration/. Keep supporting source/text fixtures under integration/fixtures/ or test_support/ and distinguish them from discovered test declarations.,Compile and run the framework’s goosetest_root.goose through the built CLI. Keep a small independent bootstrap verifier so the runtime cannot certify its own broken exit behavior.,Replace temporary manual registration used during development with generated discovery; retain a minimal explicit-harness example only where it tests the public runtime independently.,"Resolve the fixture-directory convention with E2: files containing intentionally invalid Goose should be stored as data with a non-.goose fixture suffix and materialized in temporary project directories."
+        acceptanceCriteria[4]: The framework passes its own strict mirror audit and discovers all intended unit and integration suites.,All production modules have corresponding tests with actual valid test declarations.,"A deliberate assertion failure in a self-test causes a nonzero process result, verified outside goosetest.",Negative fixture data never appears as an accidentally discovered or linted test source.
+        unitTests[2]: Run the complete self-hosted suite and compare listed IDs with the expected module/test inventory.,Temporarily inject a failing fixture in a disposable copy and verify external exit status.
+        filesLikelyTouched[4]: goosetest_root.goose,scripts/verify.goose,integration/self_host_test.goose,test/
+        dependencies[3]: E3.S4,E4.S4,E5.S3
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-project-layout).\n\n**Existing source references:**\n\n- [POC mirror audit and generation — line 266, `fn generate_junit_runner`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Auth test authoring example — line 12, `struct Fixture`](/Users/bob/repos/goosetest/poc/example_project/test/auth/token_test.goose)\n- [Style guide: file/declaration structure — line 58, `### 2.1`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Use the same mirrored layout and authoring experience for the framework itself."
+      - id: E6.S2
+        title: Lock down the regressions that could create false success
+        details[5]: "Build a focused external regression matrix for failed assertions, compile errors, runtime aborts, empty selection, malformed metadata, missing mirrors, discovery limits, failed output writes, stale binaries, and stage timeouts.","Include large-but-bounded discovery and generation fixtures that cross the POC’s 64-case/128-file thresholds. Verify completeness by exact case IDs and counts, not elapsed-time measurements.","Exercise disabled and filtered tests that contain non-local assertion returns, plus setup/body/cleanup combinations.",Keep process and filesystem fixtures isolated under owned temporary directories and always clean up resources they created. Do not rely on success of the system under test to validate the oracle.,Run the supported debug build path. Add release-mode compiler checks only where a concrete semantic concern requires them; do not create a compiler/platform matrix without a support commitment.
+        acceptanceCriteria[4]: Every incomplete or failed-run fixture produces its specified nonzero status and an actionable diagnostic.,No test disappears silently when a POC-era capacity is exceeded within the new limits.,Disabled/filtered type errors are detected and no stale executable runs after a failed compile.,Timeout/cancellation fixtures leave no framework-owned processes or locks behind.
+        unitTests[2]: Execute the process-level regression matrix through the independent verifier.,Check exact discovered/generated case identities on bounded large fixtures.
+        filesLikelyTouched[4]: scripts/verify.goose,integration/failure_contract_test.goose,integration/limits_test.goose,integration/fixtures/README.md
+        dependencies[1]: E6.S1
+        risk: high
+        description: "**Design target:** [Concrete example in this plan](#reference-console).\n\n**Existing source references:**\n\n- [POC directory walker — line 33, `fn walk_goose_files`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [Disabled call-graph preservation — line 224, `Keep disabled test in`](/Users/bob/repos/goosetest/poc/junit_runner_poc.goose)\n- [POC console summary — line 235, `fn summary`](/Users/bob/repos/goosetest/poc/example_project/goosetest.goose)\n- [Deferred contained-worker alternative — line 46, `fn expect_abort`](/Users/bob/repos/goosetest/poc/goosetest_contained_poc.goose)\n\n**Retain or change:** Turn prototype failure modes into external exit/completeness assertions; contained workers are reference evidence only."
+      - id: E6.S3
+        title: Demonstrate adoption with pretty-goose without changing that repository
+        details[5]: Create a disposable consumer fixture based on representative pure formatter/lexer behavior in /Users/bob/repos/pretty-goose. Preserve its production implementation and expected behavior while converting the selected tests to goosetest conventions.,"Include a lexer unit mirror, a formatter unit mirror, and one integration test spanning tokenization and formatting. Include realistic strings, nested comments, and custom diagnostic messages.",Resolve source and package paths explicitly in the fixture; do not make the distributed framework depend on /Users/bob/repos/pretty-goose.,"Identify adoption changes needed for the real repository, whose current tests live in src/tests.goose and whose CLI entry is under src/. Document the mapping to src/test mirrors and an appropriate root entry.","Do not edit pretty-goose, migrate its entire test suite, or publish a change to that repository as part of this plan. The artifact is a reproducible consumer example and a concrete migration recipe."
+        acceptanceCriteria[4]: Representative existing behavior passes through the public package and generated runner in the disposable consumer.,An intentionally changed formatter expectation produces a useful value/field diagnostic and status 1.,The fixture demonstrates unit mirrors and a separate integration suite together.,The original pretty-goose working tree and test commands remain untouched.
+        unitTests[2]: Run representative known formatter/lexer cases before and after their conversion in the isolated fixture.,Verify a deliberate negative expectation and package resolution outside the goosetest source tree.
+        filesLikelyTouched[3]: integration/consumer_test.goose,integration/fixtures/pretty_goose/README.md,docs/adopting_pretty_goose.md
+        dependencies[1]: E6.S2
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#reference-integration-api).\n\n**Existing source references:**\n\n- [Existing pretty-goose behavioral tests — line 89, `fn test_statement_blocks`](/Users/bob/repos/pretty-goose/src/tests.goose)\n- [Existing pretty-goose tokenizer — line 15, `struct Token`](/Users/bob/repos/pretty-goose/src/lexer.goose)\n- [Normative Goose style guide](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n\n**Retain or change:** Validate real consumer behavior in the separate integration area without migrating the original repository."
+      - id: E6.S4
+        title: "Finish developer commands, examples, and first-release documentation"
+        details[6]: "Provide Taskfile targets for building, testing, and checking style, with repository automation implemented in scripts/*.goose and long-form CLI options. Keep tasks thin; do not add a release service or deployment system.","Document package installation by explicit local source or pinned repository reference, one-time goosetest_root.goose wiring, the optional test-root native sidecar, directory layout, assertions, fixtures, selection, status codes, and finite default limits/deadlines.","Document unsupported features: tags, repetitions, parameterized cases, nested describe DSL, contained-worker APIs, per-case crash isolation, parallel runs, property testing, snapshots, watch mode, exporters, and unverified operating systems.",Apply the style guide to all shipping examples and generated code. Retain poc/ as historical reference with an explicit exclusion from shipping-source checks; explain its known violations instead of presenting it as conforming framework code.,Update POC documentation references from obsolete docs/ locations where needed and label historical performance/cleanup claims as prototype claims. Do not rewrite the POC into a second supported implementation.,"Run the required checks once the final changes are complete, then record the supported baseline and reproducible commands."
+        acceptanceCriteria[6]: "A clean checkout with documented prerequisites can build the CLI, run the passing example, run self-tests, and check style using the documented commands.",The first example has no intentional failures by default and needs no manual list of tests.,Every shipped .goose file and representative generated project passes goosefmt check; intentional invalid fixture data and historical POCs are clearly scoped out.,"Documentation distinguishes ordinary assertion failures, runner errors, disabled cases, and fatal runtime failures.","No benchmarks, telemetry/metrics, feature-flag system, shadow/A-B rollout, or smoke-check workflow is introduced.","The embedded unit, integration, and test-root examples are compiled and style checked as maintained documentation examples; source references and public signatures match the implementation."
+        unitTests[2]: Execute the documented build/test/check commands and the basic consumer walkthrough.,Read the generated public API and CLI documentation against implemented behavior; do not add tests that merely restate documentation.
+        filesLikelyTouched[6]: README.md,Taskfile.yml,scripts/check.goose,docs/architecture.md,docs/compatibility.md,poc/goosetest_framework_research.md
+        dependencies[1]: E6.S3
+        risk: medium
+        description: "**Design target:** [Concrete example in this plan](#framework-design-reference).\n\n**Existing source references:**\n\n- [Normative Goose style guide](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n- [Style guide: Goose repository tooling — line 155, `### 2.7`](/Users/bob/repos/pretty-goose/docs/styleguide.md)\n- [POC design research — line 61, `## Part 2:`](/Users/bob/repos/goosetest/poc/goosetest_framework_research.md)\n\n**Retain or change:** Promote the embedded reference examples to maintained user documentation, and keep their commands and results truthful."
+    shortTitle: Release & adoption
+recommendedOrder[23]{ref,reason}:
+  E1.S1,First fix the compiler and style baseline; this avoids later public-API and generation rework.
+  E1.S2,Prove the central hard/soft assertion semantics immediately.
+  E1.S3,Stabilize bounded ownership and result records before adding consumers.
+  E1.S4,Finish the first usable vertical slice and independently verify shell status.
+  E2.S1,Start discovery as an independent track; it can begin after E1.S1 if work is delegated.
+  E2.S2,Build declaration scanning independently of runtime and process code.
+  E2.S3,Join paths and declarations into the agreed strict-unit/separate-integration contract.
+  E2.S4,Ship useful list/audit commands before compilation integration.
+  E3.S2,Prove the necessary native process/deadline boundary early; this can run in parallel with E2 after E1.S1.
+  E3.S1,Connect the usable runtime and manifest using the stable root/package model.
+  E3.S3,Deliver one-command test execution and real status propagation.
+  E3.S4,Make repeated and interrupted runs safe before broad self-hosting.
+  E5.S1,Improve diagnostics on the stable runtime; this track can start after E1.S4 without waiting for E3.
+  E5.S2,Add the high-value POC field diffs without general deep-comparison machinery.
+  E5.S3,"Finish a reporter against stable results, ready for lifecycle phases."
+  E4.S1,Add per-case fixtures and separate failure boundaries after the basic runner works.
+  E4.S2,Extend proven per-case semantics to suite hooks.
+  E4.S3,Protect disabled tests against runtime side effects and compile-time bit rot.
+  E4.S4,Add focused execution and fail-fast only after cleanup/disabled behavior is settled.
+  E6.S1,Join the completed features by running the framework through its own runner.
+  E6.S2,Use an independent oracle to catch false-success regressions.
+  E6.S3,Validate real-consumer ergonomics in an isolated pretty-goose fixture.
+  E6.S4,Finalize instructions and run required release checks against the finished implementation.
+exitCriteria[9]: A documented consumer project with mirrored units and independent integration tests builds and runs with one goosetest test invocation.,"Passing, assertion-failing, disabled, empty, compile-error, runtime-abort, timeout, and limit-breach outcomes have independently verified process statuses.",Discovery and generation are deterministic and complete within their bounds; no test or failure is silently dropped.,"Fixture and suite cleanup semantics are tested for setup/body/cleanup failure combinations, including preservation of original failures.",Disabled and filtered functions retain valid non-local-return ancestry and remain compiler checked.,The framework runs its own mirrored unit/integration suite and is checked by a small independent process-level oracle.,A disposable pretty-goose consumer demonstrates real adoption without modifying the original repository.,"Shipping source, example source, and representative generated output pass the specified style checks; historical POCs and invalid fixture data are explicitly identified.",All required commands and platform/compiler limitations are documented; excluded features and operational fluff have not entered the implementation.
+changedFiles[1]:
+  - label: Proposed implementation files and mirrored tests
+    root:
+      name: goosetest
+      type: folder
+      children[16]:
+        - name: .gitignore
+          type: file
+          status: new
+          stories[1]: E3.S4
+        - name: .goosefmt.toml
+          type: file
+          status: new
+          stories[1]: E1.S1
+        - name: README.md
+          type: file
+          status: new
+          stories[1]: E6.S4
+        - name: Taskfile.yml
+          type: file
+          status: new
+          stories[1]: E6.S4
+        - name: docs
+          type: folder
+          children[3]:
+            - name: adopting_pretty_goose.md
+              type: file
+              status: new
+              stories[1]: E6.S3
+            - name: architecture.md
+              type: file
+              status: new
+              stories[1]: E6.S4
+            - name: compatibility.md
+              type: file
+              status: new
+              stories[2]: E1.S1,E6.S4
+        - name: examples
+          type: folder
+          children[1]:
+            - name: basic
+              type: folder
+              children[3]:
+                - name: goosetest_root.goose
+                  type: file
+                  status: new
+                  stories[2]: E1.S4,E3.S1
+                - name: src
+                  type: folder
+                  children[1]:
+                    - name: calculator.goose
+                      type: file
+                      status: new
+                      stories[1]: E1.S4
+                - name: test
+                  type: folder
+                  children[1]:
+                    - name: calculator_test.goose
+                      type: file
+                      status: new
+                      stories[2]: E1.S4,E5.S2
+        - name: goosetest.goose
+          type: file
+          status: new
+          stories[1]: E1.S2
+        - name: goosetest_root.goose
+          type: file
+          status: new
+          stories[2]: E3.S1,E6.S1
+        - name: integration
+          type: folder
+          children[15]:
+            - name: artifacts_test.goose
+              type: file
+              status: new
+              stories[1]: E3.S4
+            - name: cli_test.goose
+              type: file
+              status: new
+              stories[1]: E2.S4
+            - name: compatibility_test.goose
+              type: file
+              status: new
+              stories[1]: E1.S1
+            - name: consumer_test.goose
+              type: file
+              status: new
+              stories[1]: E6.S3
+            - name: discovery_test.goose
+              type: file
+              status: new
+              stories[1]: E2.S3
+            - name: execution_test.goose
+              type: file
+              status: new
+              stories[1]: E3.S3
+            - name: failure_contract_test.goose
+              type: file
+              status: new
+              stories[1]: E6.S2
+            - name: fixtures
+              type: folder
+              children[3]:
+                - name: README.md
+                  type: file
+                  status: new
+                  stories[1]: E6.S2
+                - name: compatibility
+                  type: folder
+                  children[1]:
+                    - name: README.md
+                      type: file
+                      status: new
+                      stories[1]: E1.S1
+                - name: pretty_goose
+                  type: folder
+                  children[1]:
+                    - name: README.md
+                      type: file
+                      status: new
+                      stories[1]: E6.S3
+            - name: lifecycle_test.goose
+              type: file
+              status: new
+              stories[2]: E4.S1,E4.S2
+            - name: limits_test.goose
+              type: file
+              status: new
+              stories[1]: E6.S2
+            - name: package_test.goose
+              type: file
+              status: new
+              stories[1]: E1.S4
+            - name: process_test.goose
+              type: file
+              status: new
+              stories[1]: E3.S2
+            - name: reporting_test.goose
+              type: file
+              status: new
+              stories[1]: E5.S3
+            - name: selection_test.goose
+              type: file
+              status: new
+              stories[2]: E4.S3,E4.S4
+            - name: self_host_test.goose
+              type: file
+              status: new
+              stories[1]: E6.S1
+        - name: main.build
+          type: file
+          status: new
+          stories[3]: E2.S1,E3.S2,E3.S4
+        - name: main.goose
+          type: file
+          status: new
+          stories[1]: E2.S4
+        - name: native
+          type: folder
+          children[2]:
+            - name: filesystem.c
+              type: file
+              status: new
+              stories[2]: E2.S1,E3.S4
+            - name: process.c
+              type: file
+              status: new
+              stories[1]: E3.S2
+        - name: poc
+          type: folder
+          children[1]:
+            - name: goosetest_framework_research.md
+              type: file
+              status: modified
+              stories[1]: E6.S4
+        - name: scripts
+          type: folder
+          children[2]:
+            - name: check.goose
+              type: file
+              status: new
+              stories[1]: E6.S4
+            - name: verify.goose
+              type: file
+              status: new
+              stories[2]: E6.S1,E6.S2
+        - name: src
+          type: folder
+          children[8]:
+            - name: arguments.goose
+              type: file
+              status: new
+              stories[3]: E2.S4,E3.S3,E4.S4
+            - name: cli.goose
+              type: file
+              status: new
+              stories[2]: E2.S4,E3.S3
+            - name: discovery
+              type: folder
+              children[8]:
+                - name: annotations.goose
+                  type: file
+                  status: new
+                  stories[2]: E2.S2,E4.S3
+                - name: declarations.goose
+                  type: file
+                  status: new
+                  stories[1]: E2.S2
+                - name: files.goose
+                  type: file
+                  status: new
+                  stories[1]: E2.S1
+                - name: lexer.goose
+                  type: file
+                  status: new
+                  stories[1]: E2.S2
+                - name: mirror.goose
+                  type: file
+                  status: new
+                  stories[1]: E2.S3
+                - name: model.goose
+                  type: file
+                  status: new
+                  stories[3]: E2.S1,E2.S2,E2.S3
+                - name: paths.goose
+                  type: file
+                  status: new
+                  stories[1]: E2.S1
+                - name: selection.goose
+                  type: file
+                  status: new
+                  stories[1]: E4.S4
+            - name: execution
+              type: folder
+              children[1]:
+                - name: command.goose
+                  type: file
+                  status: new
+                  stories[1]: E3.S3
+            - name: generation
+              type: folder
+              children[4]:
+                - name: artifacts.goose
+                  type: file
+                  status: new
+                  stories[1]: E3.S4
+                - name: literals.goose
+                  type: file
+                  status: new
+                  stories[1]: E3.S1
+                - name: runner.goose
+                  type: file
+                  status: new
+                  stories[2]: E3.S1,E4.S4
+                - name: suites.goose
+                  type: file
+                  status: new
+                  stories[5]: E3.S1,E4.S1,E4.S2,E4.S3,E4.S4
+            - name: platform
+              type: folder
+              children[2]:
+                - name: filesystem.goose
+                  type: file
+                  status: new
+                  stories[2]: E2.S1,E3.S4
+                - name: process.goose
+                  type: file
+                  status: new
+                  stories[1]: E3.S2
+            - name: reporting
+              type: folder
+              children[2]:
+                - name: console.goose
+                  type: file
+                  status: new
+                  stories[1]: E5.S3
+                - name: formatting.goose
+                  type: file
+                  status: new
+                  stories[1]: E5.S3
+            - name: runtime
+              type: folder
+              children[7]:
+                - name: assertions.goose
+                  type: file
+                  status: new
+                  stories[2]: E1.S2,E5.S1
+                - name: assertions_struct.goose
+                  type: file
+                  status: new
+                  stories[1]: E5.S2
+                - name: assertions_values.goose
+                  type: file
+                  status: new
+                  stories[1]: E5.S1
+                - name: context.goose
+                  type: file
+                  status: new
+                  stories[2]: E1.S2,E1.S3
+                - name: diagnostics.goose
+                  type: file
+                  status: new
+                  stories[3]: E1.S3,E5.S1,E5.S2
+                - name: execution.goose
+                  type: file
+                  status: new
+                  stories[3]: E1.S2,E4.S1,E4.S2
+                - name: results.goose
+                  type: file
+                  status: new
+                  stories[4]: E1.S3,E4.S1,E4.S2,E4.S3
+        - name: test
+          type: folder
+          children[8]:
+            - name: arguments_test.goose
+              type: file
+              status: new
+              stories[4]: E2.S4,E3.S3,E4.S4,E6.S1
+            - name: cli_test.goose
+              type: file
+              status: new
+              stories[3]: E2.S4,E3.S3,E6.S1
+            - name: discovery
+              type: folder
+              children[8]:
+                - name: annotations_test.goose
+                  type: file
+                  status: new
+                  stories[3]: E2.S2,E4.S3,E6.S1
+                - name: declarations_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E2.S2,E6.S1
+                - name: files_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E2.S1,E6.S1
+                - name: lexer_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E2.S2,E6.S1
+                - name: mirror_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E2.S3,E6.S1
+                - name: model_test.goose
+                  type: file
+                  status: new
+                  stories[4]: E2.S1,E2.S2,E2.S3,E6.S1
+                - name: paths_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E2.S1,E6.S1
+                - name: selection_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E4.S4,E6.S1
+            - name: execution
+              type: folder
+              children[1]:
+                - name: command_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E3.S3,E6.S1
+            - name: generation
+              type: folder
+              children[4]:
+                - name: artifacts_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E3.S4,E6.S1
+                - name: literals_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E3.S1,E6.S1
+                - name: runner_test.goose
+                  type: file
+                  status: new
+                  stories[3]: E3.S1,E4.S4,E6.S1
+                - name: suites_test.goose
+                  type: file
+                  status: new
+                  stories[6]: E3.S1,E4.S1,E4.S2,E4.S3,E4.S4,E6.S1
+            - name: platform
+              type: folder
+              children[2]:
+                - name: filesystem_test.goose
+                  type: file
+                  status: new
+                  stories[3]: E2.S1,E3.S4,E6.S1
+                - name: process_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E3.S2,E6.S1
+            - name: reporting
+              type: folder
+              children[2]:
+                - name: console_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E5.S3,E6.S1
+                - name: formatting_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E5.S3,E6.S1
+            - name: runtime
+              type: folder
+              children[7]:
+                - name: assertions_struct_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E5.S2,E6.S1
+                - name: assertions_test.goose
+                  type: file
+                  status: new
+                  stories[3]: E1.S2,E5.S1,E6.S1
+                - name: assertions_values_test.goose
+                  type: file
+                  status: new
+                  stories[2]: E5.S1,E6.S1
+                - name: context_test.goose
+                  type: file
+                  status: new
+                  stories[3]: E1.S2,E1.S3,E6.S1
+                - name: diagnostics_test.goose
+                  type: file
+                  status: new
+                  stories[4]: E1.S3,E5.S1,E5.S2,E6.S1
+                - name: execution_test.goose
+                  type: file
+                  status: new
+                  stories[4]: E1.S2,E4.S1,E4.S2,E6.S1
+                - name: results_test.goose
+                  type: file
+                  status: new
+                  stories[5]: E1.S3,E4.S1,E4.S2,E4.S3,E6.S1
