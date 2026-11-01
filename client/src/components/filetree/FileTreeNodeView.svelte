@@ -5,6 +5,7 @@
   export let node: FileTreeNode
   export let parentPath = ""
   export let depth = 0
+  export let fileIds: Map<string, string> = new Map()
 
   $: currentPath = computeChildPath(parentPath, node.name, node.path)
   $: isFolder = node.type === "folder"
@@ -26,12 +27,12 @@
     </summary>
     <div class="folder-children">
       {#each node.children ?? [] as child}
-        <svelte:self node={child} parentPath={currentPath} depth={depth + 1} />
+        <svelte:self node={child} parentPath={currentPath} depth={depth + 1} {fileIds} />
       {/each}
     </div>
   </details>
 {:else}
-  <div class="file-row" data-path={currentPath}>
+  <div class="file-row" id={fileIds.get(currentPath)} data-path={currentPath}>
     <code class="file-name" title={currentPath}>{node.name}</code>
     {#if node.status}
       <span class="file-status {node.status}">{node.status}</span>

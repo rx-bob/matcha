@@ -1,11 +1,12 @@
 <script lang="ts">
   import type { FileTree } from "../../../../src/plan.ts"
   import FileTreeNodeView from "./FileTreeNodeView.svelte"
-  import { countFileStats } from "../../lib/fileTreeHelpers"
+  import { buildFileIdMap, countFileStats } from "../../lib/fileTreeHelpers"
 
   export let changedFiles: FileTree[] = []
 
   $: stats = countFileStats(changedFiles)
+  $: fileIds = buildFileIdMap(changedFiles)
 
   function handleExpandAll(): void {
     if (typeof document !== "undefined") {
@@ -41,7 +42,7 @@
 <div class="file-tree" aria-label="Proposed implementation files and mirrored tests">
   {#each changedFiles as tree}
     {#if tree.root}
-      <FileTreeNodeView node={tree.root} parentPath="" depth={0} />
+      <FileTreeNodeView node={tree.root} parentPath="" depth={0} {fileIds} />
     {/if}
   {/each}
 </div>

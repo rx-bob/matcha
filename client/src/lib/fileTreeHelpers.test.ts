@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest"
 import type { FileTree } from "../../../src/plan"
-import { countFileStats, computeChildPath } from "./fileTreeHelpers"
+import { buildFileIdMap, countFileStats, computeChildPath } from "./fileTreeHelpers"
 
 describe("fileTreeHelpers", () => {
   const sampleTrees: FileTree[] = [
@@ -51,5 +51,13 @@ describe("fileTreeHelpers", () => {
     expect(computeChildPath("root/src", "main.ts", "custom/explicit.ts")).toBe(
       "custom/explicit.ts",
     )
+  })
+
+  it("assigns sequential file ids in tree order", () => {
+    const ids = buildFileIdMap(sampleTrees)
+    const values = [...ids.values()]
+    expect(values[0]).toBe("file-0")
+    expect(values).toEqual(values.map((_, index) => `file-${index}`))
+    expect(ids.size).toBe(countFileStats(sampleTrees).total)
   })
 })

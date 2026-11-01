@@ -7,6 +7,8 @@
     type StoryFilterState,
   } from "../../lib/epicsHelpers"
   import { showToast } from "../../lib/toast"
+  import { onMount } from "svelte"
+  import { CLEAR_STORY_FILTERS_EVENT } from "../../lib/router"
 
   export let epics: Epic[] | undefined = []
 
@@ -34,6 +36,15 @@
       showToast("Design references collapsed")
     }
   }
+
+  onMount(() => {
+    const clear = (): void => {
+      searchQuery = ""
+      selectedRisk = "all"
+    }
+    window.addEventListener(CLEAR_STORY_FILTERS_EVENT, clear)
+    return () => window.removeEventListener(CLEAR_STORY_FILTERS_EVENT, clear)
+  })
 
   function handleClearFilters(): void {
     searchQuery = ""

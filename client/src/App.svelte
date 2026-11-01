@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount } from "svelte"
+  import { onMount, tick } from "svelte"
   import type { Plan } from "../../src/plan.ts"
   import SvgSprite from "./components/ui/SvgSprite.svelte"
   import PlanPage from "./components/sections/PlanPage.svelte"
+  import StoryDialog from "./components/dialogs/StoryDialog.svelte"
   import {
     type PlanDesign,
     type EvaTheme,
@@ -11,7 +12,8 @@
     applyPlanDesign,
     applyEvaTheme,
   } from "./lib/theme"
-  import { resolveViewForHash } from "./lib/overviewHelpers"
+  import { createRouter } from "./lib/router"
+  import { initStoryDialog, syncScrollLock } from "./lib/storyDialog"
   import { initClipboardDelegation } from "./lib/clipboard"
 
   export let plan: Plan
@@ -37,6 +39,7 @@
 
   $: projectName = plan.project || plan.id || "matcha"
   $: currentViewTitle = viewTitles[currentView] || "Overview"
+  $: if (typeof document !== "undefined") document.title = `${currentViewTitle} · ${projectName}`
 
   function selectDesign(design: PlanDesign): void {
     currentDesign = design
@@ -53,7 +56,7 @@
     isNavOpen = open && isMobile
     if (typeof document !== "undefined") {
       document.body.classList.toggle("nav-open", isNavOpen)
-      document.body.style.overflow = isNavOpen ? "hidden" : ""
+      syncScrollLock()
       if (sidebarElement) {
         sidebarElement.inert = isMobile && !isNavOpen
       }
@@ -71,18 +74,20 @@
     setNavigation(!isNavOpen)
   }
 
-  function selectView(view: string): void {
-    currentView = view
-    if (isNavOpen) {
-      setNavigation(false, false)
-    }
-    if (typeof window !== "undefined") {
-      if (window.location.hash !== `#${view}`) {
-        window.history.pushState(null, "", `#${view}`)
-      }
-      document.title = `${viewTitles[view] || "Overview"} · ${projectName}`
-    }
-  }
+  const router = createRouter({
+    get plan() {
+      return plan
+    },
+    getView: () => currentView,
+    async setView(view) {
+      currentView = view
+      await tick()
+    },
+    dismissChrome() {
+      if (isNavOpen) setNavigation(false, false)
+      closeExport()
+    },
+  })
 
   function toggleExport(): void {
     isExportOpen = !isExportOpen
@@ -116,6 +121,15 @@
       clone.querySelector("#sidebar")?.removeAttribute("inert")
       const overlay = clone.querySelector(".nav-overlay") as HTMLElement | null
       if (overlay) overlay.hidden = true
+      clone.querySelectorAll("dialog").forEach((node) => {
+        node.removeAttribute("open")
+        node.classList.remove("is-visible")
+      })
+      clone.querySelector("#story-dialog-content")?.replaceChildren()
+      clone.querySelector("#story-dialog")?.removeAttribute("data-story")
+      const feedback = clone.querySelector<HTMLElement>("#story-dialog-feedback")
+      if (feedback) feedback.hidden = true
+      clone.querySelectorAll(".spotlight").forEach((node) => node.classList.remove("spotlight"))
       download(`${filenameBase}-plan.html`, "<!DOCTYPE html>\n" + clone.outerHTML, "text/html;charset=utf-8")
     } else if (type === "print") {
       window.print()
@@ -180,18 +194,6 @@
     if (isExportOpen && target && !target.closest(".export-wrap")) {
       closeExport()
     }
-
-    const link = target?.closest<HTMLAnchorElement>('a[href^="#"]')
-    if (link && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
-      const href = link.getAttribute("href")
-      if (href && href !== "#main-content") {
-        const resolved = resolveViewForHash(href, plan)
-        if (resolved && resolved !== currentView) {
-          currentView = resolved
-          document.title = `${viewTitles[resolved] || "Overview"} · ${projectName}`
-        }
-      }
-    }
   }
 
   onMount(() => {
@@ -215,13 +217,8 @@
     }
     media.addEventListener("change", onMediaChange)
 
-    const syncHash = () => {
-      const targetView = resolveViewForHash(window.location.hash, plan)
-      currentView = targetView
-      document.title = `${viewTitles[targetView] || "Overview"} · ${projectName}`
-    }
-    window.addEventListener("hashchange", syncHash)
-    syncHash()
+    const cleanupStoryDialog = initStoryDialog(() => router.onStoryDismissed())
+    const stopRouter = router.start()
 
     window.addEventListener("keydown", onWindowKeydown)
     document.addEventListener("click", onDocumentClick)
@@ -233,13 +230,14 @@
 
     return () => {
       media.removeEventListener("change", onMediaChange)
-      window.removeEventListener("hashchange", syncHash)
+      stopRouter()
+      cleanupStoryDialog()
       window.removeEventListener("keydown", onWindowKeydown)
       document.removeEventListener("click", onDocumentClick)
       cleanupClipboard()
       if (typeof document !== "undefined") {
         document.body.classList.remove("nav-open")
-        document.body.style.overflow = ""
+        syncScrollLock()
       }
     }
   })
@@ -261,7 +259,7 @@
     <svg><use href="#i-close" /></svg>
   </button>
 
-  <a href="#overview" class="brand" aria-label="{projectName} overview" on:click={() => selectView("overview")}>
+  <a href="#overview" class="brand" aria-label="{projectName} overview">
     <span class="brandmark">
       <svg viewBox="0 0 34 38" aria-hidden="true">
         <path d="M6 28c0-4 5-4 9-8 2-2 2-5 2-8V9c0-7 10-7 10 0l5 2-6 3v10c0 7-13 10-20 4Z" />
@@ -277,7 +275,7 @@
       class="nav-link {currentView === 'overview' ? 'is-active' : ''}"
       data-nav="overview"
       aria-current={currentView === "overview" ? "page" : undefined}
-      on:click={() => selectView("overview")}
+
     >
       <svg aria-hidden="true"><use href="#i-grid" /></svg>
       <span>Overview</span>
@@ -287,7 +285,7 @@
       class="nav-link {currentView === 'epics' ? 'is-active' : ''}"
       data-nav="epics"
       aria-current={currentView === "epics" ? "page" : undefined}
-      on:click={() => selectView("epics")}
+
     >
       <svg aria-hidden="true"><use href="#i-layers" /></svg>
       <span>Implementation</span>
@@ -297,7 +295,7 @@
       class="nav-link {currentView === 'files' ? 'is-active' : ''}"
       data-nav="files"
       aria-current={currentView === "files" ? "page" : undefined}
-      on:click={() => selectView("files")}
+
     >
       <svg aria-hidden="true"><use href="#i-folder" /></svg>
       <span>Project files</span>
@@ -308,7 +306,7 @@
       class="nav-link {currentView === 'context' ? 'is-active' : ''}"
       data-nav="context"
       aria-current={currentView === "context" ? "page" : undefined}
-      on:click={() => selectView("context")}
+
     >
       <svg aria-hidden="true"><use href="#i-book" /></svg>
       <span>Architecture & decisions</span>
@@ -318,7 +316,7 @@
       class="nav-link {currentView === 'order' ? 'is-active' : ''}"
       data-nav="order"
       aria-current={currentView === "order" ? "page" : undefined}
-      on:click={() => selectView("order")}
+
     >
       <svg aria-hidden="true"><use href="#i-order" /></svg>
       <span>Delivery order</span>
@@ -328,7 +326,7 @@
       class="nav-link {currentView === 'criteria' ? 'is-active' : ''}"
       data-nav="criteria"
       aria-current={currentView === "criteria" ? "page" : undefined}
-      on:click={() => selectView("criteria")}
+
     >
       <svg aria-hidden="true"><use href="#i-check" /></svg>
       <span>Release criteria</span>
@@ -456,5 +454,7 @@
     <PlanPage {plan} {currentView} />
   </main>
 </div>
+
+<StoryDialog />
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
