@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="${MATCHA_REPO:-https://github.com/bitbybob/matcha}"
+repo="${MATCHA_REPO:-https://github.com/rx-bob/matcha}"
 ref="${MATCHA_REF:-main}"
 install_dir="${MATCHA_INSTALL_DIR:-$HOME/.local/bin}"
 
