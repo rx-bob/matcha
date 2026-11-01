@@ -27,16 +27,11 @@ function readPlan(): Plan {
   throw new Error("Plan data was not found")
 }
 
-const target = document.getElementById("content-area")
-
-if (!target) {
-  throw new Error("Plan content target was not found")
-}
+const target = document.getElementById("plan-root") ?? document.body
 
 mount(App, {
   target,
   props: {
     plan: readPlan(),
-    sidebarTarget: document.getElementById("sidebar"),
   },
 })
