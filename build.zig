@@ -114,6 +114,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_markdown_tests = b.addRunArtifact(markdown_tests);
 
+    const toon_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/render_toon.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_toon_tests = b.addRunArtifact(toon_tests);
+
     const workflow_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/cli_workflow_test.zig"),
@@ -135,6 +145,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_ownership_tests.step);
     test_step.dependOn(&run_markdown_tests.step);
+    test_step.dependOn(&run_toon_tests.step);
     test_step.dependOn(&run_workflow_tests.step);
 
     const leak_sensitive_test_roots = .{

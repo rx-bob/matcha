@@ -74,3 +74,7 @@ task install  # install dist/matcha to ~/.local/bin
 - Map UI: `client/src/MapApp.svelte` and `client/src/map.ts`.
 - Client build output consumed by CLI: `client/package.json` copies `dist/plan.js`, `dist/plan.css`,
   `dist/map.js`, and `dist/map.css` to the repo root.
+
+# Rules
+
+You are not allowed to edit the README.md unless you get explicit approval from the user.
