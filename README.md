@@ -1,4 +1,9 @@
-# Matcha 🍵
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/full_logo_dark.png">
+    <img src="assets/full_logo.png" alt="Matcha" width="640">
+  </picture>
+</p>
 
 Matcha is a CLI that lets you escape the modern markdown hell that working with an agent has become. You tell it to create a plan or a map with matcha & sit back 'n relax. No need to worry about semi-functional / semi-broken UIs.
 
