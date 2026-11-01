@@ -4,6 +4,8 @@
   import SvgSprite from "./components/ui/SvgSprite.svelte"
   import PlanPage from "./components/sections/PlanPage.svelte"
   import StoryDialog from "./components/dialogs/StoryDialog.svelte"
+  import SearchDialog from "./components/dialogs/SearchDialog.svelte"
+  import CopyDialog from "./components/dialogs/CopyDialog.svelte"
   import {
     type PlanDesign,
     type EvaTheme,
@@ -15,6 +17,8 @@
   import { createRouter } from "./lib/router"
   import { initStoryDialog, syncScrollLock } from "./lib/storyDialog"
   import { initClipboardDelegation } from "./lib/clipboard"
+  import { initPrintHandlers } from "./lib/print"
+  import { VIEW_TITLES, isViewId } from "./lib/ids"
 
   export let plan: Plan
 
@@ -27,18 +31,10 @@
   let searchShortcut = "⌘ K"
 
   let sidebarElement: HTMLElement | null = null
-
-  const viewTitles: Record<string, string> = {
-    overview: "Overview",
-    epics: "Implementation",
-    files: "Project files",
-    context: "Architecture & decisions",
-    order: "Delivery order",
-    criteria: "Release criteria",
-  }
+  let searchDialog: SearchDialog
 
   $: projectName = plan.project || plan.id || "matcha"
-  $: currentViewTitle = viewTitles[currentView] || "Overview"
+  $: currentViewTitle = isViewId(currentView) ? VIEW_TITLES[currentView] : VIEW_TITLES.overview
   $: if (typeof document !== "undefined") document.title = `${currentViewTitle} · ${projectName}`
 
   function selectDesign(design: PlanDesign): void {
@@ -99,10 +95,7 @@
 
   function handleSearchClick(): void {
     closeExport()
-    const searchDialog = document.getElementById("search-dialog") as HTMLDialogElement | null
-    if (searchDialog && !searchDialog.open) {
-      searchDialog.showModal()
-    }
+    searchDialog?.open()
   }
 
   function exportPlan(type: "html" | "json" | "print"): void {
@@ -180,12 +173,31 @@
       }
     }
 
+    const copyDialog = document.getElementById("copy-dialog") as HTMLDialogElement | null
+
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-      const searchTrigger = document.getElementById("open-search")
-      if (searchTrigger) {
-        event.preventDefault()
-        searchTrigger.click()
-      }
+      event.preventDefault()
+      if (copyDialog?.open) return
+      closeExport()
+      searchDialog?.toggle()
+      return
+    }
+
+    const editing = (event.target as HTMLElement | null)?.closest?.(
+      'input, textarea, select, [contenteditable="true"]'
+    )
+    if (
+      event.key === "/" &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !editing &&
+      !searchDialog?.isOpen() &&
+      !copyDialog?.open
+    ) {
+      event.preventDefault()
+      closeExport()
+      searchDialog?.open()
     }
   }
 
@@ -223,6 +235,7 @@
     window.addEventListener("keydown", onWindowKeydown)
     document.addEventListener("click", onDocumentClick)
     const cleanupClipboard = initClipboardDelegation()
+    const cleanupPrint = initPrintHandlers()
 
     if (sidebarElement) {
       sidebarElement.inert = isMobile && !isNavOpen
@@ -235,6 +248,7 @@
       window.removeEventListener("keydown", onWindowKeydown)
       document.removeEventListener("click", onDocumentClick)
       cleanupClipboard()
+      cleanupPrint()
       if (typeof document !== "undefined") {
         document.body.classList.remove("nav-open")
         syncScrollLock()
@@ -456,5 +470,7 @@
 </div>
 
 <StoryDialog />
+<SearchDialog {plan} bind:this={searchDialog} />
+<CopyDialog />
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
