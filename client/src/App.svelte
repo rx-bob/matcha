@@ -11,6 +11,7 @@
     applyPlanDesign,
     applyEvaTheme,
   } from "./lib/theme"
+  import { resolveViewForHash } from "./lib/overviewHelpers"
 
   export let plan: Plan
 
@@ -178,6 +179,18 @@
     if (isExportOpen && target && !target.closest(".export-wrap")) {
       closeExport()
     }
+
+    const link = target?.closest<HTMLAnchorElement>('a[href^="#"]')
+    if (link && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
+      const href = link.getAttribute("href")
+      if (href && href !== "#main-content") {
+        const resolved = resolveViewForHash(href, plan)
+        if (resolved && resolved !== currentView) {
+          currentView = resolved
+          document.title = `${viewTitles[resolved] || "Overview"} · ${projectName}`
+        }
+      }
+    }
   }
 
   onMount(() => {
@@ -202,11 +215,9 @@
     media.addEventListener("change", onMediaChange)
 
     const syncHash = () => {
-      const hash = window.location.hash.replace("#", "")
-      if (viewTitles[hash]) {
-        currentView = hash
-        document.title = `${viewTitles[hash]} · ${projectName}`
-      }
+      const targetView = resolveViewForHash(window.location.hash, plan)
+      currentView = targetView
+      document.title = `${viewTitles[targetView] || "Overview"} · ${projectName}`
     }
     window.addEventListener("hashchange", syncHash)
     syncHash()
@@ -439,6 +450,6 @@
   </header>
 
   <main class="content" id="main-content" tabindex="-1">
-    <PlanPage {plan} />
+    <PlanPage {plan} {currentView} />
   </main>
 </div>

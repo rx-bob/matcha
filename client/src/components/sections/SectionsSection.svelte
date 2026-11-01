@@ -1,22 +1,37 @@
 <script lang="ts">
-  import type { PlanSection } from "../../../../src/plan.ts"
-  import SectionCard from "../cards/SectionCard.svelte"
-  import EmptyState from "../ui/EmptyState.svelte"
+  import type { PlanSection } from "../../../../src/plan"
 
-  export let sections: PlanSection[] | undefined
+  export let sections: PlanSection[] = []
+  export let hidden = false
 </script>
 
-<section class="document-section" id="sections">
-  <header class="section-header">
-    <h1 class="section-title">Sections</h1>
-    <p class="page-subtitle">Architecture, rules, data models, requirements, and other plan context.</p>
+<section class="page-view" id="view-context" data-view="context" {hidden}>
+  <header class="page-heading">
+    <h1>Decisions &amp; architecture</h1>
   </header>
 
-  {#if sections && sections.length > 0}
-    {#each sections as section}
-      <SectionCard {section} />
-    {/each}
-  {:else}
-    <EmptyState message="No sections are defined." />
-  {/if}
+  {#each sections as section}
+    <article class="context-card" id={section.id}>
+      <span id="section-{section.id}" class="legacy-anchor"></span>
+      <div class="context-header context-card-header">
+        <h2>{section.title}</h2>
+        {#if section.kind}
+          <span class="context-kind">{section.kind}</span>
+        {/if}
+      </div>
+      {#if section.summary}
+        <p class="context-summary">{section.summary}</p>
+      {/if}
+      <div class="context-items">
+        {#each section.items || [] as item}
+          <div class="context-item">
+            {#if item.title}
+              <h3 class="context-item-title">{item.title}</h3>
+            {/if}
+            <p class="context-item-text">{item.text}</p>
+          </div>
+        {/each}
+      </div>
+    </article>
+  {/each}
 </section>

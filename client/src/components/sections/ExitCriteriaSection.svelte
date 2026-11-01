@@ -1,25 +1,19 @@
 <script lang="ts">
-  import EmptyState from "../ui/EmptyState.svelte"
-
-  export let criteria: string[] | undefined
+  export let criteria: string[] = []
+  export let hidden = false
 </script>
 
-<section class="document-section" id="exit-criteria">
-  <header class="section-header">
-    <h1 class="section-title">Exit Criteria</h1>
-    <p class="page-subtitle">The proof that the whole plan is complete.</p>
+<section class="page-view" id="view-criteria" data-view="criteria" {hidden}>
+  <header class="page-heading">
+    <h1>Release criteria</h1>
   </header>
 
-  {#if criteria && criteria.length > 0}
-    <section class="list-section">
-      <h3 class="small-heading">Criteria</h3>
-      <ul class="item-list">
-        {#each criteria as criterion}
-          <li class="list-item">{criterion}</li>
-        {/each}
-      </ul>
-    </section>
-  {:else}
-    <EmptyState message="No exit criteria are defined." />
-  {/if}
+  <ol class="criteria-list">
+    {#each criteria as criterion, index}
+      <li>
+        <span class="criterion-number">{String(index + 1).padStart(2, "0")}</span>
+        <p>{criterion}</p>
+      </li>
+    {/each}
+  </ol>
 </section>

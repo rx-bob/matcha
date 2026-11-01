@@ -4,28 +4,37 @@
   import FileTreeSection from "../filetree/FileTreeSection.svelte"
   import EpicsSection from "./EpicsSection.svelte"
   import SectionsSection from "./SectionsSection.svelte"
-  import WorkflowsSection from "./WorkflowsSection.svelte"
-  import CommandsSection from "./CommandsSection.svelte"
   import RecommendedOrderSection from "./RecommendedOrderSection.svelte"
   import ExitCriteriaSection from "./ExitCriteriaSection.svelte"
 
   export let plan: Plan
+  export let currentView = "overview"
 </script>
 
-<OverviewSection {plan} />
+<OverviewSection {plan} hidden={currentView !== "overview"} />
 
-{#if plan.changedFiles && plan.changedFiles.length > 0}
-  <FileTreeSection changedFiles={plan.changedFiles} />
-{/if}
+<section class="page-view" id="view-epics" data-view="epics" hidden={currentView !== "epics"}>
+  <header class="page-heading">
+    <h1>Implementation plan</h1>
+  </header>
+  <EpicsSection epics={plan.epics} />
+</section>
 
-<EpicsSection epics={plan.epics} />
+<section class="page-view" id="view-files" data-view="files" hidden={currentView !== "files"}>
+  <header class="page-heading">
+    <h1>Project files</h1>
+  </header>
+  {#if plan.changedFiles && plan.changedFiles.length > 0}
+    <FileTreeSection changedFiles={plan.changedFiles} />
+  {/if}
+</section>
 
-<SectionsSection sections={plan.sections} />
+<SectionsSection sections={plan.sections} hidden={currentView !== "context"} />
 
-<WorkflowsSection workflows={plan.workflows} />
+<RecommendedOrderSection
+  items={plan.recommendedOrder}
+  epics={plan.epics}
+  hidden={currentView !== "order"}
+/>
 
-<CommandsSection commands={plan.commands} />
-
-<RecommendedOrderSection items={plan.recommendedOrder} />
-
-<ExitCriteriaSection criteria={plan.exitCriteria} />
+<ExitCriteriaSection criteria={plan.exitCriteria} hidden={currentView !== "criteria"} />
