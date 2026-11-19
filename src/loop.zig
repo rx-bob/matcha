@@ -46,9 +46,9 @@ var caught_signal: std.atomic.Value(c_int) = .init(0);
 extern "c" fn kill(pid: std.posix.pid_t, signal_number: c_int) c_int;
 
 fn loopSignalHandler(signal: std.posix.SIG) callconv(.c) void {
-    caught_signal.store(@intCast(@intFromEnum(signal)), .release);
+    caught_signal.store(@intCast(@backingInt(signal)), .release);
     const pid = active_child_pid.load(.acquire);
-    if (pid > 0) _ = kill(pid, @intCast(@intFromEnum(signal)));
+    if (pid > 0) _ = kill(pid, @intCast(@backingInt(signal)));
 }
 
 const SignalGuard = struct {
@@ -1297,7 +1297,7 @@ test "consecutive blocker reports stop the loop" {
     defer environment.deinit();
     var output = std.Io.Writer.Allocating.init(allocator);
     defer output.deinit();
-    const script = [_]FakeStep{.worker_blocked} ** store_mod.max_blocked_strikes;
+    const script: [store_mod.max_blocked_strikes]FakeStep = @splat(.worker_blocked);
     var fake = FakeRunner{ .store = &store, .script = &script };
     defer fake.deinit(allocator);
     const exit_code = try run(.{

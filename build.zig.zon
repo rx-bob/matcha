@@ -2,7 +2,7 @@
     .name = .matcha,
     .version = "0.1.0",
     .fingerprint = 0x98a71109a2487d8f,
-    .minimum_zig_version = "0.17.0-dev.690+c5a61e899",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{
         "build.zig",

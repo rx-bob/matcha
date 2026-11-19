@@ -217,10 +217,11 @@ fn applyObject(a: std.mem.Allocator, settings: *Config, root: std.json.Value, so
             if (std.mem.eql(u8, key, "output_mode") and std.meta.stringToEnum(options.OutputMode, raw.string) == null) return error.InvalidEnumTag;
         }
         var found = false;
-        inline for (std.meta.fields(Config)) |field| {
-            if (std.mem.eql(u8, key, field.name)) {
+        const fields = @typeInfo(Config).@"struct";
+        inline for (fields.field_names, fields.field_types) |name, field_type| {
+            if (std.mem.eql(u8, key, name)) {
                 if (project and std.mem.eql(u8, key, "schema_version")) return error.UnknownField;
-                @field(settings, field.name) = std.json.parseFromValueLeaky(field.type, a, entry.value_ptr.*, .{}) catch |err| {
+                @field(settings, name) = std.json.parseFromValueLeaky(field_type, a, entry.value_ptr.*, .{}) catch |err| {
                     try diagnostic.print("Config {s}, field {s}: {s}\n", .{ source, key, @errorName(err) });
                     return err;
                 };

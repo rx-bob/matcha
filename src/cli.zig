@@ -1,10 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("termios.h");
-    @cInclude("unistd.h");
-    @cInclude("poll.h");
-    @cInclude("sys/ioctl.h");
-});
+const c = std.c;
 
 const assets = @import("assets.zig");
 const errors = @import("errors.zig");
@@ -57,7 +52,7 @@ pub fn run(init: std.process.Init) !void {
     try stderr.flush();
 
     if (exit_code != .ok) {
-        std.process.exit(@intFromEnum(exit_code));
+        std.process.exit(@backingInt(exit_code));
     }
 }
 
@@ -433,21 +428,22 @@ fn runLoopConfig(io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !Ex
 }
 
 fn selectConfigOption(stdout: *std.Io.Writer, title: []const u8, choices: []const []const u8, initial: usize) !usize {
-    var original: c.struct_termios = undefined;
+    var original: c.termios = undefined;
     if (c.tcgetattr(c.STDIN_FILENO, &original) != 0) return error.TerminalSetupFailed;
     var raw = original;
-    raw.c_lflag &= @as(c.tcflag_t, ~@as(c.tcflag_t, c.ICANON | c.ECHO));
-    raw.c_cc[c.VMIN] = 1;
-    raw.c_cc[c.VTIME] = 0;
-    if (c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &raw) != 0) return error.TerminalSetupFailed;
-    defer _ = c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &original);
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.cc[@backingInt(c.V.MIN)] = 1;
+    raw.cc[@backingInt(c.V.TIME)] = 0;
+    if (c.tcsetattr(c.STDIN_FILENO, .NOW, &raw) != 0) return error.TerminalSetupFailed;
+    defer _ = c.tcsetattr(c.STDIN_FILENO, .NOW, &original);
 
     var selected = @min(initial, choices.len - 1);
     var first_visible = visibleMenuStart(selected, choices.len);
     try drawConfigMenu(stdout, title, choices, selected, first_visible, false);
     while (true) {
         var byte: u8 = 0;
-        if (c.read(c.STDIN_FILENO, &byte, 1) != 1) return error.TerminalReadFailed;
+        if (c.read(c.STDIN_FILENO, (&byte)[0..1], 1) != 1) return error.TerminalReadFailed;
         if (byte == '\r' or byte == '\n') {
             try stdout.writeByte('\n');
             try stdout.flush();
@@ -456,8 +452,8 @@ fn selectConfigOption(stdout: *std.Io.Writer, title: []const u8, choices: []cons
         if (byte == 3) return error.ConfigCancelled;
         var changed = false;
         if (byte == 0x1b) {
-            var poll_fd = c.struct_pollfd{ .fd = c.STDIN_FILENO, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(&poll_fd, 1, 80) > 0 and (poll_fd.revents & c.POLLIN) != 0) {
+            var poll_fd = c.pollfd{ .fd = c.STDIN_FILENO, .events = c.POLL.IN, .revents = 0 };
+            if (c.poll((&poll_fd)[0..1], 1, 80) > 0 and (poll_fd.revents & c.POLL.IN) != 0) {
                 var sequence: [2]u8 = undefined;
                 if (c.read(c.STDIN_FILENO, &sequence, 2) == 2 and sequence[0] == '[') {
                     if (sequence[1] == 'A') {
@@ -515,8 +511,8 @@ fn drawConfigMenu(stdout: *std.Io.Writer, title: []const u8, choices: []const []
 }
 
 fn configMenuColumns() usize {
-    var window: c.struct_winsize = undefined;
-    if (c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &window) == 0 and window.ws_col > 0) return window.ws_col;
+    var window: c.winsize = undefined;
+    if (c.ioctl(c.STDOUT_FILENO, c.T.IOCGWINSZ, &window) == 0 and window.col > 0) return window.col;
     return 80;
 }
 

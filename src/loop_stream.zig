@@ -1,10 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sys/ioctl.h");
-    @cInclude("unistd.h");
-    @cInclude("termios.h");
-    @cInclude("poll.h");
-});
+const c = std.c;
 const options = @import("loop_options.zig");
 const store = @import("loop_store.zig");
 
@@ -164,7 +159,7 @@ pub const Presenter = struct {
     output_mutex: std.Io.Mutex = .init,
     stop_status_ticker: std.atomic.Value(bool) = .init(false),
     status_ticker: ?std.Thread = null,
-    original_stdin_termios: c.struct_termios = undefined,
+    original_stdin_termios: c.termios = undefined,
     stdin_raw: bool = false,
     stop_input_reader: std.atomic.Value(bool) = .init(false),
     input_reader: ?std.Thread = null,
@@ -645,9 +640,9 @@ pub const Presenter = struct {
 
     fn beginTerminalUi(self: *Presenter) !void {
         if (c.isatty(c.STDOUT_FILENO) != 1) return;
-        var window: c.struct_winsize = undefined;
-        if (c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &window) != 0 or window.ws_row < 3 or window.ws_col == 0) return;
-        self.terminal_rows = window.ws_row;
+        var window: c.winsize = undefined;
+        if (c.ioctl(c.STDOUT_FILENO, c.T.IOCGWINSZ, &window) != 0 or window.row < 3 or window.col == 0) return;
+        self.terminal_rows = window.row;
         self.history = std.Io.Writer.Allocating.init(self.allocator);
         self.terminal_ui = true;
         try self.writer.print("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H\x1b[1;{d}r\x1b[1;1H", .{self.historyHeight()});
@@ -659,8 +654,8 @@ pub const Presenter = struct {
 
     fn updateStatusBar(self: *Presenter) !void {
         if (!self.terminal_ui) return;
-        var window: c.struct_winsize = undefined;
-        const columns: usize = if (c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &window) == 0 and window.ws_col > 0) window.ws_col else 80;
+        var window: c.winsize = undefined;
+        const columns: usize = if (c.ioctl(c.STDOUT_FILENO, c.T.IOCGWINSZ, &window) == 0 and window.col > 0) window.col else 80;
         const elapsed_seconds: u64 = self.elapsed_base_seconds + (if (self.io) |io| if (self.status_started_at) |started|
             @as(u64, @intCast(@max(@as(i96, 0), @divTrunc(started.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_s))))
         else
@@ -737,10 +732,11 @@ pub const Presenter = struct {
         if (c.isatty(c.STDIN_FILENO) != 1) return;
         if (c.tcgetattr(c.STDIN_FILENO, &self.original_stdin_termios) != 0) return error.TerminalSetupFailed;
         var raw = self.original_stdin_termios;
-        raw.c_lflag &= @as(c.tcflag_t, ~@as(c.tcflag_t, c.ICANON | c.ECHO));
-        raw.c_cc[c.VMIN] = 0;
-        raw.c_cc[c.VTIME] = 0;
-        if (c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &raw) != 0) return error.TerminalSetupFailed;
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.cc[@backingInt(c.V.MIN)] = 0;
+        raw.cc[@backingInt(c.V.TIME)] = 0;
+        if (c.tcsetattr(c.STDIN_FILENO, .NOW, &raw) != 0) return error.TerminalSetupFailed;
         self.stdin_raw = true;
         self.stop_input_reader.store(false, .release);
         self.input_reader = try std.Thread.spawn(.{}, inputReader, .{self});
@@ -753,7 +749,7 @@ pub const Presenter = struct {
             self.input_reader = null;
         }
         if (self.stdin_raw) {
-            _ = c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &self.original_stdin_termios);
+            _ = c.tcsetattr(c.STDIN_FILENO, .NOW, &self.original_stdin_termios);
             self.stdin_raw = false;
         }
     }
@@ -834,11 +830,11 @@ fn inputReader(presenter: *Presenter) void {
     var length: usize = 0;
     var escape = false;
     while (!presenter.stop_input_reader.load(.acquire)) {
-        var poll_fd = c.struct_pollfd{ .fd = c.STDIN_FILENO, .events = c.POLLIN, .revents = 0 };
-        const ready = c.poll(&poll_fd, 1, 100);
-        if (ready <= 0 or (poll_fd.revents & c.POLLIN) == 0) continue;
+        var poll_fd = c.pollfd{ .fd = c.STDIN_FILENO, .events = c.POLL.IN, .revents = 0 };
+        const ready = c.poll((&poll_fd)[0..1], 1, 100);
+        if (ready <= 0 or (poll_fd.revents & c.POLL.IN) == 0) continue;
         var byte: u8 = 0;
-        if (c.read(c.STDIN_FILENO, &byte, 1) != 1) continue;
+        if (c.read(c.STDIN_FILENO, (&byte)[0..1], 1) != 1) continue;
         if (byte == 27) {
             escape = true;
             length = 0;
@@ -908,9 +904,9 @@ pub fn classifyToolActivity(name: []const u8) ActivityState {
 
 fn terminalColumns() usize {
     if (c.isatty(c.STDOUT_FILENO) != 1) return 80;
-    var window: c.struct_winsize = undefined;
-    if (c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &window) != 0 or window.ws_col == 0) return 80;
-    return window.ws_col;
+    var window: c.winsize = undefined;
+    if (c.ioctl(c.STDOUT_FILENO, c.T.IOCGWINSZ, &window) != 0 or window.col == 0) return 80;
+    return window.col;
 }
 
 fn writeOneLine(writer: *std.Io.Writer, text: []const u8, limit: usize) !void {

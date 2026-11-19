@@ -61,7 +61,8 @@ test "summary handles missing history and limits long agent reports" {
     const result = try render(allocator, .{ .id = "loop", .backend = .codex, .cwd = ".", .objective = "fix", .started_at_ms = 0, .updated_at_ms = 0 }, "bad json\n");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("No work summary was recorded before the loop stopped.", result);
-    const short = try brief(allocator, "word " ** 100);
+    const words: [100][5]u8 = @splat("word ".*);
+    const short = try brief(allocator, std.mem.asBytes(&words));
     defer allocator.free(short);
     try std.testing.expect(short.len < 410);
     try std.testing.expect(std.mem.endsWith(u8, short, "…"));

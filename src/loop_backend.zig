@@ -163,7 +163,7 @@ const stderr_tail_capacity = 8 * 1024;
 extern "c" fn kill(pid: std.posix.pid_t, signal_number: c_int) c_int;
 
 fn stopChild(id: std.process.Child.Id) void {
-    _ = kill(@intCast(id), @intCast(@intFromEnum(std.posix.SIG.KILL)));
+    _ = kill(@intCast(id), @intCast(@backingInt(std.posix.SIG.KILL)));
 }
 
 /// Spawn a backend, stream its stdout events, drain stderr concurrently, and return after wait.
@@ -1006,9 +1006,11 @@ test "real runner streams events, captures early session, stdin, stderr, and exi
         try std.testing.expectEqual(@as(i64, 1), value.object.get("attempt").?.integer);
     }
     try std.testing.expect(std.mem.startsWith(u8, stdout_bytes.items, "{\"type\":\"thread.started\""));
-    try std.testing.expect(std.mem.endsWith(u8, stdout_bytes.items, "begin-" ++ ("x" ** 9000)));
+    const stdout_padding: [9000]u8 = @splat('x');
+    try std.testing.expect(std.mem.endsWith(u8, stdout_bytes.items, "begin-" ++ &stdout_padding));
     try std.testing.expectEqual(@as(usize, 9000 + "-stderr-tail-marker\n".len), stderr_bytes.items.len);
-    try std.testing.expect(std.mem.startsWith(u8, stderr_bytes.items, "y" ** 9000));
+    const stderr_padding: [9000]u8 = @splat('y');
+    try std.testing.expect(std.mem.startsWith(u8, stderr_bytes.items, &stderr_padding));
     const prompt_path = try std.fmt.allocPrint(allocator, "{s}/current_prompt.md", .{absolute_loop_dir});
     defer allocator.free(prompt_path);
     const saved_prompt = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, prompt_path, allocator, .limited(20000));
