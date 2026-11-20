@@ -9,6 +9,7 @@ const path = require('node:path');
   const variants = [
     { name: 'Coral', design: 'coral', theme: 'light', file: 'coral.html' },
     { name: 'Chonk', design: 'chonk', theme: 'dark', file: 'chonk.html' },
+    { name: 'Uji', design: 'uji', theme: 'light', file: 'uji.html' },
     { name: 'EVA-01 Dark', design: 'eva-01', theme: 'dark', file: 'eva-01-dark.html' },
     { name: 'EVA-01 Light', design: 'eva-01', theme: 'light', file: 'eva-01-light.html' },
   ];
@@ -33,5 +34,5 @@ iframe{display:block;width:100%;height:850px;border:1px solid #ccc;background:wh
 <h1>Sample plan designs</h1><p>Compare the same plan in every design. Open a design in its own tab for a full-width view.</p>
 <div class="grid">${variants.map(v => `<article><h2><a href="${v.file}" target="_blank" rel="noopener">${v.name} ↗</a></h2><iframe src="${v.file}" title="${v.name}"></iframe></article>`).join('\n')}</div>
 </html>\n`);
-  console.log('Generated dist/plan-designs/index.html and four standalone sample plans.');
+  console.log(`Generated dist/plan-designs/index.html and ${variants.length} standalone sample plans.`);
 })().catch(error => { console.error(error); process.exitCode = 1; });

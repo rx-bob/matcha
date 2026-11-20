@@ -13,6 +13,7 @@ const root = path.resolve(__dirname, '../..');
     const variants = [
       { design: 'coral', color: '#e33920', background: '#f5f3ef', radius: 28 },
       { design: 'chonk', color: '#ff842a', background: '#0b0b12', radius: 12 },
+      { design: 'uji', color: '#275638', background: '#e6eecf', radius: 36 },
       { design: 'eva-01', color: '#bdff39', background: '#0d0d13', radius: 0 },
     ];
     for (const variant of variants) {

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest"
 import {
   defaultPlanDesign,
+  planDesigns,
   defaultEvaTheme,
   planDesignStorageKey,
   evaThemeStorageKey,
@@ -109,6 +110,7 @@ describe("theme and design system", () => {
       expect(isPlanDesign("coral")).toBe(true)
       expect(isPlanDesign("chonk")).toBe(true)
       expect(isPlanDesign("eva-01")).toBe(true)
+      expect(isPlanDesign("uji")).toBe(true)
       expect(isPlanDesign("unknown")).toBe(false)
       expect(isPlanDesign(null)).toBe(false)
       expect(isPlanDesign(undefined)).toBe(false)
@@ -132,6 +134,14 @@ describe("theme and design system", () => {
       expect(readStoredPlanDesign()).toBe("coral")
     })
 
+    it("recognizes the former Matcha name in preferences and previews", () => {
+      mockStorage[planDesignStorageKey] = "matcha"
+      expect(readStoredPlanDesign()).toBe("uji")
+      mockStorage[planDesignStorageKey] = "coral"
+      mockDataset.initialDesign = "matcha"
+      expect(readStoredPlanDesign()).toBe("uji")
+    })
+
     it("reads stored eva theme with fallback to dark", () => {
       expect(readStoredEvaTheme()).toBe("dark")
       writeStoredEvaTheme("light")
@@ -143,14 +153,14 @@ describe("theme and design system", () => {
 
   describe("favicon generation", () => {
     it("embeds a distinct mascot PNG for each design", () => {
-      const icons = ["coral", "chonk", "eva-01"].map(design => getFaviconUrl(design as "coral" | "chonk" | "eva-01"))
-      expect(new Set(icons).size).toBe(3)
+      const icons = planDesigns.map(getFaviconUrl)
+      expect(new Set(icons).size).toBe(planDesigns.length)
       for (const icon of icons) expect(icon).toMatch(/^data:image\/png;base64,iVBOR/)
     })
 
     it("updates the favicon when the selected design changes", () => {
       mockIconLink = { rel: "icon", href: "" }
-      for (const design of ["coral", "chonk", "eva-01"] as const) {
+      for (const design of planDesigns) {
         updateFavicon(design)
         expect(mockIconLink.href).toBe(getFaviconUrl(design))
       }
@@ -165,6 +175,14 @@ describe("theme and design system", () => {
       expect(mockDataset.design).toBe("coral")
       expect(mockDataset.theme).toBe("light")
       expect(localStorage.getItem(planDesignStorageKey)).toBe("coral")
+    })
+
+    it("keeps Uji light with a saved dark EVA preference", () => {
+      applyEvaTheme("dark")
+      applyPlanDesign("uji", readStoredEvaTheme())
+      expect(mockDataset.theme).toBe("light")
+      expect(readStoredPlanDesign()).toBe("uji")
+      expect(readStoredEvaTheme()).toBe("dark")
     })
 
     it("applies chonk design forcing dark theme", () => {

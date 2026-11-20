@@ -40,7 +40,7 @@ tasks:
       - zig build run -- plan
 
   run-plan-designs:
-    desc: Generate sample plans for Coral, Chonk, and EVA dark/light with a comparison index
+    desc: Generate sample plans for Coral, Chonk, Uji, and EVA dark/light with a comparison index
     deps:
       - build-client
     cmds:

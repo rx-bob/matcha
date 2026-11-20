@@ -22,9 +22,9 @@ const url = pathToFileURL(path.join(root, 'dist/plan.html')).href;
   assert.equal(await page.locator('html').getAttribute('data-design'),'coral');
   for(const view of ['overview','epics','files','context','order','criteria']){await page.locator(`[data-nav="${view}"]`).click();await visible(`#view-${view}`);assert.equal(await page.locator('.page-view:visible').count(),1)}
  });
- await check('Three designs, EVA theme persistence and reference screenshots',async()=>{
+ await check('Four designs, EVA theme persistence and reference screenshots',async()=>{
   await route('#overview');
-  for(const design of ['coral','chonk','eva-01']){
+  for(const design of ['coral','chonk','uji','eva-01']){
    await page.locator(`[data-design-choice="${design}"]`).click();
    await page.reload(); await page.waitForTimeout(300); await page.evaluate(()=>document.fonts.ready);
    assert.equal(await page.locator('html').getAttribute('data-design'),design);
@@ -33,6 +33,15 @@ const url = pathToFileURL(path.join(root, 'dist/plan.html')).href;
    assert.equal(await page.locator('#sidebar .brand-type, #sidebar .brand-logo').count(),0);
    await visible('#sidebar .matcha-mascot');
    assert((await page.locator('.matcha-mascot').getAttribute('style')).includes('data:image/png;base64,'));
+   if(design==='uji'){
+    assert.equal(await page.locator('html').getAttribute('data-theme'),'light');
+    assert.equal(await page.getByRole('group',{name:'Eva color mode'}).isVisible(),false);
+    await visible('.uji-hero-art');
+    const viewport=page.viewportSize();
+    await page.setViewportSize({width:320,height:844});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Uji overview overflows on mobile');
+    await page.setViewportSize(viewport);
+   }
    const mascotBounds=await page.locator('.matcha-mascot').boundingBox();
    const sidebarBounds=await page.locator('#sidebar').boundingBox();
    assert.equal(mascotBounds.width,80);assert.equal(mascotBounds.height,80);
@@ -65,7 +74,7 @@ const url = pathToFileURL(path.join(root, 'dist/plan.html')).href;
     await preview.locator(`[data-theme-choice="${initial}"][aria-pressed="true"]`).waitFor({state:'visible'});
     for(const mode of [initial==='dark'?'light':'dark',initial]){
      await preview.locator(`[data-theme-choice="${mode}"]`).click();
-     for(const design of ['coral','chonk']){
+     for(const design of ['coral','chonk','uji']){
       await preview.locator(`[data-design-choice="${design}"]`).click();
       await preview.locator('[data-design-choice="eva-01"]').click();
       assert.equal(await preview.locator('html').getAttribute('data-theme'),mode);

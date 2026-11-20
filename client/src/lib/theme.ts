@@ -1,20 +1,35 @@
 import coralFavicon from "../../../assets/favicon-coral.png?inline"
 import chonkFavicon from "../../../assets/favicon-chonk.png?inline"
 import evaFavicon from "../../../assets/favicon-eva-01.png?inline"
+import ujiFavicon from "../../../assets/favicon-uji.png?inline"
 
 export const planDesignStorageKey = "matcha-plan-design"
 export const evaThemeStorageKey = "matcha-eva-theme"
 
-export type PlanDesign = "coral" | "chonk" | "eva-01"
+export const planDesigns = ["chonk", "coral", "eva-01", "uji"] as const
+export type PlanDesign = (typeof planDesigns)[number]
+
+export const planDesignLabels: Record<PlanDesign, string> = {
+  chonk: "Chonk",
+  coral: "Coral",
+  "eva-01": "Eva-01",
+  uji: "Uji",
+}
+
+const favicons: Record<PlanDesign, string> = {
+  chonk: chonkFavicon,
+  coral: coralFavicon,
+  "eva-01": evaFavicon,
+  uji: ujiFavicon,
+}
+
 export type EvaTheme = "dark" | "light"
 
 export const defaultPlanDesign: PlanDesign = "coral"
 export const defaultEvaTheme: EvaTheme = "dark"
 
-export const planDesigns: readonly PlanDesign[] = ["chonk", "coral", "eva-01"] as const
-
 export function isPlanDesign(value: string | null | undefined): value is PlanDesign {
-  return value === "coral" || value === "chonk" || value === "eva-01"
+  return planDesigns.some(design => design === value)
 }
 
 export function isEvaTheme(value: string | null | undefined): value is EvaTheme {
@@ -23,10 +38,12 @@ export function isEvaTheme(value: string | null | undefined): value is EvaTheme 
 
 export function readStoredPlanDesign(storageKey = planDesignStorageKey): PlanDesign {
   const initial = typeof document !== "undefined" ? document.documentElement.dataset.initialDesign : undefined
+  if (initial === "matcha") return "uji"
   if (isPlanDesign(initial)) return initial
   try {
     if (typeof localStorage !== "undefined") {
       const saved = localStorage.getItem(storageKey)
+      if (saved === "matcha") return "uji"
       if (isPlanDesign(saved)) {
         return saved
       }
@@ -69,7 +86,7 @@ export function writeStoredEvaTheme(theme: EvaTheme, storageKey = getEvaThemeSto
 }
 
 export function getFaviconUrl(design: PlanDesign): string {
-  return design === "coral" ? coralFavicon : design === "chonk" ? chonkFavicon : evaFavicon
+  return favicons[design]
 }
 
 export function updateFavicon(design: PlanDesign): void {
@@ -90,7 +107,7 @@ export function applyPlanDesign(
   const validEvaTheme: EvaTheme = isEvaTheme(evaTheme) ? evaTheme : defaultEvaTheme
 
   const theme: "dark" | "light" =
-    validDesign === "coral"
+    validDesign === "coral" || validDesign === "uji"
       ? "light"
       : validDesign === "chonk"
         ? "dark"

@@ -10,6 +10,8 @@
   import {
     type PlanDesign,
     type EvaTheme,
+    planDesigns,
+    planDesignLabels,
     readStoredPlanDesign,
     readStoredEvaTheme,
     applyPlanDesign,
@@ -341,27 +343,15 @@
 
   <div class="sidebar-foot">
     <div class="design-switch" role="group" aria-label="Design theme">
-      <button
-        data-design-choice="chonk"
-        aria-pressed={currentDesign === "chonk"}
-        on:click={() => selectDesign("chonk")}
-      >
-        Chonk
-      </button>
-      <button
-        data-design-choice="coral"
-        aria-pressed={currentDesign === "coral"}
-        on:click={() => selectDesign("coral")}
-      >
-        Coral
-      </button>
-      <button
-        data-design-choice="eva-01"
-        aria-pressed={currentDesign === "eva-01"}
-        on:click={() => selectDesign("eva-01")}
-      >
-        Eva-01
-      </button>
+      {#each planDesigns as design}
+        <button
+          data-design-choice={design}
+          aria-pressed={currentDesign === design}
+          on:click={() => selectDesign(design)}
+        >
+          {planDesignLabels[design]}
+        </button>
+      {/each}
     </div>
 
     <div

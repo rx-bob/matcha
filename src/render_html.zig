@@ -31,6 +31,7 @@ fn faviconDataUrl(comptime png: []const u8) []const u8 {
 
 const coral_favicon_url = faviconDataUrl(@embedFile("../assets/favicon-coral.png"));
 const chonk_favicon_url = faviconDataUrl(@embedFile("../assets/favicon-chonk.png"));
+const uji_favicon_url = faviconDataUrl(@embedFile("../assets/favicon-uji.png"));
 const eva_favicon_url = faviconDataUrl(@embedFile("../assets/favicon-eva-01.png"));
 
 const plan_boot_script =
@@ -39,12 +40,13 @@ const plan_boot_script =
     \\    try {
     \\      var root = document.documentElement;
     \\      var savedDesign = root.dataset.initialDesign || localStorage.getItem('matcha-plan-design');
-    \\      var designs = ['coral', 'chonk', 'eva-01'];
+    \\      if (savedDesign === 'matcha') savedDesign = 'uji';
+    \\      var designs = ['coral', 'chonk', 'eva-01', 'uji'];
     \\      var design = (savedDesign && designs.indexOf(savedDesign) !== -1) ? savedDesign : 'coral';
     \\      root.dataset.design = design;
     \\      var savedTheme = localStorage.getItem(root.dataset.evaThemeStorageKey || 'matcha-eva-theme');
     \\      if (savedTheme !== 'light' && savedTheme !== 'dark') savedTheme = root.dataset.initialEvaTheme;
-    \\      var theme = design === 'coral' ? 'light' : design === 'chonk' ? 'dark' : (savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : 'dark');
+    \\      var theme = (design === 'coral' || design === 'uji') ? 'light' : design === 'chonk' ? 'dark' : (savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : 'dark');
     \\      root.dataset.theme = theme;
     \\      var fav = document.getElementById('dynamic-favicon');
     \\      if (fav) {
@@ -85,6 +87,8 @@ pub fn writePlanHtml(io: std.Io, output_path: []const u8, title: []const u8, pay
     try file.writeStreamingAll(io, chonk_favicon_url);
     try file.writeStreamingAll(io, "\" data-favicon-eva-01=\"");
     try file.writeStreamingAll(io, eva_favicon_url);
+    try file.writeStreamingAll(io, "\" data-favicon-uji=\"");
+    try file.writeStreamingAll(io, uji_favicon_url);
     try file.writeStreamingAll(io, "\">\n");
     try file.writeStreamingAll(io, "  ");
     try file.writeStreamingAll(io, plan_boot_script);
@@ -245,7 +249,7 @@ test "plan HTML render emits required markers and title" {
     try std.testing.expect(std.mem.indexOf(u8, html, "id=\"plan-data\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "window.PLAN_DATA") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "id=\"dynamic-favicon\"") != null);
-    inline for (.{ "coral", "chonk", "eva-01" }) |design| {
+    inline for (.{ "coral", "chonk", "eva-01", "uji" }) |design| {
         try std.testing.expect(std.mem.indexOf(u8, html, "data-favicon-" ++ design ++ "=\"data:image/png;base64,") != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, html, "matcha-plan-design") != null);

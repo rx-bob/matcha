@@ -38,7 +38,8 @@
     color: #e33920;
   }
 
-  :global(:root[data-design="chonk"]) .brandmark {
+  :global(:root[data-design="chonk"]) .brandmark,
+  :global(:root[data-design="uji"]) .brandmark {
     width: 84px;
     height: 84px;
     border: 0;

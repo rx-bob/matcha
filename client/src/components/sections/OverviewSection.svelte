@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Plan } from "../../../../src/plan"
+  import teaIllustration from "../../assets/matcha-tea.webp?inline"
   import ChonkHeroArt from "../ui/ChonkHeroArt.svelte"
   import {
     splitHeroTitle,
@@ -40,6 +41,7 @@
     </div>
 
     <ChonkHeroArt />
+    <img class="uji-hero-art" src={teaIllustration} alt="" />
   </div>
 
   <div class="plan-counts" aria-label="Plan at a glance">
