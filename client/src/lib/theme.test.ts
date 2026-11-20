@@ -100,7 +100,7 @@ describe("theme and design system", () => {
 
   describe("defaults and guards", () => {
     it("has expected defaults and storage keys", () => {
-      expect(defaultPlanDesign).toBe("coral")
+      expect(defaultPlanDesign).toBe("uji")
       expect(defaultEvaTheme).toBe("dark")
       expect(planDesignStorageKey).toBe("matcha-plan-design")
       expect(evaThemeStorageKey).toBe("matcha-eva-theme")
@@ -126,12 +126,12 @@ describe("theme and design system", () => {
   })
 
   describe("storage persistence", () => {
-    it("reads stored plan design with fallback to coral", () => {
-      expect(readStoredPlanDesign()).toBe("coral")
+    it("reads stored plan design with fallback to uji", () => {
+      expect(readStoredPlanDesign()).toBe("uji")
       writeStoredPlanDesign("chonk")
       expect(readStoredPlanDesign()).toBe("chonk")
       localStorage.setItem(planDesignStorageKey, "invalid")
-      expect(readStoredPlanDesign()).toBe("coral")
+      expect(readStoredPlanDesign()).toBe("uji")
     })
 
     it("recognizes the former Matcha name in preferences and previews", () => {
@@ -211,7 +211,7 @@ describe("theme and design system", () => {
     it("falls back to default design on unknown input", () => {
       // @ts-expect-error testing invalid input
       const result = applyPlanDesign("nonexistent")
-      expect(result.design).toBe("coral")
+      expect(result.design).toBe("uji")
       expect(result.theme).toBe("light")
     })
 

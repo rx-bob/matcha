@@ -42,7 +42,7 @@ const plan_boot_script =
     \\      var savedDesign = root.dataset.initialDesign || localStorage.getItem('matcha-plan-design');
     \\      if (savedDesign === 'matcha') savedDesign = 'uji';
     \\      var designs = ['coral', 'chonk', 'eva-01', 'uji'];
-    \\      var design = (savedDesign && designs.indexOf(savedDesign) !== -1) ? savedDesign : 'coral';
+    \\      var design = (savedDesign && designs.indexOf(savedDesign) !== -1) ? savedDesign : 'uji';
     \\      root.dataset.design = design;
     \\      var savedTheme = localStorage.getItem(root.dataset.evaThemeStorageKey || 'matcha-eva-theme');
     \\      if (savedTheme !== 'light' && savedTheme !== 'dark') savedTheme = root.dataset.initialEvaTheme;
@@ -62,7 +62,7 @@ pub fn writePlanHtml(io: std.Io, output_path: []const u8, title: []const u8, pay
     defer file.close(io);
 
     try file.writeStreamingAll(io, "<!DOCTYPE html>\n");
-    try file.writeStreamingAll(io, "<html lang=\"en\" data-design=\"coral\" data-theme=\"light\">\n");
+    try file.writeStreamingAll(io, "<html lang=\"en\" data-design=\"uji\" data-theme=\"light\">\n");
     try file.writeStreamingAll(io, "<head>\n");
     try file.writeStreamingAll(io, "  <title>");
     try file.writeStreamingAll(io, title);
@@ -80,7 +80,7 @@ pub fn writePlanHtml(io: std.Io, output_path: []const u8, title: []const u8, pay
     try file.writeStreamingAll(io, "  </script>\n");
 
     try file.writeStreamingAll(io, "  <link rel=\"icon\" id=\"dynamic-favicon\" type=\"image/png\" href=\"");
-    try file.writeStreamingAll(io, coral_favicon_url);
+    try file.writeStreamingAll(io, uji_favicon_url);
     try file.writeStreamingAll(io, "\" data-favicon-coral=\"");
     try file.writeStreamingAll(io, coral_favicon_url);
     try file.writeStreamingAll(io, "\" data-favicon-chonk=\"");
@@ -244,7 +244,7 @@ test "plan HTML render emits required markers and title" {
     defer allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "<title>Plan Fixture</title>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "<html lang=\"en\" data-design=\"coral\" data-theme=\"light\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<html lang=\"en\" data-design=\"uji\" data-theme=\"light\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "<div id=\"plan-root\"></div>") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "id=\"plan-data\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "window.PLAN_DATA") != null);

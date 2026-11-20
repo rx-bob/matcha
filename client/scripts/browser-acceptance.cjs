@@ -18,8 +18,8 @@ const url = pathToFileURL(path.join(root, 'dist/plan.html')).href;
  const visible=async(selector)=>page.locator(selector).waitFor({state:'visible',timeout:5000});
  const route=async(hash)=>{await page.evaluate(h=>{location.hash=h},hash);await page.waitForTimeout(300)};
  await page.goto(url); await page.locator('#view-overview').waitFor(); await page.evaluate(()=>document.fonts.ready);
- await check('Coral default and six workspace views',async()=>{
-  assert.equal(await page.locator('html').getAttribute('data-design'),'coral');
+ await check('Uji default and six workspace views',async()=>{
+  assert.equal(await page.locator('html').getAttribute('data-design'),'uji');
   for(const view of ['overview','epics','files','context','order','criteria']){await page.locator(`[data-nav="${view}"]`).click();await visible(`#view-${view}`);assert.equal(await page.locator('.page-view:visible').count(),1)}
  });
  await check('Four designs, EVA theme persistence and reference screenshots',async()=>{

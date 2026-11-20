@@ -10,6 +10,7 @@
   import {
     type PlanDesign,
     type EvaTheme,
+    defaultPlanDesign,
     planDesigns,
     planDesignLabels,
     readStoredPlanDesign,
@@ -25,7 +26,7 @@
 
   export let plan: Plan
 
-  let currentDesign: PlanDesign = "coral"
+  let currentDesign: PlanDesign = defaultPlanDesign
   let currentEvaTheme: EvaTheme = "dark"
   let currentView = "overview"
   let isNavOpen = false

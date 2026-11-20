@@ -25,7 +25,7 @@ const favicons: Record<PlanDesign, string> = {
 
 export type EvaTheme = "dark" | "light"
 
-export const defaultPlanDesign: PlanDesign = "coral"
+export const defaultPlanDesign: PlanDesign = "uji"
 export const defaultEvaTheme: EvaTheme = "dark"
 
 export function isPlanDesign(value: string | null | undefined): value is PlanDesign {
